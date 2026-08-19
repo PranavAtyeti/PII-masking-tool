@@ -52,6 +52,36 @@ def init_db():
             ON token_entries (session_id, token)
             """
         )
+        # Admin-set app config (currently: shared LLM api key + model). Global,
+        # not session-scoped -- one row per key, last write wins. Separate
+        # table from token_entries on purpose: this is app config an admin
+        # sets, not PII passing through the masking pipeline, even though it
+        # lives in the same local-only DB file.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_config (
+                config_key   TEXT PRIMARY KEY,
+                config_value TEXT NOT NULL
+            )
+            """
+        )
+
+
+def get_admin_config(config_key: str, default: str = "") -> str:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT config_value FROM admin_config WHERE config_key = ?", (config_key,)
+        ).fetchone()
+    return row[0] if row else default
+
+
+def set_admin_config(config_key: str, config_value: str):
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO admin_config (config_key, config_value) VALUES (?, ?) "
+            "ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value",
+            (config_key, config_value),
+        )
 
 
 @contextmanager

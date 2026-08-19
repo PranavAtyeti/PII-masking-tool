@@ -16,7 +16,32 @@ subtract coverage anywhere regex already had it.
 A confidence threshold guards against over-flagging real business text as PII.
 """
 
+import re
 from functools import lru_cache
+
+# Presidio's DATE_TIME recognizer flags relative/vague time expressions
+# ("yesterday", "next quarter", "3pm") at the same flat confidence as actual
+# dates -- the confidence score alone can't tell them apart. None of these
+# are privacy-sensitive (they're not dates of birth), and masking them
+# strips ordinary time context the model needs to answer well, so they're
+# filtered out here by content instead.
+_VAGUE_DATE_WORDS = {
+    "today", "yesterday", "tomorrow", "tonight",
+    "morning", "evening", "afternoon", "night",
+    "this week", "next week", "last week",
+    "this month", "next month", "last month",
+    "this quarter", "next quarter", "last quarter",
+    "this year", "next year", "last year",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+}
+_CLOCK_TIME_RE = re.compile(r"^\d{1,2}(:\d{2})?\s?(am|pm)$", re.IGNORECASE)
+
+
+def _is_vague_date_mention(entity_text: str) -> bool:
+    t = entity_text.strip().lower()
+    return t in _VAGUE_DATE_WORDS or bool(_CLOCK_TIME_RE.match(t))
 
 # Presidio entity -> our internal type vocabulary (matches detection.py)
 PRESIDIO_TO_INTERNAL = {
@@ -72,6 +97,8 @@ def analyze_text(text: str, min_confidence: float = CONFIDENCE_THRESHOLD):
         if not internal_type:
             continue
         entity_text = str(text)[r.start:r.end]
+        if internal_type == "DOB" and _is_vague_date_mention(entity_text):
+            continue
         findings.append((entity_text, internal_type, r.score))
     return findings
 
