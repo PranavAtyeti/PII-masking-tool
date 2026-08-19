@@ -348,7 +348,6 @@ def find_leaked_values(df: pd.DataFrame, masked_df: pd.DataFrame, col_types: dic
 defaults = {
     "session_id": lambda: str(uuid.uuid4()),
     "token_counters": lambda: {},
-    "chat_history": lambda: [],
     "df": lambda: None,
     "col_types": lambda: {},
     "column_enabled": lambda: {},
@@ -358,6 +357,19 @@ for key, factory in defaults.items():
         st.session_state[key] = factory()
 
 SESSION_ID = st.session_state.session_id
+
+# Chat persistence. chat_history in session_state is just a display cache
+# for the active chat_id -- the source of truth is mapping_store.db, so a
+# browser refresh (which wipes session_state) reloads the same chat instead
+# of losing it. No auth yet, so "most recent chat" is app-wide, not
+# per-user -- revisit once auth exists.
+if "active_chat_id" not in st.session_state:
+    existing_chats = store.list_chats()
+    if existing_chats:
+        st.session_state.active_chat_id = existing_chats[0]["chat_id"]
+    else:
+        st.session_state.active_chat_id = store.create_chat()
+    st.session_state.chat_history = store.get_chat_messages(st.session_state.active_chat_id)
 
 
 def get_active_llm_config():
@@ -531,7 +543,16 @@ def build_masked_context(masked_df: pd.DataFrame, max_rows=200) -> tuple[str, bo
 # Shared question handler -- works whether or not a spreadsheet is loaded
 # ---------------------------------------------------------------------------
 def process_question(question: str, use_ner: bool, ner_confidence: float, concise: bool = True):
+    chat_id = st.session_state.active_chat_id
+    is_first_message = not st.session_state.chat_history
+
     st.session_state.chat_history.append({"role": "user", "content": question})
+    store.add_message(chat_id, "user", question)
+    if is_first_message:
+        title = " ".join(question.strip().split())
+        if len(title) > 40:
+            title = title[:40].rstrip() + "…"
+        store.rename_chat(chat_id, title or "New chat")
 
     df = st.session_state.df
     known_values = st.session_state.get("_known_values", {})
@@ -624,6 +645,30 @@ def process_question(question: str, use_ner: bool, ner_confidence: float, concis
     else:
         try:
             active_api_key, active_model = get_active_llm_config()
+
+            if is_first_message:
+                # Best-effort: upgrade the truncated fallback title (set
+                # above) to a short LLM-written one. Uses the already-masked
+                # question -- the titling call must obey the same "nothing
+                # raw leaves this machine" rule as the main answer. Silent
+                # on failure: a plain-answer question shouldn't fail just
+                # because the title polish call did.
+                try:
+                    title_raw = call_llm(
+                        "Write a short title (3-6 words) summarizing the topic of "
+                        "the user's message below. Plain text only -- no quotes, "
+                        "no punctuation at the end, no preamble like 'Title:'.",
+                        masked_question,
+                        active_api_key, active_model,
+                        temperature=0.3, max_tokens=16,
+                    )
+                    title = unmask_text(" ".join(title_raw.strip().split()))
+                    title = title.strip(" \"'.")[:60]
+                    if title:
+                        store.rename_chat(chat_id, title)
+                except Exception:
+                    pass
+
             raw_text = call_llm(
                 system_prompt, user_prompt,
                 active_api_key, active_model,
@@ -645,6 +690,24 @@ def process_question(question: str, use_ner: bool, ner_confidence: float, concis
     st.session_state.chat_history.append(
         {"role": "assistant", "content": answer, "masked_count": masked_count}
     )
+    store.add_message(chat_id, "assistant", answer, masked_count)
+
+
+def _export_chat_text(chat_id: str, title: str) -> str:
+    """Plain-text transcript of a chat, always read fresh from the DB so it
+    works for any chat in the list, not just the currently active one."""
+    messages = store.get_chat_messages(chat_id)
+    lines = [title, "=" * len(title), ""]
+    for m in messages:
+        speaker = "You" if m["role"] == "user" else "Privy"
+        lines.append(f"{speaker}: {m['content']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _safe_filename(title: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")
+    return safe[:50] or "chat"
 
 
 # ---------------------------------------------------------------------------
@@ -656,8 +719,85 @@ with st.sidebar:
     st.caption("Personal data stays on this device")
 
     if st.button("+ New chat", use_container_width=True):
+        st.session_state.active_chat_id = store.create_chat()
         st.session_state.chat_history = []
         st.rerun()
+
+    past_chats = store.list_chats()
+    if past_chats:
+        st.caption("Recent chats")
+        for chat in past_chats[:20]:
+            is_active = chat["chat_id"] == st.session_state.active_chat_id
+            label = chat["title"] or "New chat"
+            col_select, col_menu = st.columns([5, 1])
+            if col_select.button(
+                label,
+                key=f"chat_{chat['chat_id']}",
+                use_container_width=True,
+                disabled=is_active,
+            ):
+                st.session_state.active_chat_id = chat["chat_id"]
+                st.session_state.chat_history = store.get_chat_messages(chat["chat_id"])
+                st.rerun()
+
+            with col_menu.popover("⋮", use_container_width=True):
+                renaming_key = f"_renaming_{chat['chat_id']}"
+                is_renaming = st.session_state.get(renaming_key, False)
+
+                if is_renaming:
+                    new_title = st.text_input(
+                        "Rename",
+                        value=label,
+                        key=f"rename_input_{chat['chat_id']}",
+                        label_visibility="collapsed",
+                        placeholder="Chat name",
+                    )
+                    col_save, col_cancel = st.columns(2)
+                    if col_save.button(
+                        "Save", key=f"rename_save_{chat['chat_id']}", use_container_width=True
+                    ):
+                        cleaned = new_title.strip()
+                        if cleaned and cleaned != label:
+                            store.rename_chat(chat["chat_id"], cleaned)
+                        st.session_state[renaming_key] = False
+                        st.rerun()
+                    if col_cancel.button(
+                        "Cancel", key=f"rename_cancel_{chat['chat_id']}", use_container_width=True
+                    ):
+                        st.session_state[renaming_key] = False
+                        st.rerun()
+                else:
+                    if st.button(
+                        "Rename", key=f"rename_btn_{chat['chat_id']}", use_container_width=True
+                    ):
+                        st.session_state[renaming_key] = True
+                        st.rerun()
+
+                    st.download_button(
+                        "Export as .txt",
+                        data=_export_chat_text(chat["chat_id"], label),
+                        file_name=f"{_safe_filename(label)}.txt",
+                        mime="text/plain",
+                        key=f"export_{chat['chat_id']}",
+                        use_container_width=True,
+                    )
+
+                    if st.button(
+                        "Delete", key=f"del_{chat['chat_id']}", use_container_width=True
+                    ):
+                        store.delete_chat(chat["chat_id"])
+                        if is_active:
+                            # Deleted the chat you were looking at -- fall
+                            # back to the next most recent one, or a fresh
+                            # chat if that was the last one left.
+                            remaining = store.list_chats()
+                            if remaining:
+                                st.session_state.active_chat_id = remaining[0]["chat_id"]
+                                st.session_state.chat_history = store.get_chat_messages(remaining[0]["chat_id"])
+                            else:
+                                st.session_state.active_chat_id = store.create_chat()
+                                st.session_state.chat_history = []
+                        st.rerun()
 
     st.markdown("")
 
