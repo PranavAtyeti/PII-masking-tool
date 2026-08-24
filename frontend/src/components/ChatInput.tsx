@@ -11,8 +11,10 @@ interface ChatInputProps {
   onUploadFile: (file: File) => void;
   onEditFile?: () => void;
   onRemoveFile?: () => void;
+  onStop?: () => void;
   attachment?: ChatAttachment;
   disabled?: boolean;
+  isStreaming?: boolean;
   isUploading?: boolean;
   hasPendingFile?: boolean;
   placeholder?: string;
@@ -23,8 +25,10 @@ export function ChatInput({
   onUploadFile,
   onEditFile,
   onRemoveFile,
+  onStop,
   attachment,
   disabled = false,
+  isStreaming = false,
   isUploading = false,
   hasPendingFile = false,
   placeholder = "Message Privy",
@@ -78,11 +82,8 @@ export function ChatInput({
                 <button
                   type="button"
                   onClick={() => {
-                    if (attachment.canEdit) {
-                      onEditFile();
-                    } else {
-                      fileInputRef.current?.click();
-                    }
+                    if (attachment.canEdit) onEditFile();
+                    else fileInputRef.current?.click();
                   }}
                   disabled={composerDisabled}
                   className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-ink/60 hover:bg-white hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
@@ -134,15 +135,27 @@ export function ChatInput({
           disabled={composerDisabled}
           className="max-h-40 flex-1 resize-none bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-ink/40"
         />
-        <button
-          type="button"
-          onClick={submit}
-          disabled={composerDisabled || !value.trim()}
-          aria-label="Send message"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-20"
-        >
-          ↑
-        </button>
+        {isStreaming ? (
+          <button
+            type="button"
+            onClick={onStop}
+            aria-label="Stop generating"
+            title="Stop generating"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-white transition-opacity hover:opacity-85"
+          >
+            <span className="h-3 w-3 rounded-[3px] bg-white" aria-hidden />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={submit}
+            disabled={composerDisabled || !value.trim()}
+            aria-label="Send message"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-20"
+          >
+            ↑
+          </button>
+        )}
       </div>
     </div>
   );

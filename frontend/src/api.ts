@@ -1,10 +1,4 @@
-// Typed client for the backend built in sessions 1-2. In dev, calls go to
-// relative "/api/..." paths -- vite.config.ts proxies those to the FastAPI
-// server, so the browser sees same-origin requests and CORS never enters
-// the picture locally. A production build would need this to point at
-// wherever the API actually lives instead.
-
-import type { Chat, Message, UploadPreviewResult, UploadResult } from "./types";
+import type { Chat, Message, UploadResult, ColumnInfo } from "./types";
 
 const BASE = "/api";
 
@@ -15,7 +9,7 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
       const body = await res.json();
       detail = body.detail ?? detail;
     } catch {
-      // response wasn't JSON -- fall back to statusText, already set above
+      // response wasn't JSON -- fall back to statusText
     }
     throw new ApiError(res.status, detail);
   }
@@ -57,18 +51,13 @@ export const api = {
 
   async deleteChat(chatId: string): Promise<void> {
     const res = await fetch(`${BASE}/chats/${chatId}`, { method: "DELETE" });
-    if (!res.ok && res.status !== 204) {
-      throw new ApiError(res.status, res.statusText);
-    }
+    if (!res.ok && res.status !== 204) throw new ApiError(res.status, res.statusText);
   },
 
   async exportChat(chatId: string): Promise<void> {
     const res = await fetch(`${BASE}/chats/${chatId}/export`);
     if (!res.ok) throw new ApiError(res.status, res.statusText);
     const blob = await res.blob();
-    // filename comes from the server's Content-Disposition header; browsers
-    // don't expose an easy parsed form of it, so re-derive a reasonable one
-    // rather than parsing that header by hand.
     const disposition = res.headers.get("Content-Disposition") ?? "";
     const match = disposition.match(/filename="([^"]+)"/);
     const filename = match?.[1] ?? "chat.txt";
@@ -80,19 +69,29 @@ export const api = {
     URL.revokeObjectURL(url);
   },
 
-  async getFileInfo(chatId: string): Promise<{ filename: string; row_count: number; truncated: boolean; kept_private_count: number } | null> {
+  async getFileInfo(chatId: string): Promise<{
+    filename: string;
+    row_count: number;
+    truncated: boolean;
+    kept_private_count: number;
+  } | null> {
     const res = await fetch(`${BASE}/upload/${chatId}`);
-    if (res.status === 404) return null; // no file uploaded for this chat -- not an error
+    if (res.status === 404) return null;
     return jsonOrThrow(res);
   },
 
-  previewFile(chatId: string, file: File): Promise<UploadPreviewResult> {
+  async previewFile(chatId: string, file: File): Promise<{
+    row_count: number;
+    truncated: boolean;
+    columns: ColumnInfo[];
+  }> {
     const form = new FormData();
     form.append("file", file);
-    return fetch(`${BASE}/upload/${chatId}/preview`, {
+    const res = await fetch(`${BASE}/upload/${chatId}/preview`, {
       method: "POST",
       body: form,
-    }).then((r) => jsonOrThrow<UploadPreviewResult>(r));
+    });
+    return jsonOrThrow(res);
   },
 
   uploadFile(
@@ -110,20 +109,11 @@ export const api = {
     );
   },
 
-  /**
-   * Streams an answer via Server-Sent Events. Can't use the browser's
-   * EventSource here -- it only supports GET requests with no body, and
-   * this endpoint needs a POST with a JSON question. So this hand-parses
-   * the fetch() response body instead.
-   *
-   * SSE framing: events are separated by a blank line ("\n\n"); each event
-   * is one or more "data: ..." lines. This backend only ever sends a single
-   * "data:" line per event (see routers/messages.py's _sse()), so this
-   * parser doesn't need to handle multi-line data blocks -- but chunk
-   * boundaries from the network don't respect event boundaries at all, so
-   * a "\n\n"-terminated event can still arrive split across two chunks (or
-   * two events can arrive in one chunk). Buffering on "\n\n" handles both.
-   */
+  async removeFile(chatId: string): Promise<void> {
+    const res = await fetch(`${BASE}/upload/${chatId}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 204) throw new ApiError(res.status, res.statusText);
+  },
+
   async streamMessage(
     chatId: string,
     body: { question: string; use_ner: boolean; ner_confidence: number; concise: boolean },
@@ -131,13 +121,27 @@ export const api = {
       onDelta: (text: string) => void;
       onDone: (maskedCount: number) => void;
       onError: (message: string) => void;
-    }
+      onAbort?: () => void;
+    },
+    signal?: AbortSignal
   ): Promise<void> {
-    const res = await fetch(`${BASE}/chats/${chatId}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    let res: Response;
+
+    try {
+      res = await fetch(`${BASE}/chats/${chatId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        handlers.onAbort?.();
+        return;
+      }
+      handlers.onError(error instanceof Error ? error.message : "Couldn't start the response stream.");
+      return;
+    }
 
     if (!res.ok || !res.body) {
       let detail = res.statusText;
@@ -155,33 +159,48 @@ export const api = {
     const decoder = new TextDecoder();
     let buffer = "";
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary !== -1) {
-        const rawEvent = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        handleEvent(rawEvent, handlers);
-        boundary = buffer.indexOf("\n\n");
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+
+        while (boundary !== -1) {
+          const rawEvent = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          handleEvent(rawEvent, handlers);
+          boundary = buffer.indexOf("\n\n");
+        }
       }
-    }
-    // flush any trailing event that arrived without a final blank-line
-    // separator (e.g. connection closed right after the last event)
-    if (buffer.trim()) {
-      handleEvent(buffer, handlers);
+
+      buffer += decoder.decode();
+      if (buffer.trim()) handleEvent(buffer, handlers);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        handlers.onAbort?.();
+        return;
+      }
+      handlers.onError(error instanceof Error ? error.message : "The response stream ended unexpectedly.");
+    } finally {
+      reader.releaseLock();
     }
   },
 };
 
 function handleEvent(
   rawEvent: string,
-  handlers: { onDelta: (text: string) => void; onDone: (maskedCount: number) => void; onError: (message: string) => void }
+  handlers: {
+    onDelta: (text: string) => void;
+    onDone: (maskedCount: number) => void;
+    onError: (message: string) => void;
+    onAbort?: () => void;
+  }
 ) {
   const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
   if (!dataLine) return;
+
   const payload = dataLine.slice("data:".length).trim();
   if (!payload) return;
 
@@ -189,7 +208,7 @@ function handleEvent(
   try {
     obj = JSON.parse(payload);
   } catch {
-    return; // malformed event -- skip rather than crash the whole stream
+    return;
   }
 
   if (typeof obj.delta === "string") {

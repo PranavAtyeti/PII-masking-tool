@@ -27,6 +27,7 @@ interface ChatPaneProps {
   onApplyFile?: () => void;
   onEditFile?: () => void;
   onRemoveFile?: () => void;
+  onStop?: () => void;
   onSend: (text: string) => void;
   onUploadFile: (file: File) => void;
 }
@@ -47,6 +48,7 @@ export function ChatPane({
   onApplyFile,
   onEditFile,
   onRemoveFile,
+  onStop,
   onSend,
   onUploadFile,
 }: ChatPaneProps) {
@@ -72,18 +74,20 @@ export function ChatPane({
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-7">
         {isEmpty ? (
-          <div className="mx-auto flex h-full max-w-3xl flex-col items-center justify-center gap-6 text-center">
+          <div className="mx-auto flex h-full max-w-3xl flex-col items-center justify-center gap-7 text-center">
             <div>
-              <div className="mb-3 text-4xl">🔒</div>
+              <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-surface text-2xl shadow-sm">
+                🔒
+              </div>
               <h3 className="font-display text-xl font-semibold text-ink">Your private AI workspace</h3>
-              <p className="mt-2 max-w-md text-sm leading-6 text-ink/50">
+              <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-ink/50">
                 Ask questions about your data without exposing the original PII.
               </p>
             </div>
             <SuggestionChips suggestions={suggestions} onPick={onSend} />
           </div>
         ) : (
-          <div className="mx-auto flex max-w-4xl flex-col gap-5">
+          <div className="mx-auto flex max-w-4xl flex-col gap-7">
             {messages.map((m, i) => (
               <MessageBubble
                 key={i}
@@ -101,8 +105,10 @@ export function ChatPane({
           onUploadFile={onUploadFile}
           onEditFile={onEditFile}
           onRemoveFile={onRemoveFile}
+          onStop={onStop}
           attachment={attachment}
           disabled={isStreaming}
+          isStreaming={isStreaming}
           isUploading={isUploading}
           hasPendingFile={Boolean(pendingFile)}
         />

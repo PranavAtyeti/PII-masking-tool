@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPane } from "./components/ChatPane";
 import type { Chat, ColumnInfo, Message } from "./types";
@@ -23,6 +23,7 @@ export default function App() {
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
   const [isEditingFile, setIsEditingFile] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const streamControllerRef = useRef<AbortController | null>(null);
 
   // On first load: use the most recent existing chat, or create one if
   // there isn't one yet -- same behavior the Streamlit version had.
@@ -219,7 +220,13 @@ export default function App() {
     }
   }
 
+  function handleStopGeneration() {
+    streamControllerRef.current?.abort();
+  }
+
   async function handleSend(text: string) {
+    if (isStreaming) return;
+
     let chatId = activeChatId;
     if (!chatId) {
       const created = await api.createChat();
@@ -231,6 +238,9 @@ export default function App() {
     setMessages((prev) => [...prev, { role: "user", content: text, masked_count: 0 }]);
     setMessages((prev) => [...prev, { role: "assistant", content: "", masked_count: 0 }]);
     setIsStreaming(true);
+
+    const controller = new AbortController();
+    streamControllerRef.current = controller;
 
     await api.streamMessage(
       chatId,
@@ -252,6 +262,7 @@ export default function App() {
             return next;
           });
           setIsStreaming(false);
+          streamControllerRef.current = null;
           // The backend titles a new chat as part of the same request that
           // just finished (see routers/messages.py) -- refresh the list now
           // so the sidebar picks up the real title and the reordering by
@@ -266,9 +277,19 @@ export default function App() {
             return next;
           });
           setIsStreaming(false);
+          streamControllerRef.current = null;
         },
-      }
+        onAbort: () => {
+          setIsStreaming(false);
+          streamControllerRef.current = null;
+        },
+      },
+      controller.signal
     );
+
+    if (streamControllerRef.current === controller) {
+      streamControllerRef.current = null;
+    }
   }
 
   if (loadError) {
@@ -319,6 +340,7 @@ export default function App() {
         onApplyFile={handleApplyFile}
         onEditFile={handleEditFile}
         onRemoveFile={handleRemoveFile}
+        onStop={handleStopGeneration}
         onSend={handleSend}
         onUploadFile={handleUploadFile}
       />
