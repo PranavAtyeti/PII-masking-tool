@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPane } from "./components/ChatPane";
+import { SettingsPanel } from "./components/SettingsPanel";
 import type { Chat, ColumnInfo, Message } from "./types";
 import { api } from "./api";
 import { SUGGESTION_CHIPS } from "./constants";
@@ -15,6 +16,7 @@ export default function App() {
     keptPrivateCount: number;
   } | null>(null);
   const [collapsed, setCollapsed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
@@ -319,6 +321,7 @@ export default function App() {
         onRenameChat={handleRenameChat}
         onDeleteChat={handleDeleteChat}
         onExportChat={handleExportChat}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
       <ChatPane
         messages={messages}
@@ -344,6 +347,7 @@ export default function App() {
         onSend={handleSend}
         onUploadFile={handleUploadFile}
       />
+      <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

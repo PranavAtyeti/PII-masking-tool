@@ -11,6 +11,7 @@ interface SidebarProps {
   onRenameChat: (chatId: string, title: string) => void;
   onDeleteChat: (chatId: string) => void;
   onExportChat: (chatId: string) => void;
+  onOpenSettings: () => void;
 }
 
 export function Sidebar({
@@ -23,6 +24,7 @@ export function Sidebar({
   onRenameChat,
   onDeleteChat,
   onExportChat,
+  onOpenSettings,
 }: SidebarProps) {
   if (collapsed) {
     return (
@@ -37,6 +39,14 @@ export function Sidebar({
         <span className="text-xl" title="Privy">
           🔒
         </span>
+        <button
+          onClick={onOpenSettings}
+          aria-label="Open settings"
+          title="Settings"
+          className="rounded-md p-2 text-white/70 hover:bg-white/10 hover:text-white"
+        >
+          ⚙
+        </button>
       </div>
     );
   }
@@ -66,24 +76,34 @@ export function Sidebar({
         + New chat
       </button>
 
-      {chats.length > 0 && (
-        <>
-          <p className="mb-2 px-1 text-xs text-white/50">Recent chats</p>
-          <div className="flex flex-1 flex-col gap-1 overflow-y-auto">
-            {chats.map((chat) => (
-              <ChatListItem
-                key={chat.chat_id}
-                chat={chat}
-                isActive={chat.chat_id === activeChatId}
-                onSelect={() => onSelectChat(chat.chat_id)}
-                onRename={(title) => onRenameChat(chat.chat_id, title)}
-                onDelete={() => onDeleteChat(chat.chat_id)}
-                onExport={() => onExportChat(chat.chat_id)}
-              />
-            ))}
-          </div>
-        </>
-      )}
+      <div className="flex min-h-0 flex-1 flex-col">
+        {chats.length > 0 && (
+          <>
+            <p className="mb-2 px-1 text-xs uppercase tracking-[0.12em] text-white/40">Recent</p>
+            <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
+              {chats.map((chat) => (
+                <ChatListItem
+                  key={chat.chat_id}
+                  chat={chat}
+                  isActive={chat.chat_id === activeChatId}
+                  onSelect={() => onSelectChat(chat.chat_id)}
+                  onRename={(title) => onRenameChat(chat.chat_id, title)}
+                  onDelete={() => onDeleteChat(chat.chat_id)}
+                  onExport={() => onExportChat(chat.chat_id)}
+                />
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <button
+        onClick={onOpenSettings}
+        className="mt-4 flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/[0.10] hover:text-white"
+      >
+        <span aria-hidden>⚙</span>
+        <span>Settings</span>
+      </button>
     </aside>
   );
 }

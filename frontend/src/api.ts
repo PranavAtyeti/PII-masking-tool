@@ -1,4 +1,4 @@
-import type { Chat, Message, UploadResult, ColumnInfo } from "./types";
+import type { AdminConfig, Chat, Message, UploadResult, ColumnInfo } from "./types";
 
 const BASE = "/api";
 
@@ -25,6 +25,18 @@ export class ApiError extends Error {
 }
 
 export const api = {
+  getAdminConfig(): Promise<AdminConfig> {
+    return fetch(`${BASE}/admin/config`).then((r) => jsonOrThrow<AdminConfig>(r));
+  },
+
+  updateAdminConfig(body: { api_key?: string; model?: string }): Promise<AdminConfig> {
+    return fetch(`${BASE}/admin/config`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => jsonOrThrow<AdminConfig>(r));
+  },
+
   listChats(): Promise<Chat[]> {
     return fetch(`${BASE}/chats`).then((r) => jsonOrThrow<Chat[]>(r));
   },

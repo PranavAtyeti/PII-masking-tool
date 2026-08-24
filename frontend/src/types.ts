@@ -21,12 +21,6 @@ export interface ColumnInfo {
   enabled: boolean;
 }
 
-export interface UploadPreviewResult {
-  filename: string;
-  row_count: number;
-  columns: ColumnInfo[];
-}
-
 export interface UploadResult {
   chat_id: string;
   filename: string;
@@ -35,4 +29,11 @@ export interface UploadResult {
   columns: ColumnInfo[];
   kept_private_count: number;
   preview_csv: string;
+}
+
+export interface AdminConfig {
+  model: string;
+  api_key_set: boolean;
+  api_key_preview: string;
+  common_models: string[];
 }
