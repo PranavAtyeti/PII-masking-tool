@@ -26,7 +26,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import mapping_store as store
-from .routers import chats, upload, messages, admin
+from .routers import chats, upload, messages, admin, auth
 
 app = FastAPI(title="Privy API", version="0.1.0")
 
@@ -59,3 +59,4 @@ app.include_router(chats.router)
 app.include_router(upload.router)
 app.include_router(messages.router)
 app.include_router(admin.router)
+app.include_router(auth.router)
