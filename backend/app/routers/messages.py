@@ -23,10 +23,11 @@ blocked/errored answer).
 import json
 
 import requests
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .. import mapping_store as store
+from ..auth import get_current_app_user
 from ..llm import call_llm, stream_llm, LLM_API_KEY_ENV, LLM_MODEL_DEFAULT
 from ..masking import (
     mask_free_text_cell, _replace_known_values, unmask_text, stream_unmask,
@@ -109,7 +110,7 @@ def _build_prompt(chat_id: str, masked_question: str, concise: bool):
     return system_prompt, user_prompt, payload_to_check
 
 
-def _generate(chat_id: str, body: MessageIn):
+def _generate(chat_id: str, body: MessageIn, user_id: str):
     """The actual SSE event generator. All persistence + error handling
     lives in here so it happens regardless of how the stream ends."""
     is_first_message = len(store.get_chat_messages(chat_id)) == 0
@@ -119,7 +120,7 @@ def _generate(chat_id: str, body: MessageIn):
         fallback_title = " ".join(body.question.strip().split())
         if len(fallback_title) > 40:
             fallback_title = fallback_title[:40].rstrip() + "\u2026"
-        store.rename_chat(chat_id, fallback_title or "New chat")
+        store.rename_chat(chat_id, user_id, fallback_title or "New chat")
 
     counters = store.load_counters(chat_id)
     known_values = store.get_known_values(chat_id)
@@ -160,7 +161,7 @@ def _generate(chat_id: str, body: MessageIn):
             title = unmask_text(" ".join(title_raw.strip().split()), chat_id)
             title = title.strip(" \"'.")[:60]
             if title:
-                store.rename_chat(chat_id, title)
+                store.rename_chat(chat_id, user_id, title)
         except Exception:
             pass
 
@@ -190,7 +191,7 @@ def _generate(chat_id: str, body: MessageIn):
 
 
 @router.post("/{chat_id}/messages")
-def post_message(chat_id: str, body: MessageIn):
-    if not store.get_chat(chat_id):
+def post_message(chat_id: str, body: MessageIn, user: dict = Depends(get_current_app_user)):
+    if not store.get_chat(chat_id, user["auth0_sub"]):
         raise HTTPException(status_code=404, detail="Chat not found")
-    return StreamingResponse(_generate(chat_id, body), media_type="text/event-stream")
+    return StreamingResponse(_generate(chat_id, body, user["auth0_sub"]), media_type="text/event-stream")

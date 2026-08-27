@@ -68,6 +68,21 @@ def init_db():
             )
             """
         )
+        # Authenticated application users. Auth0 remains the identity provider;
+        # this table stores only the stable Auth0 subject plus local app metadata.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                auth0_sub      TEXT PRIMARY KEY,
+                email          TEXT,
+                display_name   TEXT,
+                role           TEXT NOT NULL DEFAULT 'user',
+                created_at     REAL NOT NULL,
+                last_login_at  REAL NOT NULL
+            )
+            """
+        )
+
         # Chat history. No auth yet -- these are app-wide (anyone using this
         # deployment sees the same chat list), same trust boundary as
         # admin_config above. Revisit once auth exists.
@@ -80,11 +95,25 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id      TEXT PRIMARY KEY,
+                user_id      TEXT,
                 title        TEXT NOT NULL,
                 created_at   REAL NOT NULL,
-                updated_at   REAL NOT NULL
+                updated_at   REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (auth0_sub)
             )
             """
+        )
+        # Existing local databases were created before Auth0. Add the new
+        # nullable owner column without destroying existing chats. Those
+        # orphaned chats are assigned to the first authenticated user in
+        # get_or_create_user().
+        chat_columns = {row[1] for row in conn.execute("PRAGMA table_info(chats)").fetchall()}
+        if "user_id" not in chat_columns:
+            conn.execute("ALTER TABLE chats ADD COLUMN user_id TEXT")
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chats_user_updated "
+            "ON chats (user_id, updated_at DESC)"
         )
         conn.execute(
             """
@@ -139,26 +168,96 @@ def set_admin_config(config_key: str, config_value: str):
         )
 
 
-def create_chat(title: str = "New chat") -> str:
-    """Creates a new chat row and returns its id."""
+def get_or_create_user(auth0_sub: str, email: str | None = None, display_name: str | None = None) -> dict:
+    """Create the local user on first login and assign legacy orphan chats.
+
+    The first authenticated user becomes admin for this development-era
+    single-admin model; subsequent users are ordinary users. This avoids a
+    bootstrap lockout while keeping role data local and easy to replace with
+    an explicit admin-management flow later.
+    """
+    now = time.time()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT auth0_sub, email, display_name, role, created_at, last_login_at "
+            "FROM users WHERE auth0_sub = ?",
+            (auth0_sub,),
+        ).fetchone()
+
+        if row:
+            conn.execute(
+                "UPDATE users SET email = ?, display_name = ?, last_login_at = ? "
+                "WHERE auth0_sub = ?",
+                (email or row[1], display_name or row[2], now, auth0_sub),
+            )
+            role = row[3]
+            created_at = row[4]
+        else:
+            user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            role = "admin" if user_count == 0 else "user"
+            conn.execute(
+                "INSERT INTO users (auth0_sub, email, display_name, role, created_at, last_login_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (auth0_sub, email, display_name, role, now, now),
+            )
+            created_at = now
+
+        # The existing local DB may already contain chats created before auth.
+        # Assign them to the first user who signs in so nothing is lost.
+        conn.execute(
+            "UPDATE chats SET user_id = ? WHERE user_id IS NULL",
+            (auth0_sub,),
+        )
+
+    return {
+        "auth0_sub": auth0_sub,
+        "email": email or row[1] if row else email,
+        "display_name": display_name or row[2] if row else display_name,
+        "role": role,
+        "created_at": created_at,
+        "last_login_at": now,
+    }
+
+
+def get_user(auth0_sub: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT auth0_sub, email, display_name, role, created_at, last_login_at "
+            "FROM users WHERE auth0_sub = ?",
+            (auth0_sub,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "auth0_sub": row[0],
+        "email": row[1],
+        "display_name": row[2],
+        "role": row[3],
+        "created_at": row[4],
+        "last_login_at": row[5],
+    }
+
+
+def create_chat(user_id: str, title: str = "New chat") -> str:
+    """Creates a new chat owned by the authenticated user."""
     chat_id = str(uuid.uuid4())
     now = time.time()
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO chats (chat_id, title, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (chat_id, title, now, now),
+            "INSERT INTO chats (chat_id, user_id, title, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (chat_id, user_id, title, now, now),
         )
     return chat_id
 
 
-def list_chats() -> list:
-    """All chats, most recently active first. Each item:
-    {chat_id, title, created_at, updated_at}."""
+def list_chats(user_id: str) -> list:
+    """Only chats owned by the current user, newest first."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT chat_id, title, created_at, updated_at FROM chats "
-            "ORDER BY updated_at DESC"
+            "WHERE user_id = ? ORDER BY updated_at DESC",
+            (user_id,),
         ).fetchall()
     return [
         {"chat_id": r[0], "title": r[1], "created_at": r[2], "updated_at": r[3]}
@@ -167,8 +266,6 @@ def list_chats() -> list:
 
 
 def get_chat_messages(chat_id: str) -> list:
-    """All messages for a chat, oldest first. Each item:
-    {role, content, masked_count}."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT role, content, masked_count FROM chat_messages "
@@ -179,8 +276,6 @@ def get_chat_messages(chat_id: str) -> list:
 
 
 def add_message(chat_id: str, role: str, content: str, masked_count: int = 0):
-    """Appends a message to a chat and bumps the chat's updated_at so it
-    sorts to the top of list_chats()."""
     now = time.time()
     with _connect() as conn:
         conn.execute(
@@ -194,31 +289,31 @@ def add_message(chat_id: str, role: str, content: str, masked_count: int = 0):
         )
 
 
-def get_chat(chat_id: str):
-    """Single chat's metadata, or None if it doesn't exist -- lets routers
-    return a real 404 instead of silently treating a bad id as an empty chat."""
+def get_chat(chat_id: str, user_id: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT chat_id, title, created_at, updated_at FROM chats WHERE chat_id = ?",
-            (chat_id,),
+            "SELECT chat_id, title, created_at, updated_at FROM chats "
+            "WHERE chat_id = ? AND user_id = ?",
+            (chat_id, user_id),
         ).fetchone()
     if not row:
         return None
     return {"chat_id": row[0], "title": row[1], "created_at": row[2], "updated_at": row[3]}
 
 
-def rename_chat(chat_id: str, title: str):
+def rename_chat(chat_id: str, user_id: str, title: str):
     with _connect() as conn:
         conn.execute(
-            "UPDATE chats SET title = ? WHERE chat_id = ?", (title, chat_id)
+            "UPDATE chats SET title = ? WHERE chat_id = ? AND user_id = ?",
+            (title, chat_id, user_id),
         )
 
 
-def delete_chat(chat_id: str):
+def delete_chat(chat_id: str, user_id: str):
     with _connect() as conn:
         conn.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM chat_files WHERE chat_id = ?", (chat_id,))
-        conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM chats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
 
 
 def set_chat_file(chat_id: str, filename: str, masked_csv: str, columns_json: str,

@@ -21,6 +21,12 @@ export interface ColumnInfo {
   enabled: boolean;
 }
 
+export interface UploadPreviewResult {
+  filename: string;
+  row_count: number;
+  columns: ColumnInfo[];
+}
+
 export interface UploadResult {
   chat_id: string;
   filename: string;
@@ -36,4 +42,13 @@ export interface AdminConfig {
   api_key_set: boolean;
   api_key_preview: string;
   common_models: string[];
+}
+
+export interface CurrentUser {
+  sub: string;
+  email: string | null;
+  display_name: string | null;
+  role: "admin" | "user";
+  created_at: number;
+  last_login_at: number;
 }

@@ -4,9 +4,10 @@ import io
 import json
 
 import pandas as pd
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 
 from .. import mapping_store as store
+from ..auth import get_current_app_user
 from ..detection import classify_dataframe_columns
 from ..masking import mask_dataframe, build_masked_context, find_leaked_values
 from ..schemas import UploadResult, UploadPreviewResult, ColumnInfo, ChatFileInfo
@@ -28,9 +29,9 @@ def _read_dataframe(filename: str, raw_bytes: bytes) -> pd.DataFrame:
 
 
 @router.post("/{chat_id}/preview", response_model=UploadPreviewResult)
-async def preview_file(chat_id: str, file: UploadFile = File(...)):
+async def preview_file(chat_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_app_user)):
     """Inspect the file in memory and return detected PII columns only."""
-    if not store.get_chat(chat_id):
+    if not store.get_chat(chat_id, user["auth0_sub"]):
         raise HTTPException(status_code=404, detail="Chat not found")
 
     raw_bytes = await file.read()
@@ -62,8 +63,9 @@ async def upload_file(
     use_ner: bool = Form(True),
     ner_confidence: float = Form(0.6),
     disabled_columns: str = Form(""),
+    user: dict = Depends(get_current_app_user),
 ):
-    if not store.get_chat(chat_id):
+    if not store.get_chat(chat_id, user["auth0_sub"]):
         raise HTTPException(status_code=404, detail="Chat not found")
 
     raw_bytes = await file.read()
@@ -139,16 +141,16 @@ async def upload_file(
 
 
 @router.delete("/{chat_id}", status_code=204)
-def delete_upload(chat_id: str):
+def delete_upload(chat_id: str, user: dict = Depends(get_current_app_user)):
     """Detach the masked file context from a chat without touching mappings."""
-    if not store.get_chat(chat_id):
+    if not store.get_chat(chat_id, user["auth0_sub"]):
         raise HTTPException(status_code=404, detail="Chat not found")
     store.delete_chat_file(chat_id)
 
 
 @router.get("/{chat_id}", response_model=ChatFileInfo)
-def get_upload_info(chat_id: str):
-    if not store.get_chat(chat_id):
+def get_upload_info(chat_id: str, user: dict = Depends(get_current_app_user)):
+    if not store.get_chat(chat_id, user["auth0_sub"]):
         raise HTTPException(status_code=404, detail="Chat not found")
     chat_file = store.get_chat_file(chat_id)
     if not chat_file:

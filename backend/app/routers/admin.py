@@ -16,9 +16,10 @@ set, and it looks like the right one" without the endpoint being able to
 hand the live secret back out on request.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from .. import mapping_store as store
+from ..auth import require_admin
 from ..llm import LLM_API_KEY_ENV, LLM_MODEL_DEFAULT, COMMON_MODELS
 from ..schemas import AdminConfigOut, AdminConfigIn
 
@@ -34,7 +35,7 @@ def _preview_key(key: str) -> str:
 
 
 @router.get("/config", response_model=AdminConfigOut)
-def get_config():
+def get_config(_admin: dict = Depends(require_admin)):
     api_key = store.get_admin_config("llm_api_key", LLM_API_KEY_ENV)
     model = store.get_admin_config("llm_model", LLM_MODEL_DEFAULT)
     return AdminConfigOut(
@@ -46,9 +47,9 @@ def get_config():
 
 
 @router.patch("/config", response_model=AdminConfigOut)
-def update_config(body: AdminConfigIn):
+def update_config(body: AdminConfigIn, _admin: dict = Depends(require_admin)):
     if body.api_key is not None and body.api_key.strip():
         store.set_admin_config("llm_api_key", body.api_key.strip())
     if body.model is not None and body.model.strip():
         store.set_admin_config("llm_model", body.model.strip())
-    return get_config()
+    return get_config(_admin=_admin)

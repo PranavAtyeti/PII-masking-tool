@@ -1,68 +1,61 @@
-"""
-routers/chats.py
------------------
-Chat CRUD -- direct 1:1 wrapping of mapping_store.py's chat functions, which
-were already backend-agnostic (plain SQLite, no Streamlit import) from when
-they were first built for the Streamlit app. This router is almost entirely
-plumbing, on purpose: the logic already existed and was already correct.
-"""
-
 import re
-
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from .. import mapping_store as store
+from ..auth import get_current_app_user
 from ..schemas import ChatOut, ChatCreateIn, ChatRenameIn, MessageOut
 
 router = APIRouter(prefix="/api/chats", tags=["chats"])
 
 
-def _get_chat_or_404(chat_id: str) -> dict:
-    chat = store.get_chat(chat_id)
+def _get_chat_or_404(chat_id: str, user_id: str) -> dict:
+    chat = store.get_chat(chat_id, user_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat
 
 
 @router.post("", response_model=ChatOut)
-def create_chat(body: ChatCreateIn):
-    chat_id = store.create_chat(body.title)
-    return store.get_chat(chat_id)
+def create_chat(body: ChatCreateIn, user: dict = Depends(get_current_app_user)):
+    chat_id = store.create_chat(user["auth0_sub"], body.title)
+    return store.get_chat(chat_id, user["auth0_sub"])
 
 
 @router.get("", response_model=list[ChatOut])
-def list_chats():
-    return store.list_chats()
+def list_chats(user: dict = Depends(get_current_app_user)):
+    return store.list_chats(user["auth0_sub"])
 
 
 @router.get("/{chat_id}", response_model=ChatOut)
-def get_chat(chat_id: str):
-    return _get_chat_or_404(chat_id)
+def get_chat(chat_id: str, user: dict = Depends(get_current_app_user)):
+    return _get_chat_or_404(chat_id, user["auth0_sub"])
 
 
 @router.get("/{chat_id}/messages", response_model=list[MessageOut])
-def get_messages(chat_id: str):
-    _get_chat_or_404(chat_id)
+def get_messages(chat_id: str, user: dict = Depends(get_current_app_user)):
+    _get_chat_or_404(chat_id, user["auth0_sub"])
     return store.get_chat_messages(chat_id)
 
 
 @router.patch("/{chat_id}", response_model=ChatOut)
-def rename_chat(chat_id: str, body: ChatRenameIn):
-    _get_chat_or_404(chat_id)
-    store.rename_chat(chat_id, body.title.strip())
-    return store.get_chat(chat_id)
+def rename_chat(chat_id: str, body: ChatRenameIn, user: dict = Depends(get_current_app_user)):
+    user_id = user["auth0_sub"]
+    _get_chat_or_404(chat_id, user_id)
+    store.rename_chat(chat_id, user_id, body.title.strip())
+    return store.get_chat(chat_id, user_id)
 
 
 @router.delete("/{chat_id}", status_code=204)
-def delete_chat(chat_id: str):
-    _get_chat_or_404(chat_id)
-    store.delete_chat(chat_id)
+def delete_chat(chat_id: str, user: dict = Depends(get_current_app_user)):
+    user_id = user["auth0_sub"]
+    _get_chat_or_404(chat_id, user_id)
+    store.delete_chat(chat_id, user_id)
 
 
 @router.get("/{chat_id}/export", response_class=PlainTextResponse)
-def export_chat(chat_id: str):
-    chat = _get_chat_or_404(chat_id)
+def export_chat(chat_id: str, user: dict = Depends(get_current_app_user)):
+    chat = _get_chat_or_404(chat_id, user["auth0_sub"])
     messages = store.get_chat_messages(chat_id)
     title = chat["title"] or "New chat"
     lines = [title, "=" * len(title), ""]

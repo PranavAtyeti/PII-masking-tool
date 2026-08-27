@@ -4,7 +4,7 @@
 // the picture locally. A production build would need this to point at
 // wherever the API actually lives instead.
 
-import type { Chat, Message, UploadPreviewResult, UploadResult } from "./types";
+import type { AdminConfig, Chat, CurrentUser, Message, UploadPreviewResult, UploadResult } from "./types";
 import { authHeaders } from "./auth";
 
 const BASE = "/api";
@@ -43,10 +43,19 @@ export class ApiError extends Error {
 }
 
 export const api = {
-  getCurrentUser(): Promise<{ sub: string; scope: string; permissions: string[]; azp?: string }> {
-    return authedFetch(`${BASE}/auth/me`).then((r) =>
-      jsonOrThrow<{ sub: string; scope: string; permissions: string[]; azp?: string }>(r)
-    );
+  getAdminConfig(): Promise<AdminConfig> {
+    return authedFetch(`${BASE}/admin/config`).then((r) => jsonOrThrow<AdminConfig>(r));
+  },
+
+  updateAdminConfig(body: { api_key?: string; model?: string }): Promise<AdminConfig> {
+    return authedFetch(`${BASE}/admin/config`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => jsonOrThrow<AdminConfig>(r));
+  },
+  getCurrentUser(): Promise<CurrentUser> {
+    return authedFetch(`${BASE}/auth/me`).then((r) => jsonOrThrow<CurrentUser>(r));
   },
 
   listChats(): Promise<Chat[]> {
@@ -149,13 +158,26 @@ export const api = {
       onDelta: (text: string) => void;
       onDone: (maskedCount: number) => void;
       onError: (message: string) => void;
-    }
+      onAbort?: () => void;
+    },
+    signal?: AbortSignal
   ): Promise<void> {
-    const res = await authedFetch(`${BASE}/chats/${chatId}/messages`, {
+    let res: Response;
+    try {
+      res = await authedFetch(`${BASE}/chats/${chatId}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        handlers.onAbort?.();
+        return;
+      }
+      handlers.onError(error instanceof Error ? error.message : "Couldn't start the response stream.");
+      return;
+    }
 
     if (!res.ok || !res.body) {
       let detail = res.statusText;
@@ -173,30 +195,37 @@ export const api = {
     const decoder = new TextDecoder();
     let buffer = "";
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
 
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary !== -1) {
-        const rawEvent = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        handleEvent(rawEvent, handlers);
-        boundary = buffer.indexOf("\n\n");
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const rawEvent = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          handleEvent(rawEvent, handlers);
+          boundary = buffer.indexOf("\n\n");
+        }
       }
-    }
-    // flush any trailing event that arrived without a final blank-line
-    // separator (e.g. connection closed right after the last event)
-    if (buffer.trim()) {
-      handleEvent(buffer, handlers);
+      buffer += decoder.decode();
+      if (buffer.trim()) handleEvent(buffer, handlers);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        handlers.onAbort?.();
+        return;
+      }
+      handlers.onError(error instanceof Error ? error.message : "The response stream ended unexpectedly.");
+    } finally {
+      reader.releaseLock();
     }
   },
 };
 
 function handleEvent(
   rawEvent: string,
-  handlers: { onDelta: (text: string) => void; onDone: (maskedCount: number) => void; onError: (message: string) => void }
+  handlers: { onDelta: (text: string) => void; onDone: (maskedCount: number) => void; onError: (message: string) => void; onAbort?: () => void }
 ) {
   const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
   if (!dataLine) return;

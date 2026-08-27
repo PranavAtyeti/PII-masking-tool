@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Chat } from "../types";
+import type { Chat, CurrentUser } from "../types";
 
 interface SidebarProps {
   chats: Chat[];
@@ -12,6 +12,9 @@ interface SidebarProps {
   onDeleteChat: (chatId: string) => void;
   onExportChat: (chatId: string) => void;
   onOpenSettings: () => void;
+  onLogout: () => void;
+  currentUser: CurrentUser | null;
+  isAdmin: boolean;
 }
 
 export function Sidebar({
@@ -25,6 +28,9 @@ export function Sidebar({
   onDeleteChat,
   onExportChat,
   onOpenSettings,
+  onLogout,
+  currentUser,
+  isAdmin,
 }: SidebarProps) {
   if (collapsed) {
     return (
@@ -39,13 +45,23 @@ export function Sidebar({
         <span className="text-xl" title="Privy">
           🔒
         </span>
+        {isAdmin && (
+          <button
+            onClick={onOpenSettings}
+            aria-label="Open settings"
+            title="Settings"
+            className="rounded-md p-2 text-white/70 hover:bg-white/10 hover:text-white"
+          >
+            ⚙
+          </button>
+        )}
         <button
-          onClick={onOpenSettings}
-          aria-label="Open settings"
-          title="Settings"
+          onClick={onLogout}
+          aria-label="Log out"
+          title="Log out"
           className="rounded-md p-2 text-white/70 hover:bg-white/10 hover:text-white"
         >
-          ⚙
+          ↪
         </button>
       </div>
     );
@@ -97,15 +113,61 @@ export function Sidebar({
         )}
       </div>
 
-      <button
-        onClick={onOpenSettings}
-        className="mt-4 flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/[0.10] hover:text-white"
-      >
-        <span aria-hidden>⚙</span>
-        <span>Settings</span>
-      </button>
+      <div className="mt-4 border-t border-white/10 pt-3">
+        {currentUser && (
+          <div className="mb-2 flex items-center gap-3 rounded-lg px-2 py-2">
+            <div
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/15 text-xs font-semibold text-white"
+              aria-hidden
+            >
+              {getInitials(currentUser.display_name, currentUser.email)}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-white">
+                {currentUser.display_name || "Privy user"}
+              </p>
+              <p className="truncate text-xs text-white/50">
+                {currentUser.email || "Signed in"}
+              </p>
+              {isAdmin && (
+                <p className="mt-0.5 text-[11px] text-white/40">Administrator</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-1">
+          {isAdmin && (
+            <button
+              onClick={onOpenSettings}
+              className="flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/[0.10] hover:text-white"
+            >
+              <span aria-hidden>⚙</span>
+              <span>Admin settings</span>
+            </button>
+          )}
+          <button
+            onClick={onLogout}
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/[0.10] hover:text-white"
+          >
+            <span aria-hidden>↪</span>
+            <span>Log out</span>
+          </button>
+        </div>
+      </div>
     </aside>
   );
+}
+
+function getInitials(displayName: string | null, email: string | null): string {
+  const source = displayName?.trim() || email?.trim() || "P";
+  const parts = source.split(/\s+/).filter(Boolean);
+
+  if (parts.length >= 2) {
+    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+
+  return source.slice(0, 2).toUpperCase();
 }
 
 interface ChatListItemProps {

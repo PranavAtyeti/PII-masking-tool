@@ -1,8 +1,5 @@
 """
-Auth0 JWT validation for the Privy FastAPI backend.
-
-This module validates Auth0 access tokens issued for the Privy API. It does
-not create users or enforce chat ownership yet; that is the next auth step.
+Auth0 JWT validation plus local Privy user/role resolution.
 """
 
 import os
@@ -13,6 +10,8 @@ import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
+
+from . import mapping_store as store
 
 AUTH0_DOMAIN = os.environ.get("AUTH0_DOMAIN", "").strip()
 AUTH0_AUDIENCE = os.environ.get("AUTH0_AUDIENCE", "").strip()
@@ -25,7 +24,6 @@ if not AUTH0_DOMAIN or not AUTH0_AUDIENCE:
 
 AUTH0_ISSUER = f"https://{AUTH0_DOMAIN}/"
 JWKS_URL = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -49,11 +47,10 @@ def get_current_user(
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise _unauthorized("Missing Bearer access token")
 
-    token = credentials.credentials
     try:
-        signing_key = _jwks_client().get_signing_key_from_jwt(token).key
-        claims = jwt.decode(
-            token,
+        signing_key = _jwks_client().get_signing_key_from_jwt(credentials.credentials).key
+        return jwt.decode(
+            credentials.credentials,
             signing_key,
             algorithms=["RS256"],
             audience=AUTH0_AUDIENCE,
@@ -69,7 +66,18 @@ def get_current_user(
     except jwt.PyJWTError as exc:
         raise _unauthorized("Invalid Auth0 access token") from exc
     except Exception as exc:
-        # Covers JWKS/network/key lookup failures without leaking internals.
         raise _unauthorized("Unable to validate Auth0 access token") from exc
 
-    return claims
+
+def get_current_app_user(claims: dict[str, Any] = Depends(get_current_user)) -> dict:
+    """Resolve an Auth0 identity to a local Privy user and update last-login metadata."""
+    auth0_sub = claims["sub"]
+    email = claims.get("email")
+    display_name = claims.get("name") or claims.get("nickname") or email or auth0_sub
+    return store.get_or_create_user(auth0_sub, email=email, display_name=display_name)
+
+
+def require_admin(user: dict = Depends(get_current_app_user)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return user
