@@ -1,22 +1,30 @@
-// Typed client for the backend built in sessions 1-2. In dev, calls go to
-// relative "/api/..." paths -- vite.config.ts proxies those to the FastAPI
-// server, so the browser sees same-origin requests and CORS never enters
-// the picture locally. A production build would need this to point at
-// wherever the API actually lives instead.
-
-import type { AdminConfig, Chat, CurrentUser, Message, UploadPreviewResult, UploadResult } from "./types";
+import type {
+  AdminConfig,
+  Chat,
+  ChatFileInfo,
+  ColumnInfo,
+  CurrentUser,
+  Message,
+  UploadResult,
+  ModelCatalogResponse,
+} from "./types";
 import { authHeaders } from "./auth";
 
 const BASE = "/api";
 
 async function authedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const auth = await authHeaders();
+  const headers = new Headers(init.headers);
+
+  for (const [key, value] of Object.entries(auth)) {
+    if (value !== undefined && value !== null && value !== "") {
+      headers.set(key, String(value));
+    }
+  }
+
   return fetch(input, {
     ...init,
-    headers: {
-      ...auth,
-      ...(init.headers ?? {}),
-    },
+    headers,
   });
 }
 
@@ -27,7 +35,7 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
       const body = await res.json();
       detail = body.detail ?? detail;
     } catch {
-      // response wasn't JSON -- fall back to statusText, already set above
+      // Non-JSON response.
     }
     throw new ApiError(res.status, detail);
   }
@@ -36,6 +44,7 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
 
 export class ApiError extends Error {
   status: number;
+
   constructor(status: number, message: string) {
     super(message);
     this.status = status;
@@ -43,6 +52,14 @@ export class ApiError extends Error {
 }
 
 export const api = {
+  getCurrentUser(): Promise<CurrentUser> {
+    return authedFetch(`${BASE}/auth/me`).then((r) => jsonOrThrow<CurrentUser>(r));
+  },
+
+  getModels(): Promise<ModelCatalogResponse> {
+    return authedFetch(`${BASE}/auth/models`).then((r) => jsonOrThrow<ModelCatalogResponse>(r));
+  },
+
   getAdminConfig(): Promise<AdminConfig> {
     return authedFetch(`${BASE}/admin/config`).then((r) => jsonOrThrow<AdminConfig>(r));
   },
@@ -53,9 +70,6 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then((r) => jsonOrThrow<AdminConfig>(r));
-  },
-  getCurrentUser(): Promise<CurrentUser> {
-    return authedFetch(`${BASE}/auth/me`).then((r) => jsonOrThrow<CurrentUser>(r));
   },
 
   listChats(): Promise<Chat[]> {
@@ -93,9 +107,6 @@ export const api = {
     const res = await authedFetch(`${BASE}/chats/${chatId}/export`);
     if (!res.ok) throw new ApiError(res.status, res.statusText);
     const blob = await res.blob();
-    // filename comes from the server's Content-Disposition header; browsers
-    // don't expose an easy parsed form of it, so re-derive a reasonable one
-    // rather than parsing that header by hand.
     const disposition = res.headers.get("Content-Disposition") ?? "";
     const match = disposition.match(/filename="([^"]+)"/);
     const filename = match?.[1] ?? "chat.txt";
@@ -107,53 +118,54 @@ export const api = {
     URL.revokeObjectURL(url);
   },
 
-  async getFileInfo(chatId: string): Promise<{ filename: string; row_count: number; truncated: boolean; kept_private_count: number } | null> {
+  async listFiles(chatId: string): Promise<ChatFileInfo[]> {
     const res = await authedFetch(`${BASE}/upload/${chatId}`);
-    if (res.status === 404) return null; // no file uploaded for this chat -- not an error
-    return jsonOrThrow(res);
+    return jsonOrThrow<ChatFileInfo[]>(res);
   },
 
-  previewFile(chatId: string, file: File): Promise<UploadPreviewResult> {
+  async previewFile(chatId: string, file: File): Promise<UploadPreviewResult> {
     const form = new FormData();
     form.append("file", file);
-    return authedFetch(`${BASE}/upload/${chatId}/preview`, {
+    const res = await authedFetch(`${BASE}/upload/${chatId}/preview`, {
       method: "POST",
       body: form,
-    }).then((r) => jsonOrThrow<UploadPreviewResult>(r));
+    });
+    return jsonOrThrow<UploadPreviewResult>(res);
   },
 
   uploadFile(
     chatId: string,
     file: File,
-    opts: { useNer: boolean; nerConfidence: number; disabledColumns?: string[] }
+    opts: {
+      useNer: boolean;
+      nerConfidence: number;
+      disabledColumns?: string[];
+      fileId?: string;
+    }
   ): Promise<UploadResult> {
     const form = new FormData();
     form.append("file", file);
     form.append("use_ner", String(opts.useNer));
     form.append("ner_confidence", String(opts.nerConfidence));
     form.append("disabled_columns", (opts.disabledColumns ?? []).join(","));
-    return authedFetch(`${BASE}/upload/${chatId}`, { method: "POST", body: form }).then((r) =>
-      jsonOrThrow<UploadResult>(r)
-    );
+    if (opts.fileId) form.append("file_id", opts.fileId);
+
+    return authedFetch(`${BASE}/upload/${chatId}`, {
+      method: "POST",
+      body: form,
+    }).then((r) => jsonOrThrow<UploadResult>(r));
   },
 
-  /**
-   * Streams an answer via Server-Sent Events. Can't use the browser's
-   * EventSource here -- it only supports GET requests with no body, and
-   * this endpoint needs a POST with a JSON question. So this hand-parses
-   * the fetch() response body instead.
-   *
-   * SSE framing: events are separated by a blank line ("\n\n"); each event
-   * is one or more "data: ..." lines. This backend only ever sends a single
-   * "data:" line per event (see routers/messages.py's _sse()), so this
-   * parser doesn't need to handle multi-line data blocks -- but chunk
-   * boundaries from the network don't respect event boundaries at all, so
-   * a "\n\n"-terminated event can still arrive split across two chunks (or
-   * two events can arrive in one chunk). Buffering on "\n\n" handles both.
-   */
+  async removeFile(chatId: string, fileId: string): Promise<void> {
+    const res = await authedFetch(`${BASE}/upload/${chatId}/${fileId}`, { method: "DELETE" });
+    if (!res.ok && res.status !== 204) {
+      throw new ApiError(res.status, res.statusText);
+    }
+  },
+
   async streamMessage(
     chatId: string,
-    body: { question: string; use_ner: boolean; ner_confidence: number; concise: boolean },
+    body: { question: string; use_ner: boolean; ner_confidence: number; concise: boolean; model_id?: string },
     handlers: {
       onDelta: (text: string) => void;
       onDone: (maskedCount: number) => void;
@@ -163,13 +175,14 @@ export const api = {
     signal?: AbortSignal
   ): Promise<void> {
     let res: Response;
+
     try {
       res = await authedFetch(`${BASE}/chats/${chatId}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal,
-    });
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         handlers.onAbort?.();
@@ -185,7 +198,7 @@ export const api = {
         const errBody = await res.json();
         detail = errBody.detail ?? detail;
       } catch {
-        // not JSON, use statusText
+        // Non-JSON response.
       }
       handlers.onError(detail);
       return;
@@ -199,9 +212,10 @@ export const api = {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
 
+        buffer += decoder.decode(value, { stream: true });
         let boundary = buffer.indexOf("\n\n");
+
         while (boundary !== -1) {
           const rawEvent = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
@@ -209,6 +223,7 @@ export const api = {
           boundary = buffer.indexOf("\n\n");
         }
       }
+
       buffer += decoder.decode();
       if (buffer.trim()) handleEvent(buffer, handlers);
     } catch (error) {
@@ -216,7 +231,9 @@ export const api = {
         handlers.onAbort?.();
         return;
       }
-      handlers.onError(error instanceof Error ? error.message : "The response stream ended unexpectedly.");
+      handlers.onError(
+        error instanceof Error ? error.message : "The response stream ended unexpectedly."
+      );
     } finally {
       reader.releaseLock();
     }
@@ -225,10 +242,16 @@ export const api = {
 
 function handleEvent(
   rawEvent: string,
-  handlers: { onDelta: (text: string) => void; onDone: (maskedCount: number) => void; onError: (message: string) => void; onAbort?: () => void }
+  handlers: {
+    onDelta: (text: string) => void;
+    onDone: (maskedCount: number) => void;
+    onError: (message: string) => void;
+    onAbort?: () => void;
+  }
 ) {
   const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
   if (!dataLine) return;
+
   const payload = dataLine.slice("data:".length).trim();
   if (!payload) return;
 
@@ -236,7 +259,7 @@ function handleEvent(
   try {
     obj = JSON.parse(payload);
   } catch {
-    return; // malformed event -- skip rather than crash the whole stream
+    return;
   }
 
   if (typeof obj.delta === "string") {

@@ -1,24 +1,4 @@
-"""
-routers/messages.py
---------------------
-Ask a question in a chat. Streams the answer back over Server-Sent Events
-(SSE) as it arrives from the model, unmasking safely as it goes (see
-masking.stream_unmask for why that's not just "unmask each chunk").
-
-SSE event shapes sent to the client, one JSON object per `data:` line:
-  {"delta": "..."}                      -- a piece of the answer, append it
-  {"done": true, "masked_count": N}      -- stream finished normally
-  {"error": "..."}                       -- something went wrong; the
-                                             "error" text IS the message to
-                                             show the user (already phrased
-                                             for display, not a raw
-                                             exception)
-
-Whatever the outcome, the assistant's message is persisted to the chat
-exactly once, after the stream ends -- same guarantee the original
-Streamlit version had (one chat_history entry per question, even for a
-blocked/errored answer).
-"""
+"""Ask a question against all masked files attached to a chat."""
 
 import json
 
@@ -29,6 +9,10 @@ from fastapi.responses import StreamingResponse
 from .. import mapping_store as store
 from ..auth import get_current_app_user
 from ..llm import call_llm, stream_llm, LLM_API_KEY_ENV, LLM_MODEL_DEFAULT
+from ..context_limits import (
+    MAX_TOTAL_FILE_CONTEXT_TOKENS,
+    limit_file_context,
+)
 from ..masking import (
     mask_free_text_cell, _replace_known_values, unmask_text, stream_unmask,
     looks_unmasked, count_masked_tokens,
@@ -43,66 +27,96 @@ def _sse(obj: dict) -> str:
 
 
 def _get_active_llm_config():
-    """Same precedence as the Streamlit version: admin-set DB config wins
-    over .env, which wins over the hardcoded default. Not cached -- an
-    admin's change should apply to the very next request, from anyone."""
     api_key = store.get_admin_config("llm_api_key", LLM_API_KEY_ENV)
     model = store.get_admin_config("llm_model", LLM_MODEL_DEFAULT)
     return api_key, model
 
 
 def _build_prompt(chat_id: str, masked_question: str, concise: bool):
-    """Returns (system_prompt, user_prompt, payload_to_check). Branches on
-    whether this chat has an uploaded file, same as the original
-    process_question(). The file's masked CSV is read back from
-    mapping_store (persisted at upload time) rather than from any
-    in-memory dataframe -- there isn't one; see masking.py's docstring."""
     length_instruction = (
         "Be concise: lead with the direct answer in 1-3 sentences, no preamble, "
         "no restating the question, no closing summary. Only go longer if the "
         "question explicitly asks for detail or a breakdown."
         if concise else
-        "Give a complete, clearly explained answer, using more than a few "
-        "sentences where it genuinely helps understanding."
+        "Give a complete, clearly explained answer, using more than a few sentences "
+        "where it genuinely helps understanding."
     )
 
-    chat_file = store.get_chat_file(chat_id)
-    if chat_file:
-        row_note = (
-            f"You are seeing the first 200 of {chat_file['row_count']} total rows -- "
-            "do not imply or assume you have the full dataset."
-            if chat_file["truncated"] else
-            f"You are seeing all {chat_file['row_count']} rows of the dataset."
-        )
+    chat_files = store.get_chat_files(chat_id)
+    if chat_files:
+        sections: list[str] = []
+        total_rows = 0
+        any_truncated = False
+        context_was_limited = False
+        remaining_tokens = MAX_TOTAL_FILE_CONTEXT_TOKENS
+
+        for index, chat_file in enumerate(chat_files, start=1):
+            total_rows += chat_file["row_count"]
+            any_truncated = any_truncated or chat_file["truncated"]
+
+            limited_csv, used_tokens, limited = limit_file_context(
+                chat_file["filename"],
+                chat_file["masked_csv"],
+                remaining_tokens,
+            )
+            if used_tokens <= 0:
+                context_was_limited = True
+                break
+
+            remaining_tokens = max(0, remaining_tokens - used_tokens)
+            context_was_limited = context_was_limited or limited
+            sections.append(
+                f"=== FILE {index}: {chat_file['filename']} ===\n"
+                f"{limited_csv}"
+            )
+
+            if remaining_tokens <= 0:
+                context_was_limited = context_was_limited or index < len(chat_files)
+                break
+
+        file_context = "\n\n".join(sections)
+        row_notes = []
+        if any_truncated:
+            row_notes.append(
+                "One or more files are truncated to their first 200 rows; do not imply "
+                "you have every row from those files."
+            )
+        else:
+            row_notes.append(
+                f"You are seeing the stored rows across the attached files ({total_rows} rows total)."
+            )
+        if context_was_limited:
+            row_notes.append(
+                f"Privy may limit file context to about {MAX_TOTAL_FILE_CONTEXT_TOKENS:,} "
+                "tokens across this request. Do not claim to have analyzed rows or file "
+                "content that is not present in the supplied context."
+            )
+        row_note = " ".join(row_notes)
+
         system_prompt = (
-            "You are analyzing a spreadsheet where sensitive values have been "
+            "You are analyzing one or more spreadsheets where sensitive values have been "
             "replaced with placeholder tokens like [PERSON_NAME_1], [EMAIL_EMAIL_1], "
-            "[ID_AADHAAR_2]. The part before the number hints at both the data type "
-            "and the column it came from. Never claim to know the real values behind "
-            "tokens. Answer using only the masked data provided -- do not guess or "
-            "fill in values that aren't there. " + row_note + " When asked to "
-            "identify a specific person (e.g. 'who earns the most'), refer to them "
-            "using the token from the column that actually represents their name "
-            "(tokens starting with PERSON_), not an ID/account/customer-number token, "
-            "even if both appear in the same row. Always reproduce tokens exactly as "
-            "given, including the surrounding brackets (e.g. [PERSON_NAME_1]) -- never "
-            "paraphrase, reformat, or drop the brackets, or the value cannot be "
-            "restored for display. If a question requires exact arithmetic across many "
-            "rows (sums, medians, averages, counts), work through the rows carefully "
-            "and show your row-by-row reasoning briefly before giving the final answer, "
+            "[ID_AADHAAR_2]. The part before the number hints at the data type and the "
+            "column it came from. Never claim to know the real values behind tokens. "
+            "Answer using only the masked data provided -- do not guess or fill in values "
+            "that aren't there. " + row_note + " Keep file names in mind when combining "
+            "information across files. When asked to identify a specific person, refer to "
+            "them using the token from the column that actually represents their name "
+            "(tokens starting with PERSON_), not an ID/account/customer-number token, even "
+            "if both appear in the same row. Always reproduce tokens exactly as given, "
+            "including the surrounding brackets. If a question requires exact arithmetic "
+            "across many rows (sums, medians, averages, counts), work through the rows "
+            "carefully and show the relevant reasoning briefly before the final answer, "
             "rather than estimating. " + length_instruction
         )
-        user_prompt = f"MASKED DATA (CSV):\n{chat_file['masked_csv']}\n\nQUESTION: {masked_question}"
-        payload_to_check = chat_file["masked_csv"] + masked_question
+        user_prompt = f"MASKED DATA FROM ATTACHED FILES:\n{file_context}\n\nQUESTION: {masked_question}"
+        payload_to_check = file_context + masked_question
     else:
         system_prompt = (
-            "You are a helpful, general-purpose assistant. Any personal information "
-            "the user typed (names, emails, phone numbers, etc.) may have already "
-            "been replaced with placeholder tokens like [PERSON_NAME_1] before "
-            "reaching you, as a privacy safeguard -- if you see a token like that, "
-            "treat it as a stand-in for that piece of information and use it "
-            "naturally in your answer exactly as written, brackets included, rather "
-            "than commenting on it or guessing what it says. " + length_instruction
+            "You are a helpful, general-purpose assistant. Any personal information the "
+            "user typed may have already been replaced with placeholder tokens before "
+            "reaching you. Treat those tokens as stand-ins and use them exactly as written, "
+            "rather than guessing what they contain. " + length_instruction
         )
         user_prompt = masked_question
         payload_to_check = masked_question
@@ -111,8 +125,6 @@ def _build_prompt(chat_id: str, masked_question: str, concise: bool):
 
 
 def _generate(chat_id: str, body: MessageIn, user_id: str):
-    """The actual SSE event generator. All persistence + error handling
-    lives in here so it happens regardless of how the stream ends."""
     is_first_message = len(store.get_chat_messages(chat_id)) == 0
 
     store.add_message(chat_id, "user", body.question)
@@ -137,8 +149,8 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
 
     if looks_unmasked(payload_to_check):
         answer = (
-            "Request blocked: content still looks like it contains unmasked "
-            "personal data. Nothing was sent to the model."
+            "Request blocked: content still looks like it contains unmasked personal data. "
+            "Nothing was sent to the model."
         )
         yield _sse({"delta": answer})
         store.add_message(chat_id, "assistant", answer, masked_count)
@@ -148,13 +160,11 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
     api_key, model = _get_active_llm_config()
 
     if is_first_message:
-        # Best-effort title polish -- see the Streamlit version's comment
-        # for why this is silent-fail and uses the already-masked question.
         try:
             title_raw = call_llm(
-                "Write a short title (3-6 words) summarizing the topic of "
-                "the user's message below. Plain text only -- no quotes, "
-                "no punctuation at the end, no preamble like 'Title:'.",
+                "Write a short title (3-6 words) summarizing the topic of the user's "
+                "message below. Plain text only -- no quotes, no punctuation at the end, "
+                "no preamble like 'Title:'.",
                 masked_question, api_key, model,
                 temperature=0.3, max_tokens=16,
             )
@@ -165,9 +175,11 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
         except Exception:
             pass
 
-    answer_parts = []
+    answer_parts: list[str] = []
     try:
-        raw_chunks = stream_llm(system_prompt, user_prompt, api_key, model, max_tokens=max_tokens)
+        raw_chunks = stream_llm(
+            system_prompt, user_prompt, api_key, model, max_tokens=max_tokens
+        )
         for piece in stream_unmask(raw_chunks, chat_id):
             if piece:
                 answer_parts.append(piece)
@@ -191,7 +203,14 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
 
 
 @router.post("/{chat_id}/messages")
-def post_message(chat_id: str, body: MessageIn, user: dict = Depends(get_current_app_user)):
+def post_message(
+    chat_id: str,
+    body: MessageIn,
+    user: dict = Depends(get_current_app_user),
+):
     if not store.get_chat(chat_id, user["auth0_sub"]):
         raise HTTPException(status_code=404, detail="Chat not found")
-    return StreamingResponse(_generate(chat_id, body, user["auth0_sub"]), media_type="text/event-stream")
+    return StreamingResponse(
+        _generate(chat_id, body, user["auth0_sub"]),
+        media_type="text/event-stream",
+    )

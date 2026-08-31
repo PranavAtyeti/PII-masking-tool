@@ -65,6 +65,9 @@ def get_current_user(
         raise _unauthorized("Auth0 access token has the wrong issuer") from exc
     except jwt.PyJWTError as exc:
         raise _unauthorized("Invalid Auth0 access token") from exc
+    # except jwt.PyJWTError as exc:
+    #     print(f"Auth0 JWT validation error: {type(exc).__name__}: {exc}")
+    #     raise _unauthorized("Invalid Auth0 access token") from exc
     except Exception as exc:
         raise _unauthorized("Unable to validate Auth0 access token") from exc
 

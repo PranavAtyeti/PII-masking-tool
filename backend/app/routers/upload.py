@@ -1,19 +1,29 @@
-"""Upload, preview, and detach spreadsheet context for a chat."""
+"""Upload, preview, list, and remove spreadsheet files for a chat."""
 
 import io
 import json
 
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from .. import mapping_store as store
+from ..context_limits import MAX_ROWS_PER_FILE
 from ..auth import get_current_app_user
 from ..detection import classify_dataframe_columns
-from ..masking import mask_dataframe, build_masked_context, find_leaked_values
-from ..schemas import UploadResult, UploadPreviewResult, ColumnInfo, ChatFileInfo
+from ..masking import build_masked_context, count_masked_tokens, find_leaked_values, mask_dataframe
+from ..schemas import ChatFileInfo, ColumnInfo, UploadPreviewResult, UploadResult
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+MAX_FILES_PER_CHAT = 10
+
+
+def _get_chat_or_404(chat_id: str, user_id: str) -> dict:
+    chat = store.get_chat(chat_id, user_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return chat
 
 
 def _read_dataframe(filename: str, raw_bytes: bytes) -> pd.DataFrame:
@@ -29,24 +39,43 @@ def _read_dataframe(filename: str, raw_bytes: bytes) -> pd.DataFrame:
 
 
 @router.post("/{chat_id}/preview", response_model=UploadPreviewResult)
-async def preview_file(chat_id: str, file: UploadFile = File(...), user: dict = Depends(get_current_app_user)):
-    """Inspect the file in memory and return detected PII columns only."""
-    if not store.get_chat(chat_id, user["auth0_sub"]):
-        raise HTTPException(status_code=404, detail="Chat not found")
+async def preview_file(
+    chat_id: str,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_app_user),
+):
+    """Inspect one file in memory. Nothing is persisted by preview."""
+    _get_chat_or_404(chat_id, user["auth0_sub"])
 
     raw_bytes = await file.read()
+    if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. Privy allows files up to {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
+        )
     try:
         df = _read_dataframe(file.filename or "upload.csv", raw_bytes)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}")
-    finally:
-        del raw_bytes
+        raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}") from e
 
     col_types = classify_dataframe_columns(df)
+    if len(df) > MAX_ROWS_PER_FILE:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File contains {len(df):,} rows. Privy allows up to "
+                f"{MAX_ROWS_PER_FILE:,} rows per file."
+            ),
+        )
+
     columns = [
-        ColumnInfo(name=str(col), type=col_types.get(col), enabled=bool(col_types.get(col)))
+        ColumnInfo(
+            name=str(col),
+            type=col_types.get(col),
+            enabled=bool(col_types.get(col)),
+        )
         for col in df.columns
     ]
     return UploadPreviewResult(
@@ -63,23 +92,45 @@ async def upload_file(
     use_ner: bool = Form(True),
     ner_confidence: float = Form(0.6),
     disabled_columns: str = Form(""),
+    file_id: str | None = Form(None),
     user: dict = Depends(get_current_app_user),
 ):
-    if not store.get_chat(chat_id, user["auth0_sub"]):
-        raise HTTPException(status_code=404, detail="Chat not found")
+    """Mask one file and add/replace it as an attachment on the chat."""
+    _get_chat_or_404(chat_id, user["auth0_sub"])
+
+    if not file_id and len(store.get_chat_files(chat_id)) >= MAX_FILES_PER_CHAT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This chat already has {MAX_FILES_PER_CHAT} files. Remove a file before adding another.",
+        )
+
+    if file_id and not store.get_chat_file(chat_id, file_id):
+        raise HTTPException(status_code=404, detail="File not found")
 
     raw_bytes = await file.read()
+    if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. Privy allows files up to {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
+        )
     try:
         df = _read_dataframe(file.filename or "upload.csv", raw_bytes)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}")
-    finally:
-        del raw_bytes
+        raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}") from e
 
     disabled = {c.strip() for c in disabled_columns.split(",") if c.strip()}
     col_types = classify_dataframe_columns(df)
+    if len(df) > MAX_ROWS_PER_FILE:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File contains {len(df):,} rows. Privy allows up to "
+                f"{MAX_ROWS_PER_FILE:,} rows per file."
+            ),
+        )
+
 
     counters = store.load_counters(chat_id)
     masked_df, _known_values = mask_dataframe(
@@ -96,7 +147,7 @@ async def upload_file(
     leaked = find_leaked_values(df, masked_df, col_types, enabled_columns)
     if leaked:
         leaked_cols = sorted({col for col, _ in leaked})
-        examples_by_col = {}
+        examples_by_col: dict[str, list[str]] = {}
         for col, val in leaked:
             examples_by_col.setdefault(col, [])
             if val not in examples_by_col[col] and len(examples_by_col[col]) < 3:
@@ -108,56 +159,74 @@ async def upload_file(
             status_code=422,
             detail=(
                 f"Masking failed for a structured field in column(s) "
-                f"{', '.join(leaked_cols)} -- its value is still raw in the "
-                f"data. Example(s): {example_lines}. Nothing was saved. This "
-                "is a masking bug, not a setting to adjust -- please report it."
+                f"{', '.join(leaked_cols)} -- its value is still raw in the data. "
+                f"Example(s): {example_lines}. Nothing was saved. This is a masking "
+                "bug, not a setting to adjust -- please report it."
             ),
         )
 
     masked_csv, truncated = build_masked_context(masked_df)
     columns = [
-        ColumnInfo(name=col, type=col_types.get(col), enabled=col not in disabled)
+        ColumnInfo(name=str(col), type=col_types.get(col), enabled=col not in disabled)
         for col in df.columns
     ]
 
-    store.set_chat_file(
+    # An edit supplies file_id; a new attachment gets a fresh UUID in the store.
+    masked_count = count_masked_tokens(masked_csv)
+
+    resolved_file_id = store.set_chat_file(
         chat_id=chat_id,
         filename=file.filename or "upload.csv",
         masked_csv=masked_csv,
         columns_json=json.dumps([c.model_dump() for c in columns]),
         row_count=len(df),
         truncated=truncated,
+        masked_count=masked_count,
+        file_id=file_id,
     )
 
     return UploadResult(
         chat_id=chat_id,
+        file_id=resolved_file_id,
         filename=file.filename or "upload.csv",
         row_count=len(df),
         truncated=truncated,
         columns=columns,
-        kept_private_count=store.session_entry_count(chat_id),
+        masked_count=masked_count,
         preview_csv=masked_csv,
     )
 
 
-@router.delete("/{chat_id}", status_code=204)
-def delete_upload(chat_id: str, user: dict = Depends(get_current_app_user)):
-    """Detach the masked file context from a chat without touching mappings."""
-    if not store.get_chat(chat_id, user["auth0_sub"]):
-        raise HTTPException(status_code=404, detail="Chat not found")
-    store.delete_chat_file(chat_id)
+@router.get("/{chat_id}", response_model=list[ChatFileInfo])
+def list_uploads(chat_id: str, user: dict = Depends(get_current_app_user)):
+    _get_chat_or_404(chat_id, user["auth0_sub"])
+
+    files: list[ChatFileInfo] = []
+    for chat_file in store.get_chat_files(chat_id):
+        try:
+            columns_data = json.loads(chat_file["columns_json"])
+            columns = [ColumnInfo(**item) for item in columns_data]
+        except (ValueError, TypeError, KeyError):
+            columns = []
+        files.append(
+            ChatFileInfo(
+                file_id=chat_file["file_id"],
+                filename=chat_file["filename"],
+                row_count=chat_file["row_count"],
+                truncated=chat_file["truncated"],
+                masked_count=chat_file["masked_count"],
+                columns=columns,
+            )
+        )
+    return files
 
 
-@router.get("/{chat_id}", response_model=ChatFileInfo)
-def get_upload_info(chat_id: str, user: dict = Depends(get_current_app_user)):
-    if not store.get_chat(chat_id, user["auth0_sub"]):
-        raise HTTPException(status_code=404, detail="Chat not found")
-    chat_file = store.get_chat_file(chat_id)
-    if not chat_file:
-        raise HTTPException(status_code=404, detail="No file uploaded for this chat")
-    return ChatFileInfo(
-        filename=chat_file["filename"],
-        row_count=chat_file["row_count"],
-        truncated=chat_file["truncated"],
-        kept_private_count=store.session_entry_count(chat_id),
-    )
+@router.delete("/{chat_id}/{file_id}", status_code=204)
+def delete_upload(
+    chat_id: str,
+    file_id: str,
+    user: dict = Depends(get_current_app_user),
+):
+    _get_chat_or_404(chat_id, user["auth0_sub"])
+    if not store.delete_chat_file(chat_id, file_id):
+        raise HTTPException(status_code=404, detail="File not found")

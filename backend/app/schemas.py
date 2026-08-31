@@ -1,9 +1,7 @@
 """
 schemas.py
 ----------
-Pydantic models for request/response bodies. Kept separate from the
-routers so the shapes are easy to scan in one place -- useful once the
-React frontend needs to mirror these as TypeScript types.
+Pydantic models for request/response bodies.
 """
 
 from pydantic import BaseModel, Field
@@ -29,6 +27,7 @@ class MessageIn(BaseModel):
     use_ner: bool = True
     ner_confidence: float = 0.6
     concise: bool = True
+    model_id: str | None = None
 
 
 class MessageOut(BaseModel):
@@ -40,26 +39,28 @@ class MessageOut(BaseModel):
 class AdminConfigOut(BaseModel):
     model: str
     api_key_set: bool
-    api_key_preview: str = ""  # e.g. "sk-...wxyz" -- never the full key
+    api_key_preview: str = ""
     common_models: list[str]
 
 
 class AdminConfigIn(BaseModel):
-    api_key: str | None = None  # None/omitted = leave unchanged
+    api_key: str | None = None
     model: str | None = None
-
-
-class ChatFileInfo(BaseModel):
-    filename: str
-    row_count: int
-    truncated: bool
-    kept_private_count: int
 
 
 class ColumnInfo(BaseModel):
     name: str
-    type: str | None  # e.g. "PERSON", "EMAIL"... None means not classified as PII
-    enabled: bool  # whether this column was included in masking for this upload
+    type: str | None
+    enabled: bool
+
+
+class ChatFileInfo(BaseModel):
+    file_id: str
+    filename: str
+    row_count: int
+    truncated: bool
+    masked_count: int
+    columns: list[ColumnInfo]
 
 
 class UploadPreviewResult(BaseModel):
@@ -70,9 +71,10 @@ class UploadPreviewResult(BaseModel):
 
 class UploadResult(BaseModel):
     chat_id: str
+    file_id: str
     filename: str
     row_count: int
     truncated: bool
     columns: list[ColumnInfo]
-    kept_private_count: int
-    preview_csv: str  # masked preview, first rows only -- never raw
+    masked_count: int
+    preview_csv: str

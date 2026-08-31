@@ -1,7 +1,3 @@
-// Mirrors backend/app/schemas.py. Kept 1:1 on purpose -- when session 4
-// wires this up to the real API, the shapes should already match exactly,
-// so there's nothing to reconcile beyond the fetch calls themselves.
-
 export interface Chat {
   chat_id: string;
   title: string;
@@ -27,13 +23,23 @@ export interface UploadPreviewResult {
   columns: ColumnInfo[];
 }
 
+export interface ChatFileInfo {
+  file_id: string;
+  filename: string;
+  row_count: number;
+  truncated: boolean;
+  masked_count: number;
+  columns: ColumnInfo[];
+}
+
 export interface UploadResult {
   chat_id: string;
+  file_id: string;
   filename: string;
   row_count: number;
   truncated: boolean;
   columns: ColumnInfo[];
-  kept_private_count: number;
+  masked_count: number;
   preview_csv: string;
 }
 
@@ -51,4 +57,18 @@ export interface CurrentUser {
   role: "admin" | "user";
   created_at: number;
   last_login_at: number;
+}
+
+
+export interface ModelOption {
+  id: string;
+  provider: string;
+  model: string;
+  label: string;
+  description: string;
+}
+
+export interface ModelCatalogResponse {
+  models: ModelOption[];
+  default_model_id: string | null;
 }

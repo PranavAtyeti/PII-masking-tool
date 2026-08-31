@@ -4,9 +4,21 @@ import { setAccessTokenGetter } from "./auth";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPane } from "./components/ChatPane";
 import { SettingsPanel } from "./components/SettingsPanel";
-import type { Chat, ColumnInfo, CurrentUser, Message } from "./types";
+import type { Chat, ChatFileInfo, ColumnInfo, CurrentUser, Message, ModelOption } from "./types";
 import { api } from "./api";
 import { SUGGESTION_CHIPS } from "./constants";
+import type { ChatAttachment } from "./components/ChatInput";
+import {
+  MAX_FILE_SIZE_BYTES,
+  MAX_FILE_SIZE_MB,
+  MAX_FILES_PER_CHAT,
+  MAX_FILES_PER_SELECTION,
+} from "./uploadLimits";
+
+interface LocalAttachment extends ChatAttachment {
+  file: File | null;
+  columns: ColumnInfo[];
+}
 
 export default function App() {
   const {
@@ -17,26 +29,14 @@ export default function App() {
     getAccessTokenSilently,
     user: auth0User,
   } = useAuth0();
+
   const [backendAuthReady, setBackendAuthReady] = useState(false);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-
-  useEffect(() => {
-    if (isAuthenticated) {
-      setAccessTokenGetter(() => getAccessTokenSilently());
-    } else {
-      setAccessTokenGetter(null);
-    }
-    return () => setAccessTokenGetter(null);
-  }, [isAuthenticated, getAccessTokenSilently]);
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
-  const [attachedFile, setAttachedFile] = useState<{
-    file: File | null;
-    filename: string;
-    keptPrivateCount: number;
-  } | null>(null);
+  const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
   const [collapsed, setCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -44,9 +44,35 @@ export default function App() {
   const [pendingColumns, setPendingColumns] = useState<ColumnInfo[]>([]);
   const [pendingRowCount, setPendingRowCount] = useState(0);
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [pendingFileId, setPendingFileId] = useState<string | null>(null);
+  const [pendingFileQueue, setPendingFileQueue] = useState<File[]>([]);
   const [isEditingFile, setIsEditingFile] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState<string>(
+    () => localStorage.getItem("privy-selected-model") || ""
+  );
   const streamControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+  if (!isAuthenticated) {
+    setAccessTokenGetter(null);
+    return;
+  }
+
+  setAccessTokenGetter(async () => {
+    return getAccessTokenSilently({
+      authorizationParams: {
+        audience: import.meta.env.VITE_AUTH0_AUDIENCE,
+        scope: "openid profile email",
+      },
+    });
+  });
+
+  return () => {
+    setAccessTokenGetter(null);
+  };
+}, [isAuthenticated, getAccessTokenSilently]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -61,20 +87,16 @@ export default function App() {
       try {
         const backendUser = await api.getCurrentUser();
         if (!cancelled) {
-          // Auth0 access tokens for a custom API do not necessarily contain
-          // profile claims such as email/name. The Auth0 React SDK already
-          // has the authenticated user's ID-token profile, so use those
-          // claims for the local UI while keeping the backend `sub` and role
-          // authoritative for authorization.
           setCurrentUser({
             ...backendUser,
             email: backendUser.email || auth0User?.email || null,
             display_name:
-              backendUser.display_name && !backendUser.display_name.startsWith('google-oauth2|')
+              backendUser.display_name && !backendUser.display_name.startsWith("google-oauth2|")
                 ? backendUser.display_name
                 : auth0User?.name || auth0User?.nickname || auth0User?.email || backendUser.display_name,
           });
           setBackendAuthReady(true);
+          setLoadError(null);
         }
       } catch (e) {
         if (!cancelled) {
@@ -83,11 +105,29 @@ export default function App() {
         }
       }
     })();
-    return () => { cancelled = true; };
-  }, [isAuthenticated]);
 
-  // On first load: use the most recent existing chat, or create one if
-  // there isn't one yet -- same behavior the Streamlit version had.
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, auth0User]);
+
+  useEffect(() => {
+    if (!backendAuthReady) return;
+
+    api.getModels()
+      .then((catalog) => {
+        setModels(catalog.models);
+        const saved = localStorage.getItem("privy-selected-model");
+        const savedIsAvailable = saved && catalog.models.some((model) => model.id === saved);
+        const next = savedIsAvailable ? saved : catalog.default_model_id || catalog.models[0]?.id || "";
+        setSelectedModelId(next);
+        if (next) localStorage.setItem("privy-selected-model", next);
+      })
+      .catch(() => {
+        // Model discovery is non-blocking; the existing admin/default model can still be used.
+      });
+  }, [backendAuthReady]);
+
   useEffect(() => {
     if (!backendAuthReady) return;
 
@@ -101,6 +141,8 @@ export default function App() {
           const created = await api.createChat();
           setChats([created]);
           setActiveChatId(created.chat_id);
+          setMessages([]);
+          setAttachments([]);
         }
       } catch (e) {
         setLoadError(e instanceof Error ? e.message : "Couldn't reach the backend.");
@@ -109,32 +151,42 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [backendAuthReady]);
 
-  async function selectChat(chatId: string) {
-    setActiveChatId(chatId);
-    setAttachedFile(null);
-    setIsEditingFile(false);
+  function clearPendingFileState() {
     setPendingFile(null);
     setPendingColumns([]);
     setPendingRowCount(0);
     setSelectedColumns([]);
+    setPendingFileId(null);
+    setPendingFileQueue([]);
+    setIsEditingFile(false);
+  }
+
+  async function selectChat(chatId: string) {
+    setActiveChatId(chatId);
+    clearPendingFileState();
+    setAttachments([]);
+
     try {
-      const [msgs, fileInfo] = await Promise.all([
+      const [msgs, fileInfos] = await Promise.all([
         api.getMessages(chatId),
-        api.getFileInfo(chatId),
+        api.listFiles(chatId),
       ]);
       setMessages(msgs);
-      if (fileInfo) {
-        setAttachedFile({
-          file: null,
-          filename: fileInfo.filename,
-          keptPrivateCount: fileInfo.kept_private_count,
-        });
-      } else {
-        setAttachedFile(null);
-      }
+      setAttachments(fileInfos.map(toLocalAttachment));
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : "Couldn't load that chat.");
     }
+  }
+
+  function toLocalAttachment(fileInfo: ChatFileInfo): LocalAttachment {
+    return {
+      fileId: fileInfo.file_id,
+      filename: fileInfo.filename,
+      maskedCount: fileInfo.masked_count,
+      canEdit: false,
+      file: null,
+      columns: fileInfo.columns,
+    };
   }
 
   async function handleLogout() {
@@ -155,16 +207,8 @@ export default function App() {
     setChats((prev) => [created, ...prev]);
     setActiveChatId(created.chat_id);
     setMessages([]);
-    setAttachedFile(null);
-    setIsEditingFile(false);
-    setPendingFile(null);
-    setPendingColumns([]);
-    setPendingRowCount(0);
-    setSelectedColumns([]);
-  }
-
-  async function handleSelectChat(chatId: string) {
-    await selectChat(chatId);
+    setAttachments([]);
+    clearPendingFileState();
   }
 
   async function handleRenameChat(chatId: string, title: string) {
@@ -176,6 +220,7 @@ export default function App() {
     await api.deleteChat(chatId);
     const remaining = chats.filter((c) => c.chat_id !== chatId);
     setChats(remaining);
+
     if (activeChatId === chatId) {
       if (remaining.length > 0) {
         await selectChat(remaining[0].chat_id);
@@ -184,12 +229,8 @@ export default function App() {
         setChats([created]);
         setActiveChatId(created.chat_id);
         setMessages([]);
-        setAttachedFile(null);
-        setIsEditingFile(false);
-        setPendingFile(null);
-        setPendingColumns([]);
-        setPendingRowCount(0);
-        setSelectedColumns([]);
+        setAttachments([]);
+        clearPendingFileState();
       }
     }
   }
@@ -198,40 +239,85 @@ export default function App() {
     await api.exportChat(chatId);
   }
 
-  async function handleUploadFile(file: File) {
+  async function prepareNewFile(file: File) {
     if (!activeChatId) return;
+
     setIsUploading(true);
     setIsEditingFile(false);
     try {
       const preview = await api.previewFile(activeChatId, file);
       setPendingFile(file);
+      setPendingFileId(null);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
       setSelectedColumns(preview.columns.filter((c) => c.type).map((c) => c.name));
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Couldn't inspect that file.";
       window.alert(msg);
+      setPendingFileQueue([]);
     } finally {
       setIsUploading(false);
     }
   }
 
-  async function handleEditFile() {
-    if (!activeChatId || !attachedFile) return;
-    if (!attachedFile.file) {
-      window.alert("For privacy, Privy does not keep the original file after a page refresh. Re-attach the original file to edit its masking settings.");
+  async function handleUploadFiles(files: File[]) {
+    if (!activeChatId || isUploading || pendingFile) return;
+
+    if (files.length > MAX_FILES_PER_SELECTION) {
+      window.alert(`You can select up to ${MAX_FILES_PER_SELECTION} files at a time.`);
+      return;
+    }
+
+    const oversized = files.find((file) => file.size > MAX_FILE_SIZE_BYTES);
+    if (oversized) {
+      window.alert(`\"${oversized.name}\" is too large. Privy allows files up to ${MAX_FILE_SIZE_MB} MB each.`);
+      return;
+    }
+
+    if (files.length + attachments.length > MAX_FILES_PER_CHAT) {
+      const remaining = Math.max(0, MAX_FILES_PER_CHAT - attachments.length);
+      window.alert(
+        remaining === 0
+          ? `This chat already has ${MAX_FILES_PER_CHAT} files. Remove a file before adding another.`
+          : `This chat can hold up to ${MAX_FILES_PER_CHAT} files. You can add ${remaining} more.`
+      );
+      return;
+    }
+
+    const [first, ...rest] = files;
+    setPendingFileQueue(rest);
+    await prepareNewFile(first);
+  }
+
+  async function handleEditFile(fileId: string) {
+    if (!activeChatId || isUploading) return;
+
+    const attachment = attachments.find((item) => item.fileId === fileId);
+    if (!attachment) return;
+
+    if (!attachment.file) {
+      window.alert(
+        "For privacy, Privy does not keep the original file after a page refresh. Re-attach the original file to edit its masking settings."
+      );
       return;
     }
 
     setIsUploading(true);
     setIsEditingFile(true);
     try {
-      const preview = await api.previewFile(activeChatId, attachedFile.file);
-      setPendingFile(attachedFile.file);
+      const preview = await api.previewFile(activeChatId, attachment.file);
+      setPendingFile(attachment.file);
+      setPendingFileId(fileId);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
-      // Start from the currently selected masking state where possible.
-      setSelectedColumns(preview.columns.filter((c) => c.enabled).map((c) => c.name));
+      const enabledNames = attachment.columns
+        .filter((column) => column.enabled)
+        .map((column) => column.name);
+      setSelectedColumns(
+        enabledNames.length > 0
+          ? enabledNames
+          : preview.columns.filter((column) => column.type).map((column) => column.name)
+      );
     } catch (e) {
       setIsEditingFile(false);
       const msg = e instanceof Error ? e.message : "Couldn't reopen masking settings.";
@@ -241,23 +327,18 @@ export default function App() {
     }
   }
 
-  function handleCancelFile() {
-    setPendingFile(null);
-    setPendingColumns([]);
-    setPendingRowCount(0);
-    setSelectedColumns([]);
-    setIsEditingFile(false);
-  }
+  async function handleRemoveFile(fileId: string) {
+    if (!activeChatId || isUploading) return;
+    const attachment = attachments.find((item) => item.fileId === fileId);
+    if (!attachment) return;
 
-  async function handleRemoveFile() {
-    if (!activeChatId || !attachedFile) return;
-    if (!window.confirm(`Remove ${attachedFile.filename} from this chat?`)) return;
+    if (!window.confirm(`Remove ${attachment.filename} from this chat?`)) return;
 
     setIsUploading(true);
     try {
-      await api.removeFile(activeChatId);
-      setAttachedFile(null);
-      handleCancelFile();
+      await api.removeFile(activeChatId, fileId);
+      setAttachments((prev) => prev.filter((item) => item.fileId !== fileId));
+      if (pendingFileId === fileId) clearPendingFileState();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Couldn't remove the file.";
       window.alert(msg);
@@ -267,7 +348,7 @@ export default function App() {
   }
 
   async function handleApplyFile() {
-    if (!activeChatId || !pendingFile || selectedColumns.length === 0) return;
+    if (!activeChatId || !pendingFile || selectedColumns.length === 0 || isUploading) return;
 
     setIsUploading(true);
     try {
@@ -280,14 +361,37 @@ export default function App() {
         useNer: true,
         nerConfidence: 0.6,
         disabledColumns,
+        fileId: pendingFileId ?? undefined,
       });
 
-      setAttachedFile({
-        file: pendingFile,
+      const updated: LocalAttachment = {
+        fileId: result.file_id,
         filename: result.filename,
-        keptPrivateCount: result.kept_private_count,
+        maskedCount: result.masked_count,
+        canEdit: true,
+        file: pendingFile,
+        columns: result.columns,
+      };
+
+      setAttachments((prev) => {
+        if (pendingFileId) {
+          return prev.map((item) => (item.fileId === pendingFileId ? updated : item));
+        }
+        return [...prev, updated];
       });
-      handleCancelFile();
+
+      const nextFile = pendingFileQueue[0];
+      setPendingFileQueue((prev) => prev.slice(1));
+      setPendingFileId(null);
+      setPendingFile(null);
+      setPendingColumns([]);
+      setPendingRowCount(0);
+      setSelectedColumns([]);
+      setIsEditingFile(false);
+
+      if (nextFile) {
+        await prepareNewFile(nextFile);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Masking failed.";
       window.alert(msg);
@@ -298,6 +402,11 @@ export default function App() {
 
   function handleStopGeneration() {
     streamControllerRef.current?.abort();
+  }
+
+  function handleModelChange(modelId: string) {
+    setSelectedModelId(modelId);
+    localStorage.setItem("privy-selected-model", modelId);
   }
 
   async function handleSend(text: string) {
@@ -320,7 +429,13 @@ export default function App() {
 
     await api.streamMessage(
       chatId,
-      { question: text, use_ner: true, ner_confidence: 0.6, concise: true },
+      {
+        question: text,
+        use_ner: true,
+        ner_confidence: 0.6,
+        concise: true,
+        model_id: selectedModelId || undefined,
+      },
       {
         onDelta: (piece) => {
           setMessages((prev) => {
@@ -339,11 +454,6 @@ export default function App() {
           });
           setIsStreaming(false);
           streamControllerRef.current = null;
-          // The backend titles a new chat as part of the same request that
-          // just finished (see routers/messages.py) -- refresh the list now
-          // so the sidebar picks up the real title and the reordering by
-          // recency, instead of staying on "New chat" until something else
-          // happens to trigger a refetch.
           api.listChats().then(setChats).catch(() => {});
         },
         onError: (message) => {
@@ -369,40 +479,63 @@ export default function App() {
   }
 
   if (authLoading) {
-    return <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink"><div className="text-sm text-ink/60">Loading Privy…</div></div>;
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink">
+        <div className="text-sm text-ink/60">Loading Privy…</div>
+      </div>
+    );
   }
 
   if (!isAuthenticated) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-bg px-6">
         <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-8 text-center shadow-sm">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-bg text-2xl" aria-hidden>🔒</div>
+          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-bg text-2xl" aria-hidden>
+            🔒
+          </div>
           <h1 className="font-display text-2xl font-semibold">Welcome to Privy</h1>
-          <p className="mt-2 text-sm leading-6 text-ink/60">Sign in to keep your chats associated with your account.</p>
-          <button type="button" onClick={() => loginWithRedirect()} className="mt-6 w-full rounded-xl bg-ink px-4 py-3 text-sm font-medium text-white hover:opacity-90">Sign in</button>
-        </div>
-      </div>
-    );
-  }
-
-  if (!backendAuthReady) {
-    return <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink"><div className="text-sm text-ink/60">Signing you in…</div></div>;
-  }
-
-  if (loadError) {
-    return (
-      <div className="flex h-screen w-screen items-center justify-center p-6 text-center">
-        <div>
-          <p className="mb-2 text-lg font-semibold">Couldn't reach Privy's backend</p>
-          <p className="text-sm text-ink/60">{loadError}</p>
-          <p className="mt-4 text-sm text-ink/60">
-            Make sure the FastAPI server is running (<code>uvicorn app.main:app --port 8000</code>)
-            and reload this page.
+          <p className="mt-2 text-sm leading-6 text-ink/60">
+            Sign in to keep your chats associated with your account.
           </p>
+          <button
+            type="button"
+            onClick={() => loginWithRedirect()}
+            className="mt-6 w-full rounded-xl bg-ink px-4 py-3 text-sm font-medium text-white hover:opacity-90"
+          >
+            Sign in
+          </button>
         </div>
       </div>
     );
   }
+
+if (loadError) {
+  return (
+    <div className="flex h-screen w-screen items-center justify-center p-6 text-center">
+      <div className="max-w-xl">
+        <p className="mb-2 text-lg font-semibold">
+          Privy couldn't sign you in
+        </p>
+
+        <p className="text-sm text-ink/60">
+          {loadError}
+        </p>
+
+        <p className="mt-4 text-sm text-ink/60">
+          Check the FastAPI terminal for the exact error, then reload the page.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+if (!backendAuthReady) {
+  return (
+    <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink">
+      <div className="text-sm text-ink/60">Signing you in…</div>
+    </div>
+  );
+}
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">
@@ -412,7 +545,7 @@ export default function App() {
         collapsed={collapsed}
         onToggleCollapsed={() => setCollapsed((v) => !v)}
         onNewChat={handleNewChat}
-        onSelectChat={handleSelectChat}
+        onSelectChat={selectChat}
         onRenameChat={handleRenameChat}
         onDeleteChat={handleDeleteChat}
         onExportChat={handleExportChat}
@@ -424,11 +557,7 @@ export default function App() {
       <ChatPane
         messages={messages}
         suggestions={SUGGESTION_CHIPS}
-        attachment={attachedFile ? {
-          filename: attachedFile.filename,
-          keptPrivateCount: attachedFile.keptPrivateCount,
-          canEdit: Boolean(attachedFile.file),
-        } : undefined}
+        attachments={attachments}
         isStreaming={isStreaming}
         isUploading={isUploading}
         pendingFile={pendingFile}
@@ -437,13 +566,17 @@ export default function App() {
         selectedColumns={selectedColumns}
         isEditingFile={isEditingFile}
         onSelectedColumnsChange={setSelectedColumns}
-        onCancelFile={handleCancelFile}
+        onCancelFile={clearPendingFileState}
         onApplyFile={handleApplyFile}
         onEditFile={handleEditFile}
         onRemoveFile={handleRemoveFile}
         onStop={handleStopGeneration}
         onSend={handleSend}
-        onUploadFile={handleUploadFile}
+        onUploadFiles={handleUploadFiles}
+        pendingQueueCount={pendingFileQueue.length}
+        models={models}
+        selectedModelId={selectedModelId}
+        onModelChange={handleModelChange}
       />
       {currentUser?.role === "admin" && (
         <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
