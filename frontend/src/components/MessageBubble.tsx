@@ -22,9 +22,12 @@ export function MessageBubble({ message, isStreaming = false }: MessageBubblePro
 
   return (
     <div className="flex justify-start">
-      <div className="w-full max-w-[86%]">
+      <div className="w-full max-w-[90%]">
         <div className="mb-2 flex items-center gap-2 text-xs font-medium text-ink/55">
-          <span className="flex h-6 w-6 items-center justify-center rounded-full border border-border bg-surface text-[12px] shadow-sm" aria-hidden>
+          <span
+            className="flex h-6 w-6 items-center justify-center rounded-full border border-border bg-surface text-[12px] shadow-sm"
+            aria-hidden
+          >
             🔒
           </span>
           <span>Privy</span>
@@ -33,7 +36,7 @@ export function MessageBubble({ message, isStreaming = false }: MessageBubblePro
         {isStreaming && !message.content ? (
           <StreamingIndicator />
         ) : (
-          <div className="text-sm leading-7 text-ink">
+          <div className="select-text text-sm leading-7 text-ink">
             <MarkdownContent content={message.content} />
             {isStreaming && <span className="stream-cursor" aria-hidden />}
           </div>

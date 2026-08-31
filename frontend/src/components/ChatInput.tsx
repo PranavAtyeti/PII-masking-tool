@@ -38,9 +38,11 @@ export function ChatInput({
   onStop,
 }: ChatInputProps) {
   const [value, setValue] = useState("");
+  const [attachmentsOpen, setAttachmentsOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const composerDisabled = disabled || isUploading || hasPendingFile;
+  const totalMasked = attachments.reduce((sum, item) => sum + item.maskedCount, 0);
 
   const submit = () => {
     const trimmed = value.trim();
@@ -65,54 +67,88 @@ export function ChatInput({
   return (
     <div className="rounded-2xl border border-border bg-surface p-2 shadow-sm transition-shadow focus-within:shadow-md">
       {attachments.length > 0 && (
-        <div className="mb-2 space-y-2 px-1 pt-1">
-          {attachments.map((attachment) => {
-            const ext = attachment.filename.split(".").pop()?.toLowerCase();
-            const fileIcon = ext === "xlsx" || ext === "xls" ? "▦" : "≡";
-
-            return (
-              <div
-                key={attachment.fileId}
-                className="flex items-center gap-3 rounded-xl border border-border bg-bg px-3 py-2.5"
-              >
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-lg text-ink/70 shadow-sm">
-                  {fileIcon}
-                </div>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium text-ink" title={attachment.filename}>
-                    {attachment.filename}
-                  </p>
-                  <p className="mt-0.5 text-xs text-ink/50">
-                    {attachment.maskedCount.toLocaleString()} values masked
-                  </p>
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  {onEditFile && (
-                    <button
-                      type="button"
-                      onClick={() => onEditFile(attachment.fileId)}
-                      disabled={composerDisabled}
-                      className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-ink/60 hover:bg-white hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
-                    >
-                      {attachment.canEdit ? "Edit masking" : "Re-attach to edit"}
-                    </button>
-                  )}
-                  {onRemoveFile && (
-                    <button
-                      type="button"
-                      onClick={() => onRemoveFile(attachment.fileId)}
-                      disabled={composerDisabled}
-                      aria-label={`Remove ${attachment.filename}`}
-                      title="Remove file"
-                      className="rounded-lg px-2 py-1.5 text-lg leading-none text-ink/35 hover:bg-white hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
-                    >
-                      ×
-                    </button>
-                  )}
-                </div>
+        <div className="mb-2 px-1 pt-1">
+          <button
+            type="button"
+            onClick={() => setAttachmentsOpen((open) => !open)}
+            className="flex w-full items-center justify-between rounded-xl border border-border bg-bg px-3 py-2 text-left transition-colors hover:bg-white"
+            aria-expanded={attachmentsOpen}
+          >
+            <div className="flex min-w-0 items-center gap-2.5">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-base text-ink/70 shadow-sm">
+                📎
               </div>
-            );
-          })}
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-ink">
+                  {attachments.length} file{attachments.length === 1 ? "" : "s"} attached
+                </p>
+                <p className="text-xs text-ink/50">
+                  {totalMasked.toLocaleString()} values masked
+                </p>
+              </div>
+            </div>
+            <span className="ml-3 shrink-0 text-sm text-ink/45" aria-hidden>
+              {attachmentsOpen ? "⌃" : "⌄"}
+            </span>
+          </button>
+
+          {attachmentsOpen && (
+            <div className="mt-2 space-y-2">
+              {attachments.map((attachment) => {
+                const ext = attachment.filename.split(".").pop()?.toLowerCase();
+                const fileIcon = ext === "xlsx" || ext === "xls" ? "▦" : "≡";
+
+                return (
+                  <div
+                    key={attachment.fileId}
+                    className="flex items-center gap-3 rounded-xl border border-border bg-bg px-3 py-2.5"
+                  >
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-lg text-ink/70 shadow-sm">
+                      {fileIcon}
+                    </div>
+
+                    <div className="min-w-0 flex-1">
+                      <p
+                        className="truncate text-sm font-medium text-ink"
+                        title={attachment.filename}
+                      >
+                        {attachment.filename}
+                      </p>
+                      <p className="mt-0.5 text-xs text-ink/50">
+                        {attachment.maskedCount.toLocaleString()} values masked
+                      </p>
+                    </div>
+
+                    <div className="flex shrink-0 items-center gap-1">
+                      {onEditFile && (
+                        <button
+                          type="button"
+                          onClick={() => onEditFile(attachment.fileId)}
+                          disabled={composerDisabled}
+                          className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-ink/60 hover:bg-white hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          {attachment.canEdit ? "Edit masking" : "Re-attach to edit"}
+                        </button>
+                      )}
+
+                      {onRemoveFile && (
+                        <button
+                          type="button"
+                          onClick={() => onRemoveFile(attachment.fileId)}
+                          disabled={composerDisabled}
+                          aria-label={`Remove ${attachment.filename}`}
+                          title="Remove file"
+                          className="rounded-lg px-2 py-1.5 text-lg leading-none text-ink/35 hover:bg-white hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
@@ -131,6 +167,7 @@ export function ChatInput({
           className="hidden"
           onChange={handleFileChange}
         />
+
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
@@ -141,6 +178,7 @@ export function ChatInput({
         >
           {isUploading ? "…" : "+"}
         </button>
+
         <textarea
           value={value}
           onChange={(e) => setValue(e.target.value)}
@@ -150,6 +188,7 @@ export function ChatInput({
           disabled={composerDisabled}
           className="max-h-40 flex-1 resize-none bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-ink/40"
         />
+
         {isStreaming ? (
           <button
             type="button"

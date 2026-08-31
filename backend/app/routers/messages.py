@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 
 from .. import mapping_store as store
 from ..auth import get_current_app_user
-from ..llm import call_llm, stream_llm, LLM_API_KEY_ENV, LLM_MODEL_DEFAULT
+from ..llm import call_llm, stream_llm, get_model_config
 from ..context_limits import (
     MAX_TOTAL_FILE_CONTEXT_TOKENS,
     limit_file_context,
@@ -26,9 +26,27 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
-def _get_active_llm_config():
-    api_key = store.get_admin_config("llm_api_key", LLM_API_KEY_ENV)
-    model = store.get_admin_config("llm_model", LLM_MODEL_DEFAULT)
+def _get_active_llm_config(model_id: str | None = None):
+    """Resolve the model selected by the user.
+
+    An explicit model_id always wins over the legacy admin/default model.
+    This is important because provider credentials (Gemini vs Groq) are tied
+    to the selected model, not to one global API key.
+    """
+    if model_id:
+        _provider, _base_url, api_key, model = get_model_config(model_id)
+        return api_key, model
+
+    # Backward-compatible fallback for older callers that do not send a model.
+    configured_model = store.get_admin_config("llm_model", "")
+    if configured_model:
+        try:
+            _provider, _base_url, api_key, model = get_model_config(configured_model)
+            return api_key, model
+        except RuntimeError:
+            pass
+
+    _provider, _base_url, api_key, model = get_model_config(None)
     return api_key, model
 
 
@@ -157,7 +175,15 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
         yield _sse({"done": True, "masked_count": masked_count})
         return
 
-    api_key, model = _get_active_llm_config()
+    try:
+        api_key, model = _get_active_llm_config(body.model_id)
+    except RuntimeError as e:
+        msg = f"{e}. Ask an admin to check the model configuration in Settings."
+        answer_parts = [msg]
+        yield _sse({"delta": msg})
+        store.add_message(chat_id, "assistant", msg, masked_count)
+        yield _sse({"done": True, "masked_count": masked_count})
+        return
 
     if is_first_message:
         try:
@@ -197,7 +223,11 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
         answer_parts = [msg]
         yield _sse({"delta": msg})
 
-    answer = "".join(answer_parts)
+    answer = "".join(answer_parts).strip()
+    if not answer:
+        answer = "The model returned an empty response. Please try again or choose another model."
+        yield _sse({"delta": answer})
+
     store.add_message(chat_id, "assistant", answer, masked_count)
     yield _sse({"done": True, "masked_count": masked_count})
 
