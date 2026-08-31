@@ -28,12 +28,20 @@ class MessageIn(BaseModel):
     ner_confidence: float = 0.6
     concise: bool = True
     model_id: str | None = None
+    allow_unmasked_risk: bool = False
 
 
 class MessageOut(BaseModel):
     role: str
     content: str
     masked_count: int = 0
+    metadata: dict = Field(default_factory=dict)
+
+
+class GuestSessionOut(BaseModel):
+    session_id: str
+    expires_at: float
+    user: dict
 
 
 class AdminConfigOut(BaseModel):

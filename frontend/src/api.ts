@@ -52,6 +52,11 @@ export class ApiError extends Error {
 }
 
 export const api = {
+  async createGuestSession(): Promise<{ session_id: string; expires_at: number; user: CurrentUser }> {
+    const res = await authedFetch(`${BASE}/auth/guest`, { method: "POST" });
+    return jsonOrThrow<{ session_id: string; expires_at: number; user: CurrentUser }>(res);
+  },
+
   getCurrentUser(): Promise<CurrentUser> {
     return authedFetch(`${BASE}/auth/me`).then((r) => jsonOrThrow<CurrentUser>(r));
   },
@@ -165,11 +170,12 @@ export const api = {
 
   async streamMessage(
     chatId: string,
-    body: { question: string; use_ner: boolean; ner_confidence: number; concise: boolean; model_id?: string },
+    body: { question: string; use_ner: boolean; ner_confidence: number; concise: boolean; model_id?: string; allow_unmasked_risk?: boolean },
     handlers: {
       onDelta: (text: string) => void;
       onDone: (maskedCount: number) => void;
       onError: (message: string) => void;
+      onSecurityWarning?: (warning: { message: string; findings: Array<{ type: string; count: number }> }) => void;
       onAbort?: () => void;
     },
     signal?: AbortSignal
@@ -194,12 +200,22 @@ export const api = {
 
     if (!res.ok || !res.body) {
       let detail = res.statusText;
+      let errBody: any = null;
       try {
-        const errBody = await res.json();
-        detail = errBody.detail ?? detail;
+        errBody = await res.json();
+        detail = typeof errBody.detail === "string" ? errBody.detail : (errBody.detail?.message ?? detail);
       } catch {
         // Non-JSON response.
       }
+
+      if (res.status === 409 && errBody?.detail?.code === "UNMASKED_PII") {
+        handlers.onSecurityWarning?.({
+          message: errBody.detail.message ?? "Potentially unmasked sensitive data was detected.",
+          findings: Array.isArray(errBody.detail.findings) ? errBody.detail.findings : [],
+        });
+        return;
+      }
+
       handlers.onError(detail);
       return;
     }

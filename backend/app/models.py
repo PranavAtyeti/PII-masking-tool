@@ -86,6 +86,7 @@ class ChatMessage(Base):
     role: Mapped[str] = mapped_column(String(50), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     masked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
 
     chat: Mapped[Chat] = relationship(back_populates="messages")
@@ -117,4 +118,24 @@ class ChatFile(Base):
 
     __table_args__ = (
         Index("ix_chat_files_chat_created", "chat_id", "created_at"),
+    )
+
+
+class GuestSession(Base):
+    __tablename__ = "guest_sessions"
+
+    session_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_auth0_sub: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("users.auth0_sub", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    user: Mapped[User] = relationship(foreign_keys=[user_auth0_sub])
+
+    __table_args__ = (
+        Index("ix_guest_sessions_expires_at", "expires_at"),
     )

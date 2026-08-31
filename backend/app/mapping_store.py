@@ -5,15 +5,18 @@ SQLite implementation so routers do not have to change in this step.
 """
 
 import os
+import json
 import re
 import time
 import uuid
+import hashlib
+import secrets
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal
-from .models import AdminConfig, Chat, ChatFile, ChatMessage, TokenEntry, User
+from .models import AdminConfig, Chat, ChatFile, ChatMessage, GuestSession, TokenEntry, User
 
 
 def init_db() -> None:
@@ -58,7 +61,11 @@ def get_or_create_user(
                 row.display_name = display_name
             row.last_login_at = now
         else:
-            user_count = db.scalar(select(func.count()).select_from(User)) or 0
+            user_count = db.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(User.role != "guest")
+            ) or 0
             row = User(
                 auth0_sub=auth0_sub,
                 email=email,
@@ -86,6 +93,109 @@ def get_or_create_user(
             "created_at": row.created_at,
             "last_login_at": row.last_login_at,
         }
+
+
+# --- Guest sessions -------------------------------------------------------
+
+GUEST_SESSION_TTL_SECONDS = int(os.getenv("PRIVY_GUEST_SESSION_TTL_SECONDS", "3600"))
+
+
+def _guest_session_hash(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+
+def _user_dict(row: User) -> dict:
+    return {
+        "auth0_sub": row.auth0_sub,
+        "email": row.email,
+        "display_name": row.display_name,
+        "role": row.role,
+        "created_at": row.created_at,
+        "last_login_at": row.last_login_at,
+    }
+
+
+def create_guest_session(ttl_seconds: int = GUEST_SESSION_TTL_SECONDS) -> tuple[str, dict, float]:
+    now = time.time()
+    expires_at = now + max(300, ttl_seconds)
+    session_id = secrets.token_urlsafe(32)
+    guest_sub = f"guest:{uuid.uuid4()}"
+    with SessionLocal() as db:
+        # Remove expired guest sessions/users first.
+        expired = db.scalars(select(GuestSession).where(GuestSession.expires_at <= now)).all()
+        for session in expired:
+            guest_user = db.get(User, session.user_auth0_sub)
+            if guest_user:
+                db.delete(guest_user)
+            db.delete(session)
+
+        guest = User(
+            auth0_sub=guest_sub,
+            email=None,
+            display_name="Guest",
+            role="guest",
+            created_at=now,
+            last_login_at=now,
+        )
+        db.add(guest)
+        db.flush()
+        db.add(GuestSession(
+            session_hash=_guest_session_hash(session_id),
+            user_auth0_sub=guest_sub,
+            created_at=now,
+            expires_at=expires_at,
+        ))
+        db.commit()
+        return session_id, _user_dict(guest), expires_at
+
+
+def get_guest_user(session_id: str) -> dict | None:
+    now = time.time()
+    session_hash = _guest_session_hash(session_id)
+    with SessionLocal() as db:
+        session = db.get(GuestSession, session_hash)
+        if not session:
+            return None
+        if session.expires_at <= now:
+            guest = db.get(User, session.user_auth0_sub)
+            if guest:
+                db.delete(guest)
+            db.delete(session)
+            db.commit()
+            return None
+        user = db.get(User, session.user_auth0_sub)
+        return _user_dict(user) if user and user.role == "guest" else None
+
+
+def count_user_chats(user_id: str) -> int:
+    with SessionLocal() as db:
+        return int(db.scalar(select(func.count()).select_from(Chat).where(Chat.user_id == user_id)) or 0)
+
+
+def count_user_files(user_id: str) -> int:
+    with SessionLocal() as db:
+        return int(
+            db.scalar(
+                select(func.count())
+                .select_from(ChatFile)
+                .join(Chat, Chat.chat_id == ChatFile.chat_id)
+                .where(Chat.user_id == user_id)
+            )
+            or 0
+        )
+
+
+def count_user_questions(user_id: str) -> int:
+    with SessionLocal() as db:
+        return int(
+            db.scalar(
+                select(func.count())
+                .select_from(ChatMessage)
+                .join(Chat, Chat.chat_id == ChatMessage.chat_id)
+                .where(Chat.user_id == user_id, ChatMessage.role == "user")
+            )
+            or 0
+        )
 
 
 def get_user(auth0_sub: str) -> dict | None:
@@ -138,13 +248,20 @@ def get_chat_messages(chat_id: str) -> list:
         rows = db.scalars(
             select(ChatMessage).where(ChatMessage.chat_id == chat_id).order_by(ChatMessage.id.asc())
         ).all()
-        return [{"role": r.role, "content": r.content, "masked_count": r.masked_count} for r in rows]
+        out = []
+        for r in rows:
+            try:
+                metadata = json.loads(r.metadata_json) if r.metadata_json else {}
+            except (TypeError, ValueError):
+                metadata = {}
+            out.append({"role": r.role, "content": r.content, "masked_count": r.masked_count, "metadata": metadata})
+        return out
 
 
-def add_message(chat_id: str, role: str, content: str, masked_count: int = 0) -> None:
+def add_message(chat_id: str, role: str, content: str, masked_count: int = 0, metadata: dict | None = None) -> None:
     now = time.time()
     with SessionLocal() as db:
-        db.add(ChatMessage(chat_id=chat_id, role=role, content=content, masked_count=masked_count, created_at=now))
+        db.add(ChatMessage(chat_id=chat_id, role=role, content=content, masked_count=masked_count, metadata_json=json.dumps(metadata or {}, ensure_ascii=True), created_at=now))
         db.execute(update(Chat).where(Chat.chat_id == chat_id).values(updated_at=now))
         db.commit()
 

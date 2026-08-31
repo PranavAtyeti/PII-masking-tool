@@ -18,8 +18,11 @@ def _get_chat_or_404(chat_id: str, user_id: str) -> dict:
 
 @router.post("", response_model=ChatOut)
 def create_chat(body: ChatCreateIn, user: dict = Depends(get_current_app_user)):
-    chat_id = store.create_chat(user["auth0_sub"], body.title)
-    return store.get_chat(chat_id, user["auth0_sub"])
+    user_id = user["auth0_sub"]
+    if user.get("role") == "guest" and store.count_user_chats(user_id) >= 1:
+        raise HTTPException(status_code=403, detail="Guest sessions support one chat. Sign in to create more chats.")
+    chat_id = store.create_chat(user_id, body.title)
+    return store.get_chat(chat_id, user_id)
 
 
 @router.get("", response_model=list[ChatOut])

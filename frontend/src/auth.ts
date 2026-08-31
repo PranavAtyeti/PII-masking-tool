@@ -1,4 +1,5 @@
 let getAccessToken: (() => Promise<string>) | null = null;
+let getGuestSession: (() => string | null) | null = null;
 
 export function setAccessTokenGetter(
   getter: (() => Promise<string>) | null
@@ -6,18 +7,30 @@ export function setAccessTokenGetter(
   getAccessToken = getter;
 }
 
+export function setGuestSessionGetter(
+  getter: (() => string | null) | null
+) {
+  getGuestSession = getter;
+}
+
 export async function authHeaders(): Promise<Record<string, string>> {
-  if (!getAccessToken) {
-    throw new Error("Auth0 token getter is not ready.");
+  if (getAccessToken) {
+    const token = await getAccessToken();
+
+    if (token && typeof token === "string" && token.trim()) {
+      return {
+        Authorization: `Bearer ${token.trim()}`,
+      };
+    }
   }
 
-  const token = await getAccessToken();
+  const guestSession = getGuestSession?.();
 
-  if (!token || typeof token !== "string" || !token.trim()) {
-    throw new Error("Auth0 did not return an access token.");
+  if (guestSession && guestSession.trim()) {
+    return {
+      "X-Guest-Session": guestSession.trim(),
+    };
   }
 
-  return {
-    Authorization: `Bearer ${token.trim()}`,
-  };
+  return {};
 }

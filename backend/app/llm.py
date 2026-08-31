@@ -142,6 +142,8 @@ def _post_payload(system_prompt: str, user_prompt: str, model: str, temperature:
     # Gemini 3.x models have deprecated legacy sampling parameters.
     if provider == "groq":
         payload["temperature"] = temperature
+    if provider == "gemini":
+        payload["reasoning_effort"] = "low"
     if stream:
         payload["stream"] = True
     return payload
@@ -157,7 +159,7 @@ def call_llm(system_prompt: str, user_prompt: str, api_key: str | None, model: s
         base_url,
         headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
         json=_post_payload(system_prompt, user_prompt, resolved_model, temperature, max_tokens, False, provider),
-        timeout=60,
+        timeout=(10, 30),
     )
     response.raise_for_status()
     data = response.json()
@@ -227,7 +229,7 @@ def stream_llm(
         json=_post_payload(
             system_prompt, user_prompt, resolved_model, temperature, max_tokens, True, provider
         ),
-        timeout=(10, 60),
+        timeout=(10, 30),
         stream=True,
     )
     response.raise_for_status()

@@ -13,8 +13,10 @@ interface SidebarProps {
   onExportChat: (chatId: string) => void;
   onOpenSettings: () => void;
   onLogout: () => void;
+  onSignIn: () => void;
   currentUser: CurrentUser | null;
   isAdmin: boolean;
+  isGuest: boolean;
 }
 
 export function Sidebar({
@@ -29,8 +31,10 @@ export function Sidebar({
   onExportChat,
   onOpenSettings,
   onLogout,
+  onSignIn,
   currentUser,
   isAdmin,
+  isGuest,
 }: SidebarProps) {
   if (collapsed) {
     return (
@@ -55,10 +59,20 @@ export function Sidebar({
             ⚙
           </button>
         )}
+        {isGuest && (
+          <button
+            onClick={onSignIn}
+            aria-label="Sign in to save chats"
+            title="Sign in to save chats"
+            className="rounded-md p-2 text-white/70 hover:bg-white/10 hover:text-white"
+          >
+            ⇥
+          </button>
+        )}
         <button
           onClick={onLogout}
-          aria-label="Log out"
-          title="Log out"
+          aria-label={isGuest ? "End guest session" : "Log out"}
+          title={isGuest ? "End guest session" : "Log out"}
           className="rounded-md p-2 text-white/70 hover:bg-white/10 hover:text-white"
         >
           ↪
@@ -87,10 +101,14 @@ export function Sidebar({
 
       <button
         onClick={onNewChat}
-        className="mb-4 rounded-md border border-white/20 bg-white/[0.07] py-2 text-sm font-medium transition-colors hover:border-accent hover:bg-white/[0.14]"
+        disabled={isGuest && chats.length > 0}
+        className="mb-1 rounded-md border border-white/20 bg-white/[0.07] py-2 text-sm font-medium transition-colors hover:border-accent hover:bg-white/[0.14] disabled:cursor-not-allowed disabled:opacity-40"
       >
         + New chat
       </button>
+      {isGuest && (
+        <p className="mb-3 px-1 text-[11px] text-white/40">Guest mode · 1 chat · 5 questions</p>
+      )}
 
       <div className="flex min-h-0 flex-1 flex-col">
         {chats.length > 0 && (
@@ -127,7 +145,7 @@ export function Sidebar({
                 {currentUser.display_name || "Privy user"}
               </p>
               <p className="truncate text-xs text-white/50">
-                {currentUser.email || "Signed in"}
+                {currentUser.email || (isGuest ? "Temporary session" : "Signed in")}
               </p>
               {isAdmin && (
                 <p className="mt-0.5 text-[11px] text-white/40">Administrator</p>
@@ -137,6 +155,15 @@ export function Sidebar({
         )}
 
         <div className="flex flex-col gap-1">
+          {isGuest && (
+            <button
+              onClick={onSignIn}
+              className="flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/[0.10] hover:text-white"
+            >
+              <span aria-hidden>⇥</span>
+              <span>Sign in to save chats</span>
+            </button>
+          )}
           {isAdmin && (
             <button
               onClick={onOpenSettings}
@@ -151,7 +178,7 @@ export function Sidebar({
             className="flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-white/70 transition-colors hover:bg-white/[0.10] hover:text-white"
           >
             <span aria-hidden>↪</span>
-            <span>Log out</span>
+            <span>{isGuest ? "End guest session" : "Log out"}</span>
           </button>
         </div>
       </div>

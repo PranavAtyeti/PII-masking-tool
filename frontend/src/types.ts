@@ -9,6 +9,14 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   masked_count: number;
+  metadata?: {
+    provider?: string;
+    model?: string;
+    files_used?: string[];
+    files_skipped?: string[];
+    masked_token_count?: number;
+    security_override?: boolean;
+  };
 }
 
 export interface ColumnInfo {
@@ -54,7 +62,7 @@ export interface CurrentUser {
   sub: string;
   email: string | null;
   display_name: string | null;
-  role: "admin" | "user";
+  role: "admin" | "user" | "guest";
   created_at: number;
   last_login_at: number;
 }

@@ -17,7 +17,8 @@ COLUMN_HINTS = {
     "PHONE": ["phone", "mobile", "cell", "telephone", "contact no"],
     "ADDRESS": ["address", "location", "street", "city", "residence"],
     "ID": ["pan", "aadhaar", "ssn", "passport", "id number", "id",
-           "account no", "account number", "card number"],
+           "account no", "account number", "card number", "bank account",
+           "account id", "tax id", "national id", "government id"],
     "DOB": ["dob", "date of birth", "birth date"],
     "AMOUNT": ["salary", "income", "wage", "compensation", "ctc"],
 }
@@ -97,6 +98,22 @@ def classify_column(header: str):
     return None
 
 
+def _is_valid_luhn(value: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    if not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    parity = len(digits) % 2
+    for i, ch in enumerate(digits):
+        n = int(ch)
+        if i % 2 == parity:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
 def classify_cell(value, include_name_shape: bool = False):
     """
     include_name_shape=False (the default) only checks high-precision
@@ -117,6 +134,8 @@ def classify_cell(value, include_name_shape: bool = False):
     for value_type, pattern in CELL_PATTERNS:
         if pattern.match(s):
             return value_type
+    if _is_valid_luhn(s):
+        return "ID"
     if include_name_shape and NAME_SHAPE_PATTERN.match(s):
         return "PERSON"
     return None

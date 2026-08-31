@@ -3,6 +3,9 @@
 from fastapi import APIRouter, Depends
 import os
 
+from .. import mapping_store as store
+from ..schemas import GuestSessionOut
+
 from ..auth import get_current_app_user
 from ..llm import get_model_options
 
@@ -42,3 +45,9 @@ def models(_user: dict = Depends(get_current_app_user)):
     if default_id is None and options:
         default_id = options[0]["id"]
     return {"models": options, "default_model_id": default_id}
+
+
+@router.post("/guest", response_model=GuestSessionOut)
+def create_guest():
+    session_id, user, expires_at = store.create_guest_session()
+    return {"session_id": session_id, "expires_at": expires_at, "user": user}

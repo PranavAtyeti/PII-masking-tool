@@ -7,16 +7,16 @@ import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from .. import mapping_store as store
-from ..context_limits import MAX_ROWS_PER_FILE
 from ..auth import get_current_app_user
 from ..detection import classify_dataframe_columns
 from ..masking import build_masked_context, count_masked_tokens, find_leaked_values, mask_dataframe
 from ..schemas import ChatFileInfo, ColumnInfo, UploadPreviewResult, UploadResult
+from ..security_scan import scan_for_unmasked_pii
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
-MAX_FILES_PER_CHAT = 10
+GUEST_MAX_FILES = int(__import__("os").getenv("PRIVY_GUEST_MAX_FILES", "3"))
+GUEST_MAX_FILE_SIZE_MB = int(__import__("os").getenv("PRIVY_GUEST_MAX_FILE_SIZE_MB", "10"))
 
 
 def _get_chat_or_404(chat_id: str, user_id: str) -> dict:
@@ -48,11 +48,6 @@ async def preview_file(
     _get_chat_or_404(chat_id, user["auth0_sub"])
 
     raw_bytes = await file.read()
-    if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File is too large. Privy allows files up to {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
-        )
     try:
         df = _read_dataframe(file.filename or "upload.csv", raw_bytes)
     except HTTPException:
@@ -61,15 +56,6 @@ async def preview_file(
         raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}") from e
 
     col_types = classify_dataframe_columns(df)
-    if len(df) > MAX_ROWS_PER_FILE:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"File contains {len(df):,} rows. Privy allows up to "
-                f"{MAX_ROWS_PER_FILE:,} rows per file."
-            ),
-        )
-
     columns = [
         ColumnInfo(
             name=str(col),
@@ -98,21 +84,13 @@ async def upload_file(
     """Mask one file and add/replace it as an attachment on the chat."""
     _get_chat_or_404(chat_id, user["auth0_sub"])
 
-    if not file_id and len(store.get_chat_files(chat_id)) >= MAX_FILES_PER_CHAT:
-        raise HTTPException(
-            status_code=400,
-            detail=f"This chat already has {MAX_FILES_PER_CHAT} files. Remove a file before adding another.",
-        )
-
     if file_id and not store.get_chat_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="File not found")
 
+    if user.get("role") == "guest" and not file_id and store.count_user_files(user["auth0_sub"]) >= GUEST_MAX_FILES:
+        raise HTTPException(status_code=403, detail=f"Guest sessions can attach up to {GUEST_MAX_FILES} files. Sign in for more.")
+
     raw_bytes = await file.read()
-    if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File is too large. Privy allows files up to {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
-        )
     try:
         df = _read_dataframe(file.filename or "upload.csv", raw_bytes)
     except HTTPException:
@@ -122,15 +100,6 @@ async def upload_file(
 
     disabled = {c.strip() for c in disabled_columns.split(",") if c.strip()}
     col_types = classify_dataframe_columns(df)
-    if len(df) > MAX_ROWS_PER_FILE:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"File contains {len(df):,} rows. Privy allows up to "
-                f"{MAX_ROWS_PER_FILE:,} rows per file."
-            ),
-        )
-
 
     counters = store.load_counters(chat_id)
     masked_df, _known_values = mask_dataframe(
@@ -166,6 +135,17 @@ async def upload_file(
         )
 
     masked_csv, truncated = build_masked_context(masked_df)
+
+    residual_pii = scan_for_unmasked_pii(masked_csv)
+    if residual_pii:
+        labels = ", ".join(f"{item["type"]} ({item["count"]})" for item in residual_pii)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Masking validation found possible unmasked sensitive data in the masked file "
+                f"({labels}). Nothing was saved."
+            ),
+        )
     columns = [
         ColumnInfo(name=str(col), type=col_types.get(col), enabled=col not in disabled)
         for col in df.columns

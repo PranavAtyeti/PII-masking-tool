@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useAuth0 } from "@auth0/auth0-react";
-import { setAccessTokenGetter } from "./auth";
+import { setAccessTokenGetter, setGuestSessionGetter } from "./auth";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPane } from "./components/ChatPane";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -31,6 +31,9 @@ export default function App() {
   } = useAuth0();
 
   const [backendAuthReady, setBackendAuthReady] = useState(false);
+  const [guestSessionId, setGuestSessionId] = useState<string | null>(
+    () => sessionStorage.getItem("privy-guest-session")
+  );
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [chats, setChats] = useState<Chat[]>([]);
@@ -57,7 +60,16 @@ export default function App() {
   useEffect(() => {
   if (!isAuthenticated) {
     setAccessTokenGetter(null);
-    return;
+    setGuestSessionGetter(() => guestSessionId);
+  } else {
+    setGuestSessionGetter(null);
+  }
+
+  if (!isAuthenticated) {
+    return () => {
+      setGuestSessionGetter(null);
+      setAccessTokenGetter(null);
+    };
   }
 
   setAccessTokenGetter(async () => {
@@ -71,11 +83,12 @@ export default function App() {
 
   return () => {
     setAccessTokenGetter(null);
+    setGuestSessionGetter(null);
   };
-}, [isAuthenticated, getAccessTokenSilently]);
+}, [isAuthenticated, getAccessTokenSilently, guestSessionId]);
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    if (!isAuthenticated && !guestSessionId) {
       setBackendAuthReady(false);
       setCurrentUser(null);
       setSettingsOpen(false);
@@ -109,7 +122,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, auth0User]);
+  }, [isAuthenticated, auth0User, guestSessionId]);
 
   useEffect(() => {
     if (!backendAuthReady) return;
@@ -189,12 +202,36 @@ export default function App() {
     };
   }
 
+  async function handleStartGuest() {
+    try {
+      const result = await api.createGuestSession();
+      sessionStorage.setItem("privy-guest-session", result.session_id);
+      setGuestSessionId(result.session_id);
+      setCurrentUser(result.user);
+      setLoadError(null);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Couldn't start a guest session.");
+    }
+  }
+
   async function handleLogout() {
     streamControllerRef.current?.abort();
     setIsStreaming(false);
     setSettingsOpen(false);
     setCurrentUser(null);
     setLoadError(null);
+
+    if (!isAuthenticated && guestSessionId) {
+      sessionStorage.removeItem("privy-guest-session");
+      setGuestSessionId(null);
+      setChats([]);
+      setActiveChatId(null);
+      setMessages([]);
+      setAttachments([]);
+      clearPendingFileState();
+      return;
+    }
+
     await logout({
       logoutParams: {
         returnTo: window.location.origin,
@@ -420,62 +457,97 @@ export default function App() {
       setActiveChatId(chatId);
     }
 
-    setMessages((prev) => [...prev, { role: "user", content: text, masked_count: 0 }]);
-    setMessages((prev) => [...prev, { role: "assistant", content: "", masked_count: 0 }]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: text, masked_count: 0 },
+      { role: "assistant", content: "", masked_count: 0 },
+    ]);
     setIsStreaming(true);
 
-    const controller = new AbortController();
-    streamControllerRef.current = controller;
+    const runStream = async (allowUnmaskedRisk: boolean) => {
+      const controller = new AbortController();
+      streamControllerRef.current = controller;
 
-    await api.streamMessage(
-      chatId,
-      {
-        question: text,
-        use_ner: true,
-        ner_confidence: 0.6,
-        concise: true,
-        model_id: selectedModelId || undefined,
-      },
-      {
-        onDelta: (piece) => {
-          setMessages((prev) => {
-            const next = [...prev];
-            const last = next[next.length - 1];
-            next[next.length - 1] = { ...last, content: last.content + piece };
-            return next;
-          });
+      await api.streamMessage(
+        chatId!,
+        {
+          question: text,
+          use_ner: true,
+          ner_confidence: 0.6,
+          concise: true,
+          model_id: selectedModelId || undefined,
+          allow_unmasked_risk: allowUnmaskedRisk,
         },
-        onDone: (maskedCount) => {
-          setMessages((prev) => {
-            const next = [...prev];
-            const last = next[next.length - 1];
-            next[next.length - 1] = { ...last, masked_count: maskedCount };
-            return next;
-          });
-          setIsStreaming(false);
-          streamControllerRef.current = null;
-          api.listChats().then(setChats).catch(() => {});
-        },
-        onError: (message) => {
-          setMessages((prev) => {
-            const next = [...prev];
-            next[next.length - 1] = { role: "assistant", content: message, masked_count: 0 };
-            return next;
-          });
-          setIsStreaming(false);
-          streamControllerRef.current = null;
-        },
-        onAbort: () => {
-          setIsStreaming(false);
-          streamControllerRef.current = null;
-        },
-      },
-      controller.signal
-    );
+        {
+          onDelta: (piece) => {
+            setMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (!last) return prev;
+              next[next.length - 1] = { ...last, content: last.content + piece };
+              return next;
+            });
+          },
+          onDone: (maskedCount) => {
+            setMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (!last) return prev;
+              next[next.length - 1] = { ...last, masked_count: maskedCount };
+              return next;
+            });
+            setIsStreaming(false);
+            streamControllerRef.current = null;
+            api.listChats().then(setChats).catch(() => {});
+          },
+          onSecurityWarning: (warning) => {
+            if (allowUnmaskedRisk) return;
 
-    if (streamControllerRef.current === controller) {
-      streamControllerRef.current = null;
-    }
+            const types = warning.findings
+              .map((finding) => `${finding.type.replaceAll("_", " ")} (${finding.count})`)
+              .join(", ");
+            const detail = types ? `Detected: ${types}.` : warning.message;
+            const proceed = window.confirm(
+              `${warning.message}\n\n${detail}\n\nSend to the selected model anyway?`
+            );
+
+            if (proceed) {
+              void runStream(true);
+            } else {
+              setMessages((prev) => prev.slice(0, -2));
+              setIsStreaming(false);
+              streamControllerRef.current = null;
+            }
+          },
+          onError: (message) => {
+            setMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (!last) return prev;
+              next[next.length - 1] = {
+                ...last,
+                content: message,
+                masked_count: 0,
+              };
+              return next;
+            });
+            setIsStreaming(false);
+            streamControllerRef.current = null;
+          },
+          onAbort: () => {
+            setIsStreaming(false);
+            streamControllerRef.current = null;
+          },
+        },
+        controller.signal
+      );
+
+      if (streamControllerRef.current === controller) {
+        streamControllerRef.current = null;
+      }
+    };
+
+    await runStream(false);
   }
 
   if (authLoading) {
@@ -486,7 +558,7 @@ export default function App() {
     );
   }
 
-  if (!isAuthenticated) {
+  if (!isAuthenticated && !guestSessionId) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-bg px-6">
         <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-8 text-center shadow-sm">
@@ -495,7 +567,7 @@ export default function App() {
           </div>
           <h1 className="font-display text-2xl font-semibold">Welcome to Privy</h1>
           <p className="mt-2 text-sm leading-6 text-ink/60">
-            Sign in to keep your chats associated with your account.
+            Protect sensitive data before it reaches the AI.
           </p>
           <button
             type="button"
@@ -504,6 +576,21 @@ export default function App() {
           >
             Sign in
           </button>
+          <div className="my-4 flex items-center gap-3 text-xs text-ink/35">
+            <span className="h-px flex-1 bg-border" />
+            or
+            <span className="h-px flex-1 bg-border" />
+          </div>
+          <button
+            type="button"
+            onClick={handleStartGuest}
+            className="w-full rounded-xl border border-border px-4 py-3 text-sm font-medium text-ink hover:bg-bg"
+          >
+            Try Privy as Guest
+          </button>
+          <p className="mt-3 text-xs text-ink/40">
+            Guest sessions are temporary and limited. Sign in to save chats.
+          </p>
         </div>
       </div>
     );
@@ -551,8 +638,10 @@ if (!backendAuthReady) {
         onExportChat={handleExportChat}
         onOpenSettings={() => setSettingsOpen(true)}
         onLogout={handleLogout}
+        onSignIn={() => loginWithRedirect()}
         currentUser={currentUser}
         isAdmin={currentUser?.role === "admin"}
+        isGuest={currentUser?.role === "guest"}
       />
       <ChatPane
         messages={messages}
