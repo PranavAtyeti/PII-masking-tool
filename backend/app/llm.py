@@ -7,6 +7,7 @@ from typing import Iterator
 import requests
 
 DEFAULT_TEMPERATURE = float(os.environ.get("MODEL_TEMPERATURE", "0.1"))
+DEFAULT_MAX_OUTPUT_TOKENS = int(os.environ.get("LLM_MAX_OUTPUT_TOKENS", "4096"))
 
 PROVIDERS = {
     "groq": {
@@ -143,13 +144,13 @@ def _post_payload(system_prompt: str, user_prompt: str, model: str, temperature:
     if provider == "groq":
         payload["temperature"] = temperature
     if provider == "gemini":
-        payload["reasoning_effort"] = "low"
+        payload["reasoning_effort"] = os.environ.get("GEMINI_REASONING_EFFORT", "low")
     if stream:
         payload["stream"] = True
     return payload
 
 
-def call_llm(system_prompt: str, user_prompt: str, api_key: str | None, model: str | None, temperature: float = DEFAULT_TEMPERATURE, max_tokens: int = 400) -> str:
+def call_llm(system_prompt: str, user_prompt: str, api_key: str | None, model: str | None, temperature: float = DEFAULT_TEMPERATURE, max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS) -> str:
     provider, base_url, resolved_key, resolved_model = get_model_config(model if model else None)
     # Preserve legacy explicit keys when a caller supplies one.
     if api_key:
@@ -159,7 +160,7 @@ def call_llm(system_prompt: str, user_prompt: str, api_key: str | None, model: s
         base_url,
         headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
         json=_post_payload(system_prompt, user_prompt, resolved_model, temperature, max_tokens, False, provider),
-        timeout=(10, 30),
+        timeout=(10, 90),
     )
     response.raise_for_status()
     data = response.json()
@@ -169,98 +170,34 @@ def call_llm(system_prompt: str, user_prompt: str, api_key: str | None, model: s
         raise RuntimeError("LLM returned an unexpected response format") from exc
 
 
-def _extract_stream_text(chunk: dict) -> str:
-    """Extract textual content from common OpenAI-compatible stream shapes."""
-    choices = chunk.get("choices") or []
-    if not choices:
-        return ""
-
-    choice = choices[0] or {}
-    delta = choice.get("delta") or {}
-    content = delta.get("content")
-
-    # Standard OpenAI-compatible shape: delta.content = string.
-    if isinstance(content, str):
-        return content
-
-    # Some compatible APIs return structured content parts.
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "".join(parts)
-
-    # Tolerate providers that place text directly under delta.
-    text = delta.get("text")
-    if isinstance(text, str):
-        return text
-
-    return ""
-
-
-def stream_llm(
-    system_prompt: str,
-    user_prompt: str,
-    api_key: str | None,
-    model: str | None,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = 400,
-) -> Iterator[str]:
-    """Streaming OpenAI-compatible call yielding correctly decoded UTF-8 text.
-
-    We explicitly decode SSE lines as UTF-8 instead of allowing ``requests`` to
-    guess the response encoding. This prevents mojibake such as ``â``/``�`` in
-    assistant responses containing emoji or other non-ASCII characters.
-    """
+def stream_llm(system_prompt: str, user_prompt: str, api_key: str | None, model: str | None, temperature: float = DEFAULT_TEMPERATURE, max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS) -> Iterator[str]:
     provider, base_url, resolved_key, resolved_model = get_model_config(model if model else None)
     if api_key:
         resolved_key = api_key
 
     response = requests.post(
         base_url,
-        headers={
-            "Authorization": f"Bearer {resolved_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        },
-        json=_post_payload(
-            system_prompt, user_prompt, resolved_model, temperature, max_tokens, True, provider
-        ),
-        timeout=(10, 30),
+        headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
+        json=_post_payload(system_prompt, user_prompt, resolved_model, temperature, max_tokens, True, provider),
+        timeout=(10, 90),
         stream=True,
     )
     response.raise_for_status()
 
-    yielded_any = False
-
-    for raw_line in response.iter_lines(decode_unicode=False):
-        if not raw_line:
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line or not raw_line.startswith("data:"):
             continue
-
-        try:
-            line = raw_line.decode("utf-8").strip()
-        except UnicodeDecodeError as exc:
-            raise RuntimeError("The model returned invalid UTF-8 text") from exc
-
-        if not line.startswith("data:"):
-            continue
-
-        payload = line[len("data:"):].strip()
+        payload = raw_line[len("data:"):].strip()
         if payload == "[DONE]":
             break
-
         try:
             chunk = json.loads(payload)
         except json.JSONDecodeError:
             continue
-
-        content = _extract_stream_text(chunk)
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
         if content:
-            yielded_any = True
             yield content
-
-    if not yielded_any:
-        raise RuntimeError("The model returned an empty response")

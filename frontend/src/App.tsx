@@ -4,7 +4,14 @@ import { setAccessTokenGetter, setGuestSessionGetter } from "./auth";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPane } from "./components/ChatPane";
 import { SettingsPanel } from "./components/SettingsPanel";
-import type { Chat, ChatFileInfo, ColumnInfo, CurrentUser, Message, ModelOption } from "./types";
+import type {
+  Chat,
+  ChatFileInfo,
+  ColumnInfo,
+  CurrentUser,
+  Message,
+  ModelOption,
+} from "./types";
 import { api } from "./api";
 import { SUGGESTION_CHIPS } from "./constants";
 import type { ChatAttachment } from "./components/ChatInput";
@@ -55,38 +62,39 @@ export default function App() {
   const [selectedModelId, setSelectedModelId] = useState<string>(
     () => localStorage.getItem("privy-selected-model") || ""
   );
+
   const streamControllerRef = useRef<AbortController | null>(null);
 
+  // Wire authenticated and guest request credentials into the API layer.
   useEffect(() => {
-  if (!isAuthenticated) {
-    setAccessTokenGetter(null);
-    setGuestSessionGetter(() => guestSessionId);
-  } else {
-    setGuestSessionGetter(null);
-  }
-
-  if (!isAuthenticated) {
-    return () => {
-      setGuestSessionGetter(null);
+    if (!isAuthenticated) {
       setAccessTokenGetter(null);
-    };
-  }
+      setGuestSessionGetter(() => guestSessionId);
 
-  setAccessTokenGetter(async () => {
-    return getAccessTokenSilently({
-      authorizationParams: {
-        audience: import.meta.env.VITE_AUTH0_AUDIENCE,
-        scope: "openid profile email",
-      },
-    });
-  });
+      return () => {
+        setGuestSessionGetter(null);
+        setAccessTokenGetter(null);
+      };
+    }
 
-  return () => {
-    setAccessTokenGetter(null);
     setGuestSessionGetter(null);
-  };
-}, [isAuthenticated, getAccessTokenSilently, guestSessionId]);
 
+    setAccessTokenGetter(async () => {
+      return getAccessTokenSilently({
+        authorizationParams: {
+          audience: import.meta.env.VITE_AUTH0_AUDIENCE,
+          scope: "openid profile email",
+        },
+      });
+    });
+
+    return () => {
+      setAccessTokenGetter(null);
+      setGuestSessionGetter(null);
+    };
+  }, [isAuthenticated, getAccessTokenSilently, guestSessionId]);
+
+  // Resolve the backend-side user/session before loading chats.
   useEffect(() => {
     if (!isAuthenticated && !guestSessionId) {
       setBackendAuthReady(false);
@@ -96,25 +104,36 @@ export default function App() {
     }
 
     let cancelled = false;
+
     (async () => {
       try {
         const backendUser = await api.getCurrentUser();
+
         if (!cancelled) {
           setCurrentUser({
             ...backendUser,
             email: backendUser.email || auth0User?.email || null,
             display_name:
-              backendUser.display_name && !backendUser.display_name.startsWith("google-oauth2|")
+              backendUser.display_name &&
+              !backendUser.display_name.startsWith("google-oauth2|")
                 ? backendUser.display_name
-                : auth0User?.name || auth0User?.nickname || auth0User?.email || backendUser.display_name,
+                : auth0User?.name ||
+                  auth0User?.nickname ||
+                  auth0User?.email ||
+                  backendUser.display_name,
           });
+
           setBackendAuthReady(true);
           setLoadError(null);
         }
       } catch (e) {
         if (!cancelled) {
           setBackendAuthReady(false);
-          setLoadError(e instanceof Error ? e.message : "The backend could not validate your login.");
+          setLoadError(
+            e instanceof Error
+              ? e.message
+              : "The backend could not validate your login."
+          );
         }
       }
     })();
@@ -124,29 +143,43 @@ export default function App() {
     };
   }, [isAuthenticated, auth0User, guestSessionId]);
 
+  // Discover models only after authentication/guest session is ready.
   useEffect(() => {
     if (!backendAuthReady) return;
 
-    api.getModels()
+    api
+      .getModels()
       .then((catalog) => {
         setModels(catalog.models);
+
         const saved = localStorage.getItem("privy-selected-model");
-        const savedIsAvailable = saved && catalog.models.some((model) => model.id === saved);
-        const next = savedIsAvailable ? saved : catalog.default_model_id || catalog.models[0]?.id || "";
+        const savedIsAvailable =
+          !!saved && catalog.models.some((model) => model.id === saved);
+
+        const next =
+          savedIsAvailable
+            ? saved!
+            : catalog.default_model_id || catalog.models[0]?.id || "";
+
         setSelectedModelId(next);
-        if (next) localStorage.setItem("privy-selected-model", next);
+
+        if (next) {
+          localStorage.setItem("privy-selected-model", next);
+        }
       })
       .catch(() => {
-        // Model discovery is non-blocking; the existing admin/default model can still be used.
+        // Model discovery is non-blocking.
       });
   }, [backendAuthReady]);
 
+  // Load chats after the backend identity is ready.
   useEffect(() => {
     if (!backendAuthReady) return;
 
     (async () => {
       try {
         const existing = await api.listChats();
+
         if (existing.length > 0) {
           setChats(existing);
           await selectChat(existing[0].chat_id);
@@ -158,9 +191,12 @@ export default function App() {
           setAttachments([]);
         }
       } catch (e) {
-        setLoadError(e instanceof Error ? e.message : "Couldn't reach the backend.");
+        setLoadError(
+          e instanceof Error ? e.message : "Couldn't reach the backend."
+        );
       }
     })();
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [backendAuthReady]);
 
@@ -184,10 +220,14 @@ export default function App() {
         api.getMessages(chatId),
         api.listFiles(chatId),
       ]);
+
       setMessages(msgs);
       setAttachments(fileInfos.map(toLocalAttachment));
+      setLoadError(null);
     } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Couldn't load that chat.");
+      setLoadError(
+        e instanceof Error ? e.message : "Couldn't load that chat."
+      );
     }
   }
 
@@ -210,7 +250,21 @@ export default function App() {
       setCurrentUser(result.user);
       setLoadError(null);
     } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Couldn't start a guest session.");
+      setLoadError(
+        e instanceof Error ? e.message : "Couldn't start a guest session."
+      );
+    }
+  }
+
+  async function handleSignIn() {
+    try {
+      await loginWithRedirect();
+    } catch (e) {
+      setLoadError(
+        e instanceof Error
+          ? e.message
+          : "Unable to start the Auth0 sign-in."
+      );
     }
   }
 
@@ -241,6 +295,7 @@ export default function App() {
 
   async function handleNewChat() {
     const created = await api.createChat();
+
     setChats((prev) => [created, ...prev]);
     setActiveChatId(created.chat_id);
     setMessages([]);
@@ -250,11 +305,14 @@ export default function App() {
 
   async function handleRenameChat(chatId: string, title: string) {
     const updated = await api.renameChat(chatId, title);
-    setChats((prev) => prev.map((c) => (c.chat_id === chatId ? updated : c)));
+    setChats((prev) =>
+      prev.map((c) => (c.chat_id === chatId ? updated : c))
+    );
   }
 
   async function handleDeleteChat(chatId: string) {
     await api.deleteChat(chatId);
+
     const remaining = chats.filter((c) => c.chat_id !== chatId);
     setChats(remaining);
 
@@ -281,16 +339,21 @@ export default function App() {
 
     setIsUploading(true);
     setIsEditingFile(false);
+
     try {
       const preview = await api.previewFile(activeChatId, file);
+
       setPendingFile(file);
       setPendingFileId(null);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
-      setSelectedColumns(preview.columns.filter((c) => c.type).map((c) => c.name));
+      setSelectedColumns(
+        preview.columns.filter((c) => c.type).map((c) => c.name)
+      );
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Couldn't inspect that file.";
-      window.alert(msg);
+      window.alert(
+        e instanceof Error ? e.message : "Couldn't inspect that file."
+      );
       setPendingFileQueue([]);
     } finally {
       setIsUploading(false);
@@ -301,18 +364,29 @@ export default function App() {
     if (!activeChatId || isUploading || pendingFile) return;
 
     if (files.length > MAX_FILES_PER_SELECTION) {
-      window.alert(`You can select up to ${MAX_FILES_PER_SELECTION} files at a time.`);
+      window.alert(
+        `You can select up to ${MAX_FILES_PER_SELECTION} files at a time.`
+      );
       return;
     }
 
-    const oversized = files.find((file) => file.size > MAX_FILE_SIZE_BYTES);
+    const oversized = files.find(
+      (file) => file.size > MAX_FILE_SIZE_BYTES
+    );
+
     if (oversized) {
-      window.alert(`\"${oversized.name}\" is too large. Privy allows files up to ${MAX_FILE_SIZE_MB} MB each.`);
+      window.alert(
+        `"${oversized.name}" is too large. Privy allows files up to ${MAX_FILE_SIZE_MB} MB each.`
+      );
       return;
     }
 
     if (files.length + attachments.length > MAX_FILES_PER_CHAT) {
-      const remaining = Math.max(0, MAX_FILES_PER_CHAT - attachments.length);
+      const remaining = Math.max(
+        0,
+        MAX_FILES_PER_CHAT - attachments.length
+      );
+
       window.alert(
         remaining === 0
           ? `This chat already has ${MAX_FILES_PER_CHAT} files. Remove a file before adding another.`
@@ -341,24 +415,31 @@ export default function App() {
 
     setIsUploading(true);
     setIsEditingFile(true);
+
     try {
       const preview = await api.previewFile(activeChatId, attachment.file);
+
       setPendingFile(attachment.file);
       setPendingFileId(fileId);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
+
       const enabledNames = attachment.columns
         .filter((column) => column.enabled)
         .map((column) => column.name);
+
       setSelectedColumns(
         enabledNames.length > 0
           ? enabledNames
-          : preview.columns.filter((column) => column.type).map((column) => column.name)
+          : preview.columns.filter((column) => column.type).map((c) => c.name)
       );
     } catch (e) {
       setIsEditingFile(false);
-      const msg = e instanceof Error ? e.message : "Couldn't reopen masking settings.";
-      window.alert(msg);
+      window.alert(
+        e instanceof Error
+          ? e.message
+          : "Couldn't reopen masking settings."
+      );
     } finally {
       setIsUploading(false);
     }
@@ -366,30 +447,50 @@ export default function App() {
 
   async function handleRemoveFile(fileId: string) {
     if (!activeChatId || isUploading) return;
+
     const attachment = attachments.find((item) => item.fileId === fileId);
     if (!attachment) return;
 
-    if (!window.confirm(`Remove ${attachment.filename} from this chat?`)) return;
+    if (!window.confirm(`Remove ${attachment.filename} from this chat?`)) {
+      return;
+    }
 
     setIsUploading(true);
+
     try {
       await api.removeFile(activeChatId, fileId);
-      setAttachments((prev) => prev.filter((item) => item.fileId !== fileId));
-      if (pendingFileId === fileId) clearPendingFileState();
+
+      setAttachments((prev) =>
+        prev.filter((item) => item.fileId !== fileId)
+      );
+
+      if (pendingFileId === fileId) {
+        clearPendingFileState();
+      }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Couldn't remove the file.";
-      window.alert(msg);
+      window.alert(
+        e instanceof Error ? e.message : "Couldn't remove the file."
+      );
     } finally {
       setIsUploading(false);
     }
   }
 
   async function handleApplyFile() {
-    if (!activeChatId || !pendingFile || selectedColumns.length === 0 || isUploading) return;
+    if (
+      !activeChatId ||
+      !pendingFile ||
+      selectedColumns.length === 0 ||
+      isUploading
+    ) {
+      return;
+    }
 
     setIsUploading(true);
+
     try {
       const selected = new Set(selectedColumns);
+
       const disabledColumns = pendingColumns
         .map((column) => column.name)
         .filter((name) => !selected.has(name));
@@ -412,12 +513,16 @@ export default function App() {
 
       setAttachments((prev) => {
         if (pendingFileId) {
-          return prev.map((item) => (item.fileId === pendingFileId ? updated : item));
+          return prev.map((item) =>
+            item.fileId === pendingFileId ? updated : item
+          );
         }
+
         return [...prev, updated];
       });
 
       const nextFile = pendingFileQueue[0];
+
       setPendingFileQueue((prev) => prev.slice(1));
       setPendingFileId(null);
       setPendingFile(null);
@@ -430,8 +535,9 @@ export default function App() {
         await prepareNewFile(nextFile);
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Masking failed.";
-      window.alert(msg);
+      window.alert(
+        e instanceof Error ? e.message : "Masking failed."
+      );
     } finally {
       setIsUploading(false);
     }
@@ -450,6 +556,7 @@ export default function App() {
     if (isStreaming) return;
 
     let chatId = activeChatId;
+
     if (!chatId) {
       const created = await api.createChat();
       setChats((prev) => [created, ...prev]);
@@ -462,6 +569,7 @@ export default function App() {
       { role: "user", content: text, masked_count: 0 },
       { role: "assistant", content: "", masked_count: 0 },
     ]);
+
     setIsStreaming(true);
 
     const runStream = async (allowUnmaskedRisk: boolean) => {
@@ -483,30 +591,52 @@ export default function App() {
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
+
               if (!last) return prev;
-              next[next.length - 1] = { ...last, content: last.content + piece };
+
+              next[next.length - 1] = {
+                ...last,
+                content: last.content + piece,
+              };
+
               return next;
             });
           },
+
           onDone: (maskedCount) => {
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
+
               if (!last) return prev;
-              next[next.length - 1] = { ...last, masked_count: maskedCount };
+
+              next[next.length - 1] = {
+                ...last,
+                masked_count: maskedCount,
+              };
+
               return next;
             });
+
             setIsStreaming(false);
             streamControllerRef.current = null;
             api.listChats().then(setChats).catch(() => {});
           },
+
           onSecurityWarning: (warning) => {
             if (allowUnmaskedRisk) return;
 
             const types = warning.findings
-              .map((finding) => `${finding.type.replaceAll("_", " ")} (${finding.count})`)
+              .map(
+                (finding) =>
+                  `${finding.type.replaceAll("_", " ")} (${finding.count})`
+              )
               .join(", ");
-            const detail = types ? `Detected: ${types}.` : warning.message;
+
+            const detail = types
+              ? `Detected: ${types}.`
+              : warning.message;
+
             const proceed = window.confirm(
               `${warning.message}\n\n${detail}\n\nSend to the selected model anyway?`
             );
@@ -519,21 +649,27 @@ export default function App() {
               streamControllerRef.current = null;
             }
           },
+
           onError: (message) => {
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
+
               if (!last) return prev;
+
               next[next.length - 1] = {
                 ...last,
                 content: message,
                 masked_count: 0,
               };
+
               return next;
             });
+
             setIsStreaming(false);
             streamControllerRef.current = null;
           },
+
           onAbort: () => {
             setIsStreaming(false);
             streamControllerRef.current = null;
@@ -562,25 +698,35 @@ export default function App() {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-bg px-6">
         <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-8 text-center shadow-sm">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-bg text-2xl" aria-hidden>
+          <div
+            className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-bg text-2xl"
+            aria-hidden
+          >
             🔒
           </div>
-          <h1 className="font-display text-2xl font-semibold">Welcome to Privy</h1>
+
+          <h1 className="font-display text-2xl font-semibold">
+            Welcome to Privy
+          </h1>
+
           <p className="mt-2 text-sm leading-6 text-ink/60">
             Protect sensitive data before it reaches the AI.
           </p>
+
           <button
             type="button"
-            onClick={() => loginWithRedirect()}
+            onClick={handleSignIn}
             className="mt-6 w-full rounded-xl bg-ink px-4 py-3 text-sm font-medium text-white hover:opacity-90"
           >
             Sign in
           </button>
+
           <div className="my-4 flex items-center gap-3 text-xs text-ink/35">
             <span className="h-px flex-1 bg-border" />
             or
             <span className="h-px flex-1 bg-border" />
           </div>
+
           <button
             type="button"
             onClick={handleStartGuest}
@@ -588,41 +734,57 @@ export default function App() {
           >
             Try Privy as Guest
           </button>
+
           <p className="mt-3 text-xs text-ink/40">
             Guest sessions are temporary and limited. Sign in to save chats.
           </p>
+
+          {loadError && (
+            <p className="mt-4 text-sm text-red-600">
+              {loadError}
+            </p>
+          )}
         </div>
       </div>
     );
   }
 
-if (loadError) {
-  return (
-    <div className="flex h-screen w-screen items-center justify-center p-6 text-center">
-      <div className="max-w-xl">
-        <p className="mb-2 text-lg font-semibold">
-          Privy couldn't sign you in
-        </p>
+  if (loadError) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center p-6 text-center">
+        <div className="max-w-xl">
+          <p className="mb-2 text-lg font-semibold">
+            Privy couldn't sign you in
+          </p>
 
-        <p className="text-sm text-ink/60">
-          {loadError}
-        </p>
+          <p className="text-sm text-ink/60">
+            {loadError}
+          </p>
 
-        <p className="mt-4 text-sm text-ink/60">
-          Check the FastAPI terminal for the exact error, then reload the page.
-        </p>
+          <p className="mt-4 text-sm text-ink/60">
+            Check the FastAPI terminal for the exact error, then reload the
+            page.
+          </p>
+
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="mt-5 rounded-xl bg-ink px-4 py-2 text-sm font-medium text-white hover:opacity-90"
+          >
+            Reload
+          </button>
+        </div>
       </div>
-    </div>
-  );
-}
+    );
+  }
 
-if (!backendAuthReady) {
-  return (
-    <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink">
-      <div className="text-sm text-ink/60">Signing you in…</div>
-    </div>
-  );
-}
+  if (!backendAuthReady) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink">
+        <div className="text-sm text-ink/60">Signing you in…</div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">
@@ -638,11 +800,12 @@ if (!backendAuthReady) {
         onExportChat={handleExportChat}
         onOpenSettings={() => setSettingsOpen(true)}
         onLogout={handleLogout}
-        onSignIn={() => loginWithRedirect()}
+        onSignIn={handleSignIn}
         currentUser={currentUser}
         isAdmin={currentUser?.role === "admin"}
         isGuest={currentUser?.role === "guest"}
       />
+
       <ChatPane
         messages={messages}
         suggestions={SUGGESTION_CHIPS}
@@ -667,8 +830,12 @@ if (!backendAuthReady) {
         selectedModelId={selectedModelId}
         onModelChange={handleModelChange}
       />
+
       {currentUser?.role === "admin" && (
-        <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+        <SettingsPanel
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+        />
       )}
     </div>
   );

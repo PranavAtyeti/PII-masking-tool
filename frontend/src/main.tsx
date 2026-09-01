@@ -14,6 +14,16 @@ if (!domain || !clientId || !audience) {
   );
 }
 
+const onRedirectCallback = () => {
+  // Auth0 has completed the authorization-code exchange.
+  // Remove ?code=...&state=... from the address bar.
+  window.history.replaceState(
+    {},
+    document.title,
+    window.location.pathname
+  );
+};
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <Auth0Provider
@@ -24,7 +34,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         audience,
         scope: "openid profile email",
       }}
-      cacheLocation="memory"
+      onRedirectCallback={onRedirectCallback}
+      useRefreshTokens={true}
+      cacheLocation="localstorage"
     >
       <App />
     </Auth0Provider>
