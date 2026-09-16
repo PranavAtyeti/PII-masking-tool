@@ -36,6 +36,8 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(50), nullable=False, default="user")
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     last_login_at: Mapped[float] = mapped_column(Float, nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     chats: Mapped[list["Chat"]] = relationship(
         back_populates="user",
@@ -138,4 +140,36 @@ class GuestSession(Base):
 
     __table_args__ = (
         Index("ix_guest_sessions_expires_at", "expires_at"),
+    )
+
+
+
+class AuthSession(Base):
+    """Server-side refresh-token session metadata."""
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_auth0_sub: Mapped[str] = mapped_column(
+        String(255),
+        ForeignKey("users.auth0_sub", ondelete="CASCADE"),
+        nullable=False,
+    )
+    refresh_token_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+    )
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+    last_used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    user: Mapped[User] = relationship(foreign_keys=[user_auth0_sub])
+
+    __table_args__ = (
+        Index("ix_auth_sessions_expires_at", "expires_at"),
+        Index("ix_auth_sessions_user", "user_auth0_sub"),
     )

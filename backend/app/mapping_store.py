@@ -11,12 +11,27 @@ import time
 import uuid
 import hashlib
 import secrets
+from collections.abc import Iterable
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal
-from .models import AdminConfig, Chat, ChatFile, ChatMessage, GuestSession, TokenEntry, User
+from .models import (
+    AdminConfig,
+    AuthSession,
+    Chat,
+    ChatFile,
+    ChatMessage,
+    GuestSession,
+    TokenEntry,
+    User,
+)
+
+
+# Keep ``IN (...)`` queries comfortably below driver and database parameter
+# limits when a large worksheet contains many distinct values.
+TOKEN_QUERY_CHUNK_SIZE = 1_000
 
 
 def init_db() -> None:
@@ -112,7 +127,205 @@ def _user_dict(row: User) -> dict:
         "role": row.role,
         "created_at": row.created_at,
         "last_login_at": row.last_login_at,
+        "email_verified": bool(row.email_verified),
     }
+
+
+# --- Local authentication ---------------------------------------------------
+
+AUTH_SESSION_TTL_SECONDS = int(
+    os.getenv("PRIVY_AUTH_SESSION_TTL_SECONDS", "604800")
+)
+
+
+def normalize_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def get_local_user_by_email(email: str) -> dict | None:
+    """Fetch a local account by normalized email.
+
+    Legacy Auth0 accounts and guest accounts are intentionally excluded from
+    local-password login so the Auth0 -> local-auth transition is explicit.
+    """
+    normalized = normalize_email(email)
+
+    with SessionLocal() as db:
+        row = db.scalar(
+            select(User)
+            .where(
+                func.lower(User.email) == normalized,
+                User.auth0_sub.like("local:%"),
+                User.role != "guest",
+            )
+            .order_by(User.created_at.asc())
+        )
+
+        if not row:
+            return None
+
+        result = _user_dict(row)
+        result["password_hash"] = row.password_hash
+        return result
+
+
+def get_local_user(user_id: str) -> dict | None:
+    with SessionLocal() as db:
+        row = db.get(User, user_id)
+        if not row or not row.auth0_sub.startswith("local:"):
+            return None
+        return _user_dict(row)
+
+
+def create_local_user(
+    email: str,
+    password_hash: str,
+    display_name: str | None = None,
+) -> dict:
+    normalized_email = normalize_email(email)
+    if not normalized_email:
+        raise ValueError("Email is required")
+
+    now = time.time()
+
+    with SessionLocal() as db:
+        existing = db.scalar(
+            select(User).where(func.lower(User.email) == normalized_email)
+        )
+        if existing and existing.role != "guest":
+            raise ValueError("An account with that email already exists")
+
+        local_user_count = db.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(
+                User.auth0_sub.like("local:%"),
+                User.role != "guest",
+            )
+        ) or 0
+
+        row = User(
+            auth0_sub=f"local:{uuid.uuid4()}",
+            email=normalized_email,
+            display_name=(display_name or "").strip() or None,
+            role="admin" if local_user_count == 0 else "user",
+            created_at=now,
+            last_login_at=now,
+            password_hash=password_hash,
+            email_verified=False,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return _user_dict(row)
+
+
+def update_last_login(user_id: str) -> dict | None:
+    now = time.time()
+    with SessionLocal() as db:
+        row = db.get(User, user_id)
+        if not row:
+            return None
+        row.last_login_at = now
+        db.commit()
+        db.refresh(row)
+        return _user_dict(row)
+
+
+def create_auth_session(
+    user_id: str,
+    user_agent: str | None = None,
+    ip_address: str | None = None,
+) -> tuple[str, float]:
+    """Create a refresh session and store only the token hash."""
+    now = time.time()
+    expires_at = now + max(3600, AUTH_SESSION_TTL_SECONDS)
+    refresh_token = secrets.token_urlsafe(48)
+    refresh_token_hash = hashlib.sha256(
+        refresh_token.encode("utf-8")
+    ).hexdigest()
+
+    row = AuthSession(
+        id=uuid.uuid4().hex,
+        user_auth0_sub=user_id,
+        refresh_token_hash=refresh_token_hash,
+        created_at=now,
+        expires_at=expires_at,
+        last_used_at=now,
+        revoked_at=None,
+        user_agent=(user_agent or "")[:512] or None,
+        ip_address=(ip_address or "")[:64] or None,
+    )
+
+    with SessionLocal() as db:
+        db.add(row)
+        db.commit()
+
+    return refresh_token, expires_at
+
+
+def rotate_auth_session(
+    refresh_token: str,
+) -> tuple[dict, str, float] | None:
+    """Validate and atomically rotate a refresh token."""
+    if not refresh_token:
+        return None
+
+    token_hash = hashlib.sha256(
+        refresh_token.encode("utf-8")
+    ).hexdigest()
+    now = time.time()
+
+    with SessionLocal() as db:
+        row = db.scalar(
+            select(AuthSession)
+            .where(AuthSession.refresh_token_hash == token_hash)
+            .with_for_update()
+        )
+
+        if not row or row.revoked_at is not None:
+            return None
+
+        if row.expires_at <= now:
+            row.revoked_at = now
+            db.commit()
+            return None
+
+        user = db.get(User, row.user_auth0_sub)
+        if not user or user.role == "guest" or user.password_hash is None:
+            row.revoked_at = now
+            db.commit()
+            return None
+
+        new_refresh_token = secrets.token_urlsafe(48)
+        new_hash = hashlib.sha256(
+            new_refresh_token.encode("utf-8")
+        ).hexdigest()
+
+        row.refresh_token_hash = new_hash
+        row.last_used_at = now
+        db.commit()
+
+        return _user_dict(user), new_refresh_token, row.expires_at
+
+
+def revoke_auth_session(refresh_token: str | None) -> None:
+    if not refresh_token:
+        return
+
+    token_hash = hashlib.sha256(
+        refresh_token.encode("utf-8")
+    ).hexdigest()
+
+    with SessionLocal() as db:
+        row = db.scalar(
+            select(AuthSession).where(
+                AuthSession.refresh_token_hash == token_hash
+            )
+        )
+        if row and row.revoked_at is None:
+            row.revoked_at = time.time()
+            db.commit()
 
 
 def create_guest_session(ttl_seconds: int = GUEST_SESSION_TTL_SECONDS) -> tuple[str, dict, float]:
@@ -210,6 +423,7 @@ def get_user(auth0_sub: str) -> dict | None:
             "role": row.role,
             "created_at": row.created_at,
             "last_login_at": row.last_login_at,
+            "email_verified": bool(row.email_verified),
         }
 
 
@@ -399,44 +613,92 @@ def delete_chat_file(chat_id: str, file_id: str) -> bool:
         return True
 
 
-def get_or_create_token(session_id: str, value_type: str, original_value: str, counters: dict) -> str:
-    value_norm = str(original_value).strip().lower()
-    with SessionLocal() as db:
-        row = db.scalar(
-            select(TokenEntry.token).where(
-                TokenEntry.session_id == session_id,
-                TokenEntry.value_norm == value_norm,
-            )
-        )
-        if row:
-            return row
+def get_or_create_tokens(
+    session_id: str,
+    values: Iterable[tuple[str, str]],
+    counters: dict,
+) -> dict[str, str]:
+    """Get or mint tokens for many values in one database transaction.
 
-        counters[value_type] = counters.get(value_type, 0) + 1
-        token = f"[{value_type}_{counters[value_type]}]"
-        try:
-            db.add(
+    ``TokenEntry`` is unique per normalized value within a chat, so repeated
+    spreadsheet values need one lookup and one token, regardless of how many
+    cells contain them. Keeping this operation set-based avoids a PostgreSQL
+    round trip and commit for every masked cell.
+    """
+    requested: dict[str, tuple[str, str]] = {}
+    for value_type, original_value in values:
+        value_norm = str(original_value).strip().lower()
+        if value_norm and value_norm not in requested:
+            requested[value_norm] = (value_type, str(original_value))
+
+    if not requested:
+        return {}
+
+    with SessionLocal() as db:
+        tokens = _get_existing_tokens(db, session_id, requested)
+
+        new_entries: list[TokenEntry] = []
+        for value_norm, (value_type, original_value) in requested.items():
+            if value_norm in tokens:
+                continue
+            counters[value_type] = counters.get(value_type, 0) + 1
+            token = f"[{value_type}_{counters[value_type]}]"
+            tokens[value_norm] = token
+            new_entries.append(
                 TokenEntry(
                     session_id=session_id,
                     value_norm=value_norm,
                     token=token,
-                    original=str(original_value),
+                    original=original_value,
                     value_type=value_type,
                 )
             )
+
+        if not new_entries:
+            return tokens
+
+        try:
+            db.add_all(new_entries)
             db.commit()
-            return token
         except IntegrityError:
-            # Handles concurrent requests trying to mint the same value.
+            # A concurrent request may have minted one of these values first.
+            # Roll back, fetch the now-authoritative mapping, and only retry
+            # values that are genuinely still absent.
             db.rollback()
-            existing = db.scalar(
-                select(TokenEntry.token).where(
-                    TokenEntry.session_id == session_id,
-                    TokenEntry.value_norm == value_norm,
-                )
+            tokens.update(_get_existing_tokens(db, session_id, requested))
+            unresolved = [entry for entry in new_entries if entry.value_norm not in tokens]
+            if unresolved:
+                db.add_all(unresolved)
+                db.commit()
+                tokens.update({entry.value_norm: entry.token for entry in unresolved})
+
+        return tokens
+
+
+def _get_existing_tokens(db, session_id: str, value_norms) -> dict[str, str]:
+    """Fetch existing mappings in bounded query batches."""
+    value_norms = list(value_norms)
+    tokens: dict[str, str] = {}
+    for start in range(0, len(value_norms), TOKEN_QUERY_CHUNK_SIZE):
+        chunk = value_norms[start:start + TOKEN_QUERY_CHUNK_SIZE]
+        rows = db.execute(
+            select(TokenEntry.value_norm, TokenEntry.token).where(
+                TokenEntry.session_id == session_id,
+                TokenEntry.value_norm.in_(chunk),
             )
-            if existing:
-                return existing
-            raise
+        ).all()
+        tokens.update({value_norm: token for value_norm, token in rows})
+    return tokens
+
+
+def get_or_create_token(session_id: str, value_type: str, original_value: str, counters: dict) -> str:
+    """Single-value compatibility wrapper for chat masking call sites."""
+    value_norm = str(original_value).strip().lower()
+    return get_or_create_tokens(
+        session_id,
+        [(value_type, str(original_value))],
+        counters,
+    )[value_norm]
 
 
 def load_counters(session_id: str) -> dict:

@@ -15,10 +15,10 @@ MAX_ROWS_PER_FILE = int(os.getenv("PRIVY_MAX_ROWS_PER_FILE", "100000"))
 # Estimation uses ~4 UTF-8 characters per token as a conservative application
 # heuristic. The model provider may tokenize differently.
 MAX_CONTEXT_TOKENS_PER_FILE = int(
-    os.getenv("PRIVY_MAX_CONTEXT_TOKENS_PER_FILE", "12000")
+    os.getenv("PRIVY_MAX_CONTEXT_TOKENS_PER_FILE", "90000")
 )
 MAX_TOTAL_FILE_CONTEXT_TOKENS = int(
-    os.getenv("PRIVY_MAX_TOTAL_FILE_CONTEXT_TOKENS", "30000")
+    os.getenv("PRIVY_MAX_TOTAL_FILE_CONTEXT_TOKENS", "110000")
 )
 
 

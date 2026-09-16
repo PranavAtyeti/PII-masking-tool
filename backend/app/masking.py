@@ -70,17 +70,49 @@ def mask_free_text_cell(text: str, session_id: str, counters: dict,
                          min_confidence: float, use_ner: bool = True) -> str:
     """Masks PII spans found inside free text, leaving the rest intact. Used
     both for free-text spreadsheet cells and for a chat question's raw text."""
-    findings = scan_free_text_structured(text)
+    return _mask_free_texts(
+        [str(text)], session_id, counters, min_confidence, use_ner
+    ).get(str(text), str(text))
+
+
+def _mask_free_texts(
+    texts: list[str],
+    session_id: str,
+    counters: dict,
+    min_confidence: float,
+    use_ner: bool,
+) -> dict[str, str]:
+    """Mask unique free-text values with one bulk token-store operation."""
+    unique_texts = list(dict.fromkeys(texts))
+    findings_by_text = {
+        text: scan_free_text_structured(text)
+        for text in unique_texts
+    }
     if use_ner:
-        findings = findings + ner_detection.analyze_text(text, min_confidence)
-    if not findings:
-        return text
-    out = text
-    seen = sorted({(f[0], f[1]) for f in findings}, key=lambda x: -len(x[0]))
-    for entity_text, internal_type in seen:
-        token = store.get_or_create_token(session_id, internal_type, entity_text, counters)
-        out = out.replace(entity_text, token)
-    return out
+        ner_findings = ner_detection.analyze_texts(unique_texts, min_confidence)
+        for text, findings in ner_findings.items():
+            findings_by_text[text] = findings_by_text[text] + findings
+
+    values = [
+        (internal_type, entity_text)
+        for findings in findings_by_text.values()
+        for entity_text, internal_type, *_ in findings
+    ]
+    tokens = store.get_or_create_tokens(session_id, values, counters)
+
+    masked_texts: dict[str, str] = {}
+    for text, findings in findings_by_text.items():
+        out = text
+        # Longer spans must be replaced first so overlapping recognizers do
+        # not leave partial raw values behind.
+        seen = sorted(
+            {(f[0], f[1]) for f in findings}, key=lambda item: -len(item[0])
+        )
+        for entity_text, _internal_type in seen:
+            token = tokens[str(entity_text).strip().lower()]
+            out = out.replace(entity_text, token)
+        masked_texts[text] = out
+    return masked_texts
 
 
 def _replace_known_values(text: str, known_values: dict) -> str:
@@ -110,7 +142,10 @@ def mask_dataframe(df: pd.DataFrame, col_types: dict, session_id: str, counters:
     # that entirely; to_csv() output is unaffected for ordinary values.
     masked = df.astype(object)
     known_values = {}
+    classified_cells: dict[tuple[object, object], str | None] = {}
+    structured_values: list[tuple[str, str]] = []
 
+    # Classify once, then tokenize the unique structured values in bulk.
     for col in df.columns:
         if col in disabled_columns:
             continue
@@ -119,26 +154,51 @@ def mask_dataframe(df: pd.DataFrame, col_types: dict, session_id: str, counters:
             if pd.isna(val) or str(val).strip() == "":
                 continue
             cell_type = col_type or classify_cell(val)
+            classified_cells[(col, i)] = cell_type
             if cell_type:
                 token_key = f"{cell_type}_{_col_tag(col)}"
-                token = store.get_or_create_token(session_id, token_key, val, counters)
-                masked.at[i, col] = token
-                known_values[str(val).strip().lower()] = token
+                structured_values.append((token_key, str(val)))
+
+    structured_tokens = store.get_or_create_tokens(
+        session_id, structured_values, counters
+    )
 
     for col in df.columns:
         if col in disabled_columns:
             continue
-        col_type = col_types.get(col)
+        for i, val in df[col].items():
+            cell_type = classified_cells.get((col, i))
+            if not cell_type:
+                continue
+            value_norm = str(val).strip().lower()
+            token = structured_tokens[value_norm]
+            masked.at[i, col] = token
+            known_values[value_norm] = token
+
+    free_text_cells: list[tuple[object, object, str]] = []
+    for col in df.columns:
+        if col in disabled_columns:
+            continue
         for i, val in df[col].items():
             if pd.isna(val) or str(val).strip() == "":
                 continue
-            cell_type = col_type or classify_cell(val)
+            cell_type = classified_cells.get((col, i))
             if cell_type:
                 continue
             if _looks_like_free_text(val):
                 text = _replace_known_values(str(val), known_values)
-                text = mask_free_text_cell(text, session_id, counters, ner_confidence, use_ner)
-                masked.at[i, col] = text
+                free_text_cells.append((col, i, text))
+
+    if free_text_cells:
+        masked_texts = _mask_free_texts(
+            [text for _col, _index, text in free_text_cells],
+            session_id,
+            counters,
+            ner_confidence,
+            use_ner,
+        )
+        for col, i, text in free_text_cells:
+            masked.at[i, col] = masked_texts[text]
 
     return masked, known_values
 
@@ -207,11 +267,14 @@ def stream_unmask(chunks, session_id: str):
         yield _unmask(buffer)
 
 
-def build_masked_context(masked_df: pd.DataFrame, max_rows: int = 200) -> tuple[str, bool]:
-    """Returns (csv_text, was_truncated)."""
-    truncated = len(masked_df) > max_rows
-    limited = masked_df.head(max_rows)
-    return limited.to_csv(index=False), truncated
+def build_masked_context(masked_df: pd.DataFrame) -> tuple[str, bool]:
+    """Serialize the complete masked dataframe for model context/storage."""
+    return masked_df.to_csv(index=False), False
+
+
+def build_masked_preview(masked_df: pd.DataFrame, max_rows: int = 200) -> str:
+    """Serialize only the UI preview; never use this for model context/storage."""
+    return masked_df.head(max_rows).to_csv(index=False)
 
 
 def count_masked_tokens(payload: str) -> int:

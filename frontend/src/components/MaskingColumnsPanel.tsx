@@ -5,9 +5,11 @@ interface MaskingColumnsPanelProps {
   rowCount: number;
   columns: ColumnInfo[];
   selectedColumns: string[];
+  useNer: boolean;
   isApplying: boolean;
   mode?: "new" | "edit";
   onChange: (columns: string[]) => void;
+  onUseNerChange: (enabled: boolean) => void;
   onCancel: () => void;
   onApply: () => void;
 }
@@ -28,14 +30,19 @@ export function MaskingColumnsPanel({
   rowCount,
   columns,
   selectedColumns,
+  useNer,
   isApplying,
   mode = "new",
   onChange,
+  onUseNerChange,
   onCancel,
   onApply,
 }: MaskingColumnsPanelProps) {
   const selected = new Set(selectedColumns);
   const detectedColumns = columns.filter((c) => c.type);
+  const selectedFreeTextColumns = columns.filter(
+    (column) => !column.type && selected.has(column.name)
+  );
   const unmaskedDetectedCount = detectedColumns.filter((c) => !selected.has(c.name)).length;
   const canApply = selectedColumns.length > 0 && !isApplying;
 
@@ -98,6 +105,21 @@ export function MaskingColumnsPanel({
           )}
           {selectedColumns.length === 0 && (
             <p className="text-xs text-red-600">Select at least one column before attaching this file.</p>
+          )}
+          {selectedFreeTextColumns.length > 0 && (
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-border bg-bg/50 px-3 py-3 text-xs leading-5 text-ink/70">
+              <input
+                type="checkbox"
+                checked={useNer}
+                onChange={(event) => onUseNerChange(event.target.checked)}
+                disabled={isApplying}
+                className="mt-0.5 h-4 w-4 accent-current"
+              />
+              <span>
+                <span className="block font-medium text-ink">Enhanced free-text PII scan (NER)</span>
+                Scans the {selectedFreeTextColumns.length} selected non-structured {selectedFreeTextColumns.length === 1 ? "column" : "columns"} for names and locations in prose. This adds processing time; email, phone, ID, and card-pattern masking remains enabled either way.
+              </span>
+            </label>
           )}
         </div>
 

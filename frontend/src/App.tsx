@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { useAuth0 } from "@auth0/auth0-react";
-import { setAccessTokenGetter, setGuestSessionGetter } from "./auth";
+import {
+  clearAccessToken,
+  getAccessToken,
+  setAccessToken,
+  setAccessTokenGetter,
+  setGuestSessionGetter,
+  restoreSession,
+} from "./auth";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPane } from "./components/ChatPane";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -13,6 +19,7 @@ import type {
   ModelOption,
 } from "./types";
 import { api } from "./api";
+import { AuthPanel } from "./components/AuthPanel";
 import { SUGGESTION_CHIPS } from "./constants";
 import type { ChatAttachment } from "./components/ChatInput";
 import {
@@ -28,20 +35,15 @@ interface LocalAttachment extends ChatAttachment {
 }
 
 export default function App() {
-  const {
-    isLoading: authLoading,
-    isAuthenticated,
-    loginWithRedirect,
-    logout,
-    getAccessTokenSilently,
-    user: auth0User,
-  } = useAuth0();
+  const [authLoading, setAuthLoading] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
 
   const [backendAuthReady, setBackendAuthReady] = useState(false);
   const [guestSessionId, setGuestSessionId] = useState<string | null>(
     () => sessionStorage.getItem("privy-guest-session")
   );
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [authPanelOpen, setAuthPanelOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [chats, setChats] = useState<Chat[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
@@ -54,6 +56,7 @@ export default function App() {
   const [pendingColumns, setPendingColumns] = useState<ColumnInfo[]>([]);
   const [pendingRowCount, setPendingRowCount] = useState(0);
   const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [useNerForFile, setUseNerForFile] = useState(false);
   const [pendingFileId, setPendingFileId] = useState<string | null>(null);
   const [pendingFileQueue, setPendingFileQueue] = useState<File[]>([]);
   const [isEditingFile, setIsEditingFile] = useState(false);
@@ -65,37 +68,51 @@ export default function App() {
 
   const streamControllerRef = useRef<AbortController | null>(null);
 
-  // Wire authenticated and guest request credentials into the API layer.
+  // Wire local JWT and guest-session credentials into the API layer.
   useEffect(() => {
-    if (!isAuthenticated) {
-      setAccessTokenGetter(null);
-      setGuestSessionGetter(() => guestSessionId);
-
-      return () => {
-        setGuestSessionGetter(null);
-        setAccessTokenGetter(null);
-      };
-    }
-
-    setGuestSessionGetter(null);
-
-    setAccessTokenGetter(async () => {
-      return getAccessTokenSilently({
-        authorizationParams: {
-          audience: import.meta.env.VITE_AUTH0_AUDIENCE,
-          scope: "openid profile email",
-        },
-      });
-    });
+    setAccessTokenGetter(() => getAccessToken() ?? "");
+    setGuestSessionGetter(() => guestSessionId);
 
     return () => {
       setAccessTokenGetter(null);
       setGuestSessionGetter(null);
     };
-  }, [isAuthenticated, getAccessTokenSilently, guestSessionId]);
+  }, [guestSessionId]);
+
+  // Restore a local login after a page refresh using the HttpOnly refresh cookie.
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const session = await restoreSession();
+        if (cancelled) return;
+
+        if (session) {
+          setAccessToken(session.access_token);
+          setCurrentUser(session.user as CurrentUser);
+          setIsAuthenticated(true);
+          setLoadError(null);
+        }
+      } catch {
+        if (!cancelled) {
+          clearAccessToken();
+          setIsAuthenticated(false);
+        }
+      } finally {
+        if (!cancelled) setAuthLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Resolve the backend-side user/session before loading chats.
   useEffect(() => {
+    if (authLoading) return;
+
     if (!isAuthenticated && !guestSessionId) {
       setBackendAuthReady(false);
       setCurrentUser(null);
@@ -110,19 +127,7 @@ export default function App() {
         const backendUser = await api.getCurrentUser();
 
         if (!cancelled) {
-          setCurrentUser({
-            ...backendUser,
-            email: backendUser.email || auth0User?.email || null,
-            display_name:
-              backendUser.display_name &&
-              !backendUser.display_name.startsWith("google-oauth2|")
-                ? backendUser.display_name
-                : auth0User?.name ||
-                  auth0User?.nickname ||
-                  auth0User?.email ||
-                  backendUser.display_name,
-          });
-
+          setCurrentUser(backendUser);
           setBackendAuthReady(true);
           setLoadError(null);
         }
@@ -141,7 +146,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, auth0User, guestSessionId]);
+  }, [authLoading, isAuthenticated, guestSessionId]);
 
   // Discover models only after authentication/guest session is ready.
   useEffect(() => {
@@ -205,6 +210,7 @@ export default function App() {
     setPendingColumns([]);
     setPendingRowCount(0);
     setSelectedColumns([]);
+    setUseNerForFile(false);
     setPendingFileId(null);
     setPendingFileQueue([]);
     setIsEditingFile(false);
@@ -257,40 +263,50 @@ export default function App() {
   }
 
   async function handleSignIn() {
-    try {
-      await loginWithRedirect();
-    } catch (e) {
-      setLoadError(
-        e instanceof Error
-          ? e.message
-          : "Unable to start the Auth0 sign-in."
-      );
-    }
+    setLoadError(null);
+    setAuthPanelOpen(true);
+  }
+
+  async function handleAuthSuccess(accessToken: string, user: CurrentUser) {
+    setAccessToken(accessToken);
+    setCurrentUser(user);
+    setIsAuthenticated(true);
+    setAuthPanelOpen(false);
+    setLoadError(null);
   }
 
   async function handleLogout() {
     streamControllerRef.current?.abort();
     setIsStreaming(false);
     setSettingsOpen(false);
-    setCurrentUser(null);
     setLoadError(null);
 
     if (!isAuthenticated && guestSessionId) {
       sessionStorage.removeItem("privy-guest-session");
       setGuestSessionId(null);
+      setCurrentUser(null);
       setChats([]);
       setActiveChatId(null);
       setMessages([]);
       setAttachments([]);
+      setBackendAuthReady(false);
       clearPendingFileState();
       return;
     }
 
-    await logout({
-      logoutParams: {
-        returnTo: window.location.origin,
-      },
-    });
+    try {
+      await api.logout();
+    } finally {
+      clearAccessToken();
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+      setChats([]);
+      setActiveChatId(null);
+      setMessages([]);
+      setAttachments([]);
+      setBackendAuthReady(false);
+      clearPendingFileState();
+    }
   }
 
   async function handleNewChat() {
@@ -339,6 +355,7 @@ export default function App() {
 
     setIsUploading(true);
     setIsEditingFile(false);
+    setUseNerForFile(false);
 
     try {
       const preview = await api.previewFile(activeChatId, file);
@@ -350,6 +367,7 @@ export default function App() {
       setSelectedColumns(
         preview.columns.filter((c) => c.type).map((c) => c.name)
       );
+      setUseNerForFile(false);
     } catch (e) {
       window.alert(
         e instanceof Error ? e.message : "Couldn't inspect that file."
@@ -415,6 +433,9 @@ export default function App() {
 
     setIsUploading(true);
     setIsEditingFile(true);
+    // File metadata does not retain the previous NER preference. Require an
+    // explicit opt-in whenever the source file is reattached for editing.
+    setUseNerForFile(false);
 
     try {
       const preview = await api.previewFile(activeChatId, attachment.file);
@@ -496,7 +517,7 @@ export default function App() {
         .filter((name) => !selected.has(name));
 
       const result = await api.uploadFile(activeChatId, pendingFile, {
-        useNer: true,
+        useNer: useNerForFile,
         nerConfidence: 0.6,
         disabledColumns,
         fileId: pendingFileId ?? undefined,
@@ -696,56 +717,11 @@ export default function App() {
 
   if (!isAuthenticated && !guestSessionId) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-bg px-6">
-        <div className="w-full max-w-md rounded-2xl border border-border bg-surface p-8 text-center shadow-sm">
-          <div
-            className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-bg text-2xl"
-            aria-hidden
-          >
-            🔒
-          </div>
-
-          <h1 className="font-display text-2xl font-semibold">
-            Welcome to Privy
-          </h1>
-
-          <p className="mt-2 text-sm leading-6 text-ink/60">
-            Protect sensitive data before it reaches the AI.
-          </p>
-
-          <button
-            type="button"
-            onClick={handleSignIn}
-            className="mt-6 w-full rounded-xl bg-ink px-4 py-3 text-sm font-medium text-white hover:opacity-90"
-          >
-            Sign in
-          </button>
-
-          <div className="my-4 flex items-center gap-3 text-xs text-ink/35">
-            <span className="h-px flex-1 bg-border" />
-            or
-            <span className="h-px flex-1 bg-border" />
-          </div>
-
-          <button
-            type="button"
-            onClick={handleStartGuest}
-            className="w-full rounded-xl border border-border px-4 py-3 text-sm font-medium text-ink hover:bg-bg"
-          >
-            Try Privy as Guest
-          </button>
-
-          <p className="mt-3 text-xs text-ink/40">
-            Guest sessions are temporary and limited. Sign in to save chats.
-          </p>
-
-          {loadError && (
-            <p className="mt-4 text-sm text-red-600">
-              {loadError}
-            </p>
-          )}
-        </div>
-      </div>
+      <AuthPanel
+        onAuthenticated={handleAuthSuccess}
+        onGuest={handleStartGuest}
+        error={loadError}
+      />
     );
   }
 
@@ -816,8 +792,10 @@ export default function App() {
         pendingColumns={pendingColumns}
         pendingRowCount={pendingRowCount}
         selectedColumns={selectedColumns}
+        useNerForFile={useNerForFile}
         isEditingFile={isEditingFile}
         onSelectedColumnsChange={setSelectedColumns}
+        onUseNerForFileChange={setUseNerForFile}
         onCancelFile={clearPendingFileState}
         onApplyFile={handleApplyFile}
         onEditFile={handleEditFile}
@@ -836,6 +814,23 @@ export default function App() {
           open={settingsOpen}
           onClose={() => setSettingsOpen(false)}
         />
+      )}
+
+      {authPanelOpen && !isAuthenticated && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-6 backdrop-blur-sm">
+          <div className="w-full max-w-md">
+            <AuthPanel
+              compact
+              onAuthenticated={handleAuthSuccess}
+              onGuest={async () => {
+                setAuthPanelOpen(false);
+                await handleStartGuest();
+              }}
+              onClose={() => setAuthPanelOpen(false)}
+              error={loadError}
+            />
+          </div>
+        </div>
       )}
     </div>
   );

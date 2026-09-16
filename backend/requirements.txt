@@ -7,3 +7,17 @@ presidio-analyzer>=2.2
 spacy>=3.7
 requests>=2.32
 python-dotenv>=1.0
+
+# Auth0
+PyJWT[crypto]>=2.8,<3
+
+# PostgreSQL
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+alembic>=1.16,<2
+
+# GCP (object storage / encryption — currently on hold per project status)
+google-cloud-storage>=2.18,<4
+cryptography>=43,<47
+
+argon2-cffi>=25.1.0

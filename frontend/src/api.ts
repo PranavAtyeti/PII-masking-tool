@@ -2,43 +2,77 @@ import type {
   AdminConfig,
   Chat,
   ChatFileInfo,
-  ColumnInfo,
   CurrentUser,
   Message,
+  ModelOption,
+  UploadPreviewResult,
   UploadResult,
-  ModelCatalogResponse,
 } from "./types";
-import { authHeaders } from "./auth";
+import type { AuthResponse } from "./auth";
+import {
+  authHeaders,
+  clearAccessToken,
+  getAccessToken,
+  refreshAccessToken,
+} from "./auth";
 
 const BASE = "/api";
 
-async function authedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+async function authedFetch(
+  input: RequestInfo | URL,
+  init: RequestInit = {}
+): Promise<Response> {
   const auth = await authHeaders();
-  const headers = new Headers(init.headers);
 
-  for (const [key, value] of Object.entries(auth)) {
-    if (value !== undefined && value !== null && value !== "") {
-      headers.set(key, String(value));
+  const request = () =>
+    fetch(input, {
+      ...init,
+      credentials: "include",
+      headers: {
+        ...auth,
+        ...(init.headers ?? {}),
+      },
+    });
+
+  let response = await request();
+
+  // Local JWT access tokens are short-lived. Refresh once after a rejected
+  // authenticated request, then retry the exact same request.
+  if (response.status === 401 && getAccessToken()) {
+    const refreshed = await refreshAccessToken();
+
+    if (refreshed) {
+      const refreshedHeaders = await authHeaders();
+      response = await fetch(input, {
+        ...init,
+        credentials: "include",
+        headers: {
+          ...refreshedHeaders,
+          ...(init.headers ?? {}),
+        },
+      });
+    } else {
+      clearAccessToken();
     }
   }
 
-  return fetch(input, {
-    ...init,
-    headers,
-  });
+  return response;
 }
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
+
     try {
       const body = await res.json();
       detail = body.detail ?? detail;
     } catch {
       // Non-JSON response.
     }
+
     throw new ApiError(res.status, detail);
   }
+
   return res.json();
 }
 
@@ -52,21 +86,90 @@ export class ApiError extends Error {
 }
 
 export const api = {
-  async createGuestSession(): Promise<{ session_id: string; expires_at: number; user: CurrentUser }> {
-    const res = await authedFetch(`${BASE}/auth/guest`, { method: "POST" });
-    return jsonOrThrow<{ session_id: string; expires_at: number; user: CurrentUser }>(res);
+  async login(email: string, password: string): Promise<AuthResponse> {
+    const res = await fetch(`${BASE}/auth/login`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+
+    return jsonOrThrow<AuthResponse>(res);
+  },
+
+  async register(
+    email: string,
+    password: string,
+    display_name?: string
+  ): Promise<AuthResponse> {
+    const res = await fetch(`${BASE}/auth/register`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email,
+        password,
+        display_name: display_name || null,
+      }),
+    });
+
+    return jsonOrThrow<AuthResponse>(res);
+  },
+
+  async createGuestSession(): Promise<{
+    session_id: string;
+    expires_at: string;
+    user: CurrentUser;
+  }> {
+    const res = await fetch(`${BASE}/auth/guest`, {
+      method: "POST",
+      credentials: "include",
+    });
+
+    return jsonOrThrow<{
+      session_id: string;
+      expires_at: string;
+      user: CurrentUser;
+    }>(res);
+  },
+
+
+  async logout(): Promise<void> {
+    const res = await fetch(`${BASE}/auth/logout`, {
+      method: "POST",
+      credentials: "include",
+    });
+
+    if (!res.ok) {
+      throw new ApiError(res.status, res.statusText);
+    }
   },
 
   getCurrentUser(): Promise<CurrentUser> {
-    return authedFetch(`${BASE}/auth/me`).then((r) => jsonOrThrow<CurrentUser>(r));
+    return authedFetch(`${BASE}/auth/me`).then((r) =>
+      jsonOrThrow<CurrentUser>(r)
+    );
   },
 
-  getModels(): Promise<ModelCatalogResponse> {
-    return authedFetch(`${BASE}/auth/models`).then((r) => jsonOrThrow<ModelCatalogResponse>(r));
+  // Required by App.tsx after local authentication succeeds. Omitting this
+  // method causes a runtime TypeError and a white screen immediately after
+  // login when the model-discovery effect runs.
+  getModels(): Promise<{
+    models: ModelOption[];
+    default_model_id: string | null;
+  }> {
+    return authedFetch(`${BASE}/auth/models`).then((r) =>
+      jsonOrThrow<{
+        models: ModelOption[];
+        default_model_id: string | null;
+      }>(r)
+    );
   },
 
   getAdminConfig(): Promise<AdminConfig> {
-    return authedFetch(`${BASE}/admin/config`).then((r) => jsonOrThrow<AdminConfig>(r));
+    return authedFetch(`${BASE}/admin/config`).then((r) =>
+      jsonOrThrow<AdminConfig>(r)
+    );
   },
 
   updateAdminConfig(body: { api_key?: string; model?: string }): Promise<AdminConfig> {
@@ -90,7 +193,9 @@ export const api = {
   },
 
   getMessages(chatId: string): Promise<Message[]> {
-    return authedFetch(`${BASE}/chats/${chatId}/messages`).then((r) => jsonOrThrow<Message[]>(r));
+    return authedFetch(`${BASE}/chats/${chatId}/messages`).then((r) =>
+      jsonOrThrow<Message[]>(r)
+    );
   },
 
   renameChat(chatId: string, title: string): Promise<Chat> {
@@ -102,7 +207,10 @@ export const api = {
   },
 
   async deleteChat(chatId: string): Promise<void> {
-    const res = await authedFetch(`${BASE}/chats/${chatId}`, { method: "DELETE" });
+    const res = await authedFetch(`${BASE}/chats/${chatId}`, {
+      method: "DELETE",
+    });
+
     if (!res.ok && res.status !== 204) {
       throw new ApiError(res.status, res.statusText);
     }
@@ -111,6 +219,7 @@ export const api = {
   async exportChat(chatId: string): Promise<void> {
     const res = await authedFetch(`${BASE}/chats/${chatId}/export`);
     if (!res.ok) throw new ApiError(res.status, res.statusText);
+
     const blob = await res.blob();
     const disposition = res.headers.get("Content-Disposition") ?? "";
     const match = disposition.match(/filename="([^"]+)"/);
@@ -131,10 +240,12 @@ export const api = {
   async previewFile(chatId: string, file: File): Promise<UploadPreviewResult> {
     const form = new FormData();
     form.append("file", file);
+
     const res = await authedFetch(`${BASE}/upload/${chatId}/preview`, {
       method: "POST",
       body: form,
     });
+
     return jsonOrThrow<UploadPreviewResult>(res);
   },
 
@@ -153,7 +264,10 @@ export const api = {
     form.append("use_ner", String(opts.useNer));
     form.append("ner_confidence", String(opts.nerConfidence));
     form.append("disabled_columns", (opts.disabledColumns ?? []).join(","));
-    if (opts.fileId) form.append("file_id", opts.fileId);
+
+    if (opts.fileId) {
+      form.append("file_id", opts.fileId);
+    }
 
     return authedFetch(`${BASE}/upload/${chatId}`, {
       method: "POST",
@@ -162,7 +276,10 @@ export const api = {
   },
 
   async removeFile(chatId: string, fileId: string): Promise<void> {
-    const res = await authedFetch(`${BASE}/upload/${chatId}/${fileId}`, { method: "DELETE" });
+    const res = await authedFetch(`${BASE}/upload/${chatId}/${fileId}`, {
+      method: "DELETE",
+    });
+
     if (!res.ok && res.status !== 204) {
       throw new ApiError(res.status, res.statusText);
     }
@@ -170,12 +287,18 @@ export const api = {
 
   async streamMessage(
     chatId: string,
-    body: { question: string; use_ner: boolean; ner_confidence: number; concise: boolean; model_id?: string; allow_unmasked_risk?: boolean },
+    body: {
+      question: string;
+      use_ner: boolean;
+      ner_confidence: number;
+      concise: boolean;
+      model_id?: string;
+      allow_unmasked_risk?: boolean;
+    },
     handlers: {
       onDelta: (text: string) => void;
       onDone: (maskedCount: number) => void;
       onError: (message: string) => void;
-      onSecurityWarning?: (warning: { message: string; findings: Array<{ type: string; count: number }> }) => void;
       onAbort?: () => void;
     },
     signal?: AbortSignal
@@ -194,26 +317,23 @@ export const api = {
         handlers.onAbort?.();
         return;
       }
-      handlers.onError(error instanceof Error ? error.message : "Couldn't start the response stream.");
+
+      handlers.onError(
+        error instanceof Error
+          ? error.message
+          : "Couldn't start the response stream."
+      );
       return;
     }
 
     if (!res.ok || !res.body) {
       let detail = res.statusText;
-      let errBody: any = null;
+
       try {
-        errBody = await res.json();
-        detail = typeof errBody.detail === "string" ? errBody.detail : (errBody.detail?.message ?? detail);
+        const errBody = await res.json();
+        detail = errBody.detail ?? detail;
       } catch {
         // Non-JSON response.
-      }
-
-      if (res.status === 409 && errBody?.detail?.code === "UNMASKED_PII") {
-        handlers.onSecurityWarning?.({
-          message: errBody.detail.message ?? "Potentially unmasked sensitive data was detected.",
-          findings: Array.isArray(errBody.detail.findings) ? errBody.detail.findings : [],
-        });
-        return;
       }
 
       handlers.onError(detail);
@@ -247,8 +367,11 @@ export const api = {
         handlers.onAbort?.();
         return;
       }
+
       handlers.onError(
-        error instanceof Error ? error.message : "The response stream ended unexpectedly."
+        error instanceof Error
+          ? error.message
+          : "The response stream ended unexpectedly."
       );
     } finally {
       reader.releaseLock();
@@ -265,13 +388,22 @@ function handleEvent(
     onAbort?: () => void;
   }
 ) {
-  const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
+  const dataLine = rawEvent
+    .split("\n")
+    .find((line) => line.startsWith("data:"));
+
   if (!dataLine) return;
 
   const payload = dataLine.slice("data:".length).trim();
   if (!payload) return;
 
-  let obj: { delta?: string; done?: boolean; masked_count?: number; error?: string };
+  let obj: {
+    delta?: string;
+    done?: boolean;
+    masked_count?: number;
+    error?: string;
+  };
+
   try {
     obj = JSON.parse(payload);
   } catch {

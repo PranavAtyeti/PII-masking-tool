@@ -17,8 +17,10 @@ interface ChatPaneProps {
   pendingColumns?: ColumnInfo[];
   pendingRowCount?: number;
   selectedColumns?: string[];
+  useNerForFile?: boolean;
   isEditingFile?: boolean;
   onSelectedColumnsChange?: (columns: string[]) => void;
+  onUseNerForFileChange?: (enabled: boolean) => void;
   onCancelFile?: () => void;
   onApplyFile?: () => void;
   onEditFile?: (fileId: string) => void;
@@ -42,8 +44,10 @@ export function ChatPane({
   pendingColumns = [],
   pendingRowCount = 0,
   selectedColumns = [],
+  useNerForFile = false,
   isEditingFile = false,
   onSelectedColumnsChange,
+  onUseNerForFileChange,
   onCancelFile,
   onApplyFile,
   onEditFile,
@@ -128,15 +132,17 @@ export function ChatPane({
         </p>
       </div>
 
-      {pendingFile && onSelectedColumnsChange && onCancelFile && onApplyFile && (
+      {pendingFile && onSelectedColumnsChange && onUseNerForFileChange && onCancelFile && onApplyFile && (
         <MaskingColumnsPanel
           filename={pendingFile.name}
           rowCount={pendingRowCount}
           columns={pendingColumns}
           selectedColumns={selectedColumns}
+          useNer={useNerForFile}
           isApplying={isUploading}
           mode={isEditingFile ? "edit" : "new"}
           onChange={onSelectedColumnsChange}
+          onUseNerChange={onUseNerForFileChange}
           onCancel={onCancelFile}
           onApply={onApplyFile}
         />

@@ -2,6 +2,9 @@
 
 import io
 import json
+import logging
+import os
+import time
 
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -9,11 +12,20 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from .. import mapping_store as store
 from ..auth import get_current_app_user
 from ..detection import classify_dataframe_columns
-from ..masking import build_masked_context, count_masked_tokens, find_leaked_values, mask_dataframe
+from ..gemini_files import delete_gemini_file_cache
+from ..gemini_interactions import delete_interaction
+from ..masking import (
+    build_masked_context,
+    build_masked_preview,
+    count_masked_tokens,
+    find_leaked_values,
+    mask_dataframe,
+)
 from ..schemas import ChatFileInfo, ColumnInfo, UploadPreviewResult, UploadResult
 from ..security_scan import scan_for_unmasked_pii
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
+logger = logging.getLogger(__name__)
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 GUEST_MAX_FILES = int(__import__("os").getenv("PRIVY_GUEST_MAX_FILES", "3"))
 GUEST_MAX_FILE_SIZE_MB = int(__import__("os").getenv("PRIVY_GUEST_MAX_FILE_SIZE_MB", "10"))
@@ -82,6 +94,7 @@ async def upload_file(
     user: dict = Depends(get_current_app_user),
 ):
     """Mask one file and add/replace it as an attachment on the chat."""
+    started_at = time.perf_counter()
     _get_chat_or_404(chat_id, user["auth0_sub"])
 
     if file_id and not store.get_chat_file(chat_id, file_id):
@@ -97,6 +110,7 @@ async def upload_file(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}") from e
+    parsed_at = time.perf_counter()
 
     disabled = {c.strip() for c in disabled_columns.split(",") if c.strip()}
     col_types = classify_dataframe_columns(df)
@@ -111,6 +125,7 @@ async def upload_file(
         ner_confidence=ner_confidence,
         disabled_columns=disabled,
     )
+    masked_at = time.perf_counter()
 
     enabled_columns = set(df.columns) - disabled
     leaked = find_leaked_values(df, masked_df, col_types, enabled_columns)
@@ -134,7 +149,18 @@ async def upload_file(
             ),
         )
 
+    # Any upload/edit changes the attachment set or file content, so an older
+    # Gemini interaction chain can no longer be treated as authoritative.
+    # Clear it before saving the new attachment; this is harmless when no chain exists.
+    delete_interaction(
+        chat_id,
+        api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
+    )
+
+    # Store the complete masked dataset for LLM analysis. The UI preview is
+    # generated separately below so it never reduces the analysis dataset.
     masked_csv, truncated = build_masked_context(masked_df)
+    preview_csv = build_masked_preview(masked_df, max_rows=200)
 
     residual_pii = scan_for_unmasked_pii(masked_csv)
     if residual_pii:
@@ -146,6 +172,7 @@ async def upload_file(
                 f"({labels}). Nothing was saved."
             ),
         )
+    validated_at = time.perf_counter()
     columns = [
         ColumnInfo(name=str(col), type=col_types.get(col), enabled=col not in disabled)
         for col in df.columns
@@ -164,6 +191,20 @@ async def upload_file(
         masked_count=masked_count,
         file_id=file_id,
     )
+    persisted_at = time.perf_counter()
+
+    logger.info(
+        "upload_masking_timing chat_id=%s rows=%d columns=%d parse_ms=%.1f "
+        "mask_ms=%.1f validate_ms=%.1f persist_ms=%.1f total_ms=%.1f",
+        chat_id,
+        len(df),
+        len(df.columns),
+        (parsed_at - started_at) * 1000,
+        (masked_at - parsed_at) * 1000,
+        (validated_at - masked_at) * 1000,
+        (persisted_at - validated_at) * 1000,
+        (persisted_at - started_at) * 1000,
+    )
 
     return UploadResult(
         chat_id=chat_id,
@@ -173,7 +214,7 @@ async def upload_file(
         truncated=truncated,
         columns=columns,
         masked_count=masked_count,
-        preview_csv=masked_csv,
+        preview_csv=preview_csv,
     )
 
 
@@ -208,5 +249,20 @@ def delete_upload(
     user: dict = Depends(get_current_app_user),
 ):
     _get_chat_or_404(chat_id, user["auth0_sub"])
+    if not store.get_chat_file(chat_id, file_id):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Removing/changing attachments invalidates the server-side Gemini
+    # conversation chain because it may contain references to the old files.
+    # Delete the interaction record where possible, then remove the cached
+    # provider file reference.
+    delete_interaction(
+        chat_id,
+        api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
+    )
+    delete_gemini_file_cache(
+        file_id,
+        api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
+    )
     if not store.delete_chat_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="File not found")

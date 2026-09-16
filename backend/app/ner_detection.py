@@ -103,6 +103,25 @@ def analyze_text(text: str, min_confidence: float = CONFIDENCE_THRESHOLD):
     return findings
 
 
+def analyze_texts(texts, min_confidence: float = CONFIDENCE_THRESHOLD) -> dict[str, list]:
+    """Analyze each distinct non-empty text once and return findings by text.
+
+    Spreadsheet exports frequently repeat the same note, address, or comment.
+    Presidio's public analyzer API accepts one text at a time, so deduplicating
+    before calling it eliminates redundant spaCy work while preserving exactly
+    the same findings for every repeated cell.
+    """
+    unique_texts = dict.fromkeys(
+        str(text) for text in texts if text and str(text).strip()
+    )
+    if not unique_texts:
+        return {}
+    return {
+        text: analyze_text(text, min_confidence)
+        for text in unique_texts
+    }
+
+
 def classify_cell_with_ner(value, min_confidence: float = CONFIDENCE_THRESHOLD):
     """
     Whole-cell version: returns internal_type or None, used the same way
