@@ -1,10 +1,9 @@
 """Provider-aware LLM client for Privy.
 
 Groq continues to use the OpenAI-compatible chat-completions endpoint.
-Gemini uses that endpoint for ordinary text chats, but switches to Gemini's
-native GenerateContent streaming endpoint when reusable Files API references
-are supplied. That lets Privy upload a masked dataset once and send only a
-small file URI + conversation/question on subsequent requests.
+Gemini uses its native Interactions API. Masked datasets are indexed once in
+Gemini File Search stores, and subsequent turns send only the user question
+plus the persistent File Search store name and previous interaction id.
 """
 
 import json
@@ -235,18 +234,28 @@ def _gemini_interaction_payload(
     max_tokens: int,
     file_refs: list[dict],
     previous_interaction_id: str | None,
-    include_files: bool,
 ) -> dict:
     input_parts: list[dict] = [{"type": "text", "text": user_prompt}]
-    if include_files:
-        for file_ref in file_refs:
-            input_parts.append(
-                {
-                    "type": "document",
-                    "uri": file_ref["file_uri"],
-                    "mime_type": file_ref["mime_type"],
-                }
-            )
+
+    store_names = [
+        str(ref.get("file_search_store_name") or "")
+        for ref in file_refs
+        if ref.get("file_search_store_name")
+    ]
+
+    tools: list[dict] = []
+    if store_names:
+        tools.append(
+            {
+                "type": "file_search",
+                "file_search_store_names": store_names,
+            }
+        )
+
+    # Gemini manages code execution on Google's side. When combined with
+    # File Search, the Interactions API can circulate tool context between
+    # the built-in tools without Privy downloading or re-uploading the file.
+    tools.append({"type": "code_execution"})
 
     payload: dict = {
         "model": model,
@@ -254,7 +263,7 @@ def _gemini_interaction_payload(
         "system_instruction": system_prompt,
         "stream": True,
         "store": True,
-        "tools": [{"type": "code_execution"}],
+        "tools": tools,
         "generation_config": {
             "max_output_tokens": max_tokens,
             "thinking_level": os.environ.get(
@@ -266,7 +275,6 @@ def _gemini_interaction_payload(
     if previous_interaction_id:
         payload["previous_interaction_id"] = previous_interaction_id
     return payload
-
 
 def _format_gemini_api_error(status_code: int, body: str) -> GeminiInteractionError:
     message = body[:1000]
@@ -310,10 +318,12 @@ def _stream_gemini_interaction(
     previous_interaction_id: str | None,
     interaction_state: dict | None,
 ) -> Iterator[str]:
-    include_files = previous_interaction_id is None
-    logger.info(
-        "gemini_interaction_request include_files=%s has_previous_interaction=%s",
-        include_files,
+    store_count = sum(
+        1 for ref in file_refs if ref.get("file_search_store_name")
+    )
+    logger.warning(
+        "gemini_interaction_request file_search_stores=%s has_previous_interaction=%s",
+        store_count,
         bool(previous_interaction_id),
     )
     payload = _gemini_interaction_payload(
@@ -323,7 +333,6 @@ def _stream_gemini_interaction(
         max_tokens=max_tokens,
         file_refs=file_refs,
         previous_interaction_id=previous_interaction_id,
-        include_files=include_files,
     )
 
     response = requests.post(
@@ -361,17 +370,61 @@ def _stream_gemini_interaction(
 
         if event_type == "step.delta":
             delta = event.get("delta") or {}
-            if delta.get("type") == "text":
+            delta_type = delta.get("type")
+
+            if delta_type == "text":
                 text = delta.get("text")
                 if text:
                     yield text
+
+            elif delta_type == "code_execution_call":
+                arguments = delta.get("arguments") or {}
+                code = arguments.get("code") or ""
+                logger.info("gemini_code_execution_call code_chars=%s", len(code))
+
+            elif delta_type == "code_execution_result":
+                result = delta.get("result") or ""
+                logger.info(
+                    "gemini_code_execution_result is_error=%s result_chars=%s",
+                    delta.get("is_error"),
+                    len(str(result)),
+                )
+
             continue
 
         if event_type == "interaction.completed":
             interaction = event.get("interaction") or {}
-            completed_id = interaction.get("id") or (interaction_state or {}).get("latest_interaction_id")
+
+            completed_id = (
+                interaction.get("id")
+                or (interaction_state or {}).get("latest_interaction_id")
+            )
+
             if completed_id and interaction_state is not None:
                 interaction_state["latest_interaction_id"] = str(completed_id)
+
+            usage = interaction.get("usage") or {}
+
+            logger.warning(
+                "gemini_usage "
+                "interaction_id=%s "
+                "previous_interaction_id=%s "
+                "input_tokens=%s "
+                "cached_tokens=%s "
+                "output_tokens=%s "
+                "thought_tokens=%s "
+                "tool_use_tokens=%s "
+                "total_tokens=%s",
+                completed_id,
+                previous_interaction_id,
+                usage.get("total_input_tokens"),
+                usage.get("total_cached_tokens"),
+                usage.get("total_output_tokens"),
+                usage.get("total_thought_tokens"),
+                usage.get("total_tool_use_tokens"),
+                usage.get("total_tokens"),
+            )
+
             continue
 
         if event_type == "error":
@@ -404,8 +457,8 @@ def _stream_gemini_with_state(
         )
     except GeminiInteractionError as exc:
         if exc.status_code == 404 or exc.code in {"not_found", "NOT_FOUND"}:
-            # The free-tier interaction retention window is finite. Let the
-            # caller start a fresh chain on the same still-valid Gemini File.
+            # The interaction retention window is finite. Let the caller
+            # start a fresh chain while reusing the persistent File Search store.
             interaction_state["reset_required"] = True
         raise
 

@@ -1,8 +1,7 @@
 """Persistent local state for Gemini Interactions API conversations.
 
 Privy keeps only non-sensitive provider identifiers locally: chat id, model,
-file-content fingerprint, interaction id, and message count. The masked file
-itself remains in PostgreSQL and the original-to-token mapping remains in Privy.
+File Search store fingerprints, interaction id, and message count.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ _CACHE_PATH = Path(
         ),
     )
 )
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 _LOCK = threading.RLock()
 _DEFAULT_MAX_AGE_SECONDS = int(
     os.environ.get("PRIVY_GEMINI_INTERACTION_MAX_AGE_SECONDS", str(20 * 60 * 60))
@@ -65,16 +64,12 @@ def conversation_fingerprint(model: str, file_refs: list[dict]) -> str:
     parts = [model]
     for ref in sorted(
         file_refs,
-        key=lambda item: (
-            str(item.get("file_uri") or ""),
-            str(item.get("mime_type") or ""),
-        ),
+        key=lambda item: str(item.get("file_search_store_name") or ""),
     ):
         parts.append(
             "|".join(
                 [
-                    str(ref.get("file_uri") or ""),
-                    str(ref.get("mime_type") or ""),
+                    str(ref.get("file_search_store_name") or ""),
                     str(ref.get("content_sha256") or ""),
                 ]
             )
@@ -104,8 +99,6 @@ def get_interaction_id(
         except (TypeError, ValueError):
             return None
         if saved_message_count != message_count:
-            # Another model/provider may have added a turn since this Gemini
-            # interaction was saved. Starting a fresh Gemini chain is safer.
             return None
         if time.time() - saved_at >= _DEFAULT_MAX_AGE_SECONDS:
             return None
@@ -135,8 +128,6 @@ def save_interaction_id(
         try:
             _save(entries)
         except OSError:
-            # The conversation still works; only persistence across requests
-            # is lost and the next request will start a fresh chain.
             pass
 
 
@@ -173,9 +164,7 @@ def delete_interaction(
             f"{base_url}/interactions/{interaction_id}",
             headers={
                 "x-goog-api-key": api_key,
-                "Api-Revision": os.environ.get(
-                    "GEMINI_API_REVISION", "2026-05-20"
-                ),
+                "Api-Revision": os.environ.get("GEMINI_API_REVISION", "2026-05-20"),
             },
             timeout=(10, 30),
         )
