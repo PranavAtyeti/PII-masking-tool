@@ -5,6 +5,8 @@ values stored only as SHA-256 hashes in PostgreSQL and delivered through an
 HttpOnly cookie by the auth router.
 """
 
+from __future__ import annotations
+
 import os
 import time
 from typing import Any
@@ -15,17 +17,35 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import mapping_store as store
 
+
+RUNTIME_ENVIRONMENT = os.getenv("PRIVY_ENVIRONMENT", "development").strip().lower()
 JWT_SECRET = os.environ.get("PRIVY_JWT_SECRET", "").strip()
 JWT_ALGORITHM = os.environ.get("PRIVY_JWT_ALGORITHM", "HS256").strip() or "HS256"
-ACCESS_TOKEN_TTL_SECONDS = int(
-    os.getenv("PRIVY_ACCESS_TOKEN_TTL_SECONDS", "900")
-)
+ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("PRIVY_ACCESS_TOKEN_TTL_SECONDS", "900"))
+
+_ALLOWED_JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
 
 if not JWT_SECRET:
     raise RuntimeError(
         "Missing local authentication configuration. Set PRIVY_JWT_SECRET "
         "in backend/.env."
     )
+
+if JWT_ALGORITHM not in _ALLOWED_JWT_ALGORITHMS:
+    raise RuntimeError(
+        "Unsupported PRIVY_JWT_ALGORITHM. Use one of: "
+        + ", ".join(sorted(_ALLOWED_JWT_ALGORITHMS))
+    )
+
+# Production access tokens should not be protected by a short or empty-ish
+# development secret. A 256-bit-or-longer secret is recommended for HS256.
+if RUNTIME_ENVIRONMENT in {"production", "prod"} and len(JWT_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError(
+        "PRIVY_JWT_SECRET must be at least 32 bytes in production."
+    )
+
+if ACCESS_TOKEN_TTL_SECONDS < 60:
+    ACCESS_TOKEN_TTL_SECONDS = 60
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -65,6 +85,10 @@ def decode_access_token(token: str) -> dict[str, Any]:
 
     if claims.get("typ") != "access":
         raise _unauthorized("Invalid access token type")
+
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise _unauthorized("Invalid access token subject")
 
     return claims
 

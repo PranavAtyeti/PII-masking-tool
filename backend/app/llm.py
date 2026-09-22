@@ -1,18 +1,30 @@
 """Provider-aware LLM client for Privy.
 
 Groq continues to use the OpenAI-compatible chat-completions endpoint.
-Gemini uses its native Interactions API. Masked datasets are indexed once in
-Gemini File Search stores, and subsequent turns send only the user question
-plus the persistent File Search store name and previous interaction id.
+Gemini uses the native Interactions API.
+
+Gemini file handling is deliberately split by workload:
+
+* retrieval questions use a persistent File Search store only;
+* exact calculations/data analysis use Code Execution plus the already-uploaded
+  Gemini Files API URI for the masked CSV.
+
+The masked CSV bytes are uploaded once and reused. The raw Files API object is
+only recreated after its provider-side expiry or when the masked content changes.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
+import re
+import time
 from typing import Iterator
 
-
 import requests
+
+from .logging_utils import elapsed_ms, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +86,6 @@ MODEL_CATALOG = [
 
 COMMON_MODELS = [item["model"] for item in MODEL_CATALOG]
 
-# Backward-compatible defaults used by the existing admin settings route.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
 _default_provider = PROVIDERS.get(LLM_PROVIDER, PROVIDERS["groq"])
 LLM_API_KEY_ENV = _default_provider["api_key_env"]
@@ -97,8 +108,7 @@ def get_model_options() -> list[dict]:
     options: list[dict] = []
     for item in MODEL_CATALOG:
         provider = PROVIDERS[item["provider"]]
-        configured = bool(os.environ.get(provider["api_key_env"], "").strip())
-        if configured:
+        if os.environ.get(provider["api_key_env"], "").strip():
             options.append(item.copy())
     return options
 
@@ -138,7 +148,7 @@ def get_model_config(model_id: str | None = None) -> tuple[str, str, str, str]:
 
 def get_provider_config(api_key: str | None = None, model: str | None = None):
     """Backward-compatible config resolver for older callers."""
-    provider, base_url, resolved_key, resolved_model = get_model_config(None)
+    _provider, base_url, resolved_key, resolved_model = get_model_config(None)
     return base_url, api_key or resolved_key, model or resolved_model
 
 
@@ -163,7 +173,6 @@ def _post_payload(
         payload["temperature"] = temperature
     else:
         payload["max_tokens"] = max_tokens
-    if provider == "gemini":
         payload["reasoning_effort"] = os.environ.get("GEMINI_REASONING_EFFORT", "low")
     if stream:
         payload["stream"] = True
@@ -182,6 +191,8 @@ def call_llm(
     if api_key:
         resolved_key = api_key
 
+    request_started = time.perf_counter()
+    log_event(logger, "llm_request_start", provider=provider, model=resolved_model)
     response = requests.post(
         base_url,
         headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
@@ -196,6 +207,7 @@ def call_llm(
         ),
         timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT),
     )
+    log_event(logger, "llm_request_complete", provider=provider, model=resolved_model, duration_ms=elapsed_ms(request_started), status_code=response.status_code)
     response.raise_for_status()
     data = response.json()
     try:
@@ -212,11 +224,57 @@ def _gemini_native_headers(api_key: str) -> dict[str, str]:
     }
 
 
-class GeminiInteractionError(RuntimeError):
-    def __init__(self, message: str, code: str | None = None, status_code: int | None = None):
+class LLMServiceError(RuntimeError):
+    """Provider failure with a safe message intended for the UI."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        user_message: str,
+        code: str | None = None,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ):
         super().__init__(message)
+        self.category = category
+        self.user_message = user_message
         self.code = code
         self.status_code = status_code
+        self.retryable = retryable
+
+
+class GeminiInteractionError(LLMServiceError):
+    pass
+
+
+def _safe_provider_user_message(provider: str, status_code: int | None) -> tuple[str, bool]:
+    """Return (user-facing message, retryable) without exposing provider internals."""
+    if status_code == 401 or status_code == 403:
+        return (
+            f"{provider.title()} is not authorized for this request. Please check the server configuration.",
+            False,
+        )
+    if status_code == 408:
+        return (
+            f"{provider.title()} took too long to start the request. Please try again.",
+            True,
+        )
+    if status_code == 429:
+        return (
+            f"{provider.title()} rate limit or quota was reached. Please wait and try again.",
+            True,
+        )
+    if status_code is not None and status_code >= 500:
+        return (
+            f"{provider.title()} is temporarily unavailable. Please try again.",
+            True,
+        )
+    return (
+        f"{provider.title()} could not complete the request. Please try again.",
+        True,
+    )
 
 
 def _gemini_interactions_url() -> str:
@@ -228,34 +286,53 @@ def _gemini_interactions_url() -> str:
 
 
 def _gemini_interaction_payload(
+    *,
     system_prompt: str,
     user_prompt: str,
     model: str,
     max_tokens: int,
     file_refs: list[dict],
     previous_interaction_id: str | None,
-) -> dict:
-    input_parts: list[dict] = [{"type": "text", "text": user_prompt}]
-
+) -> tuple[dict, str]:
+    calculation_file_refs = [
+        ref
+        for ref in file_refs
+        if ref.get("include_document") and ref.get("file_uri")
+    ]
     store_names = [
         str(ref.get("file_search_store_name") or "")
         for ref in file_refs
         if ref.get("file_search_store_name")
     ]
 
-    tools: list[dict] = []
-    if store_names:
-        tools.append(
+    if calculation_file_refs:
+        # Exact calculations use the reusable Files API object as an actual
+        # document input to the Code Execution-capable interaction. The file
+        # bytes are not uploaded here; only the existing provider URI is sent.
+        input_parts: list[dict] = [{"type": "text", "text": user_prompt}]
+        for ref in calculation_file_refs:
+            input_parts.append(
+                {
+                    "type": "document",
+                    "uri": ref["file_uri"],
+                    "mime_type": ref.get("mime_type") or "text/csv",
+                }
+            )
+        tools = [{"type": "code_execution"}]
+        mode = "code_execution"
+    elif store_names:
+        input_parts = [{"type": "text", "text": user_prompt}]
+        tools = [
             {
                 "type": "file_search",
                 "file_search_store_names": store_names,
             }
-        )
-
-    # Gemini manages code execution on Google's side. When combined with
-    # File Search, the Interactions API can circulate tool context between
-    # the built-in tools without Privy downloading or re-uploading the file.
-    tools.append({"type": "code_execution"})
+        ]
+        mode = "file_search"
+    else:
+        input_parts = [{"type": "text", "text": user_prompt}]
+        tools = []
+        mode = "plain"
 
     payload: dict = {
         "model": model,
@@ -274,39 +351,56 @@ def _gemini_interaction_payload(
     }
     if previous_interaction_id:
         payload["previous_interaction_id"] = previous_interaction_id
-    return payload
+    return payload, mode
+
 
 def _format_gemini_api_error(status_code: int, body: str) -> GeminiInteractionError:
-    message = body[:1000]
-    code = None
-    retry_after = None
+    """Convert a Gemini HTTP error into a typed error without retaining provider text."""
+    code: str | None = None
+    provider_text = ""
     try:
         data = json.loads(body)
         err = data.get("error") or {}
-        code = err.get("status") or err.get("code")
-        message = err.get("message") or message
-        if status_code == 429:
-            import re
-            match = re.search(r"retry after (\d+(?:\.\d+)?)s", str(message), re.I)
-            if match:
-                retry_after = float(match.group(1))
+        code_value = err.get("status") or err.get("code")
+        code = str(code_value) if code_value is not None else None
+        provider_text = str(err.get("message") or "")
     except (ValueError, TypeError):
-        pass
+        provider_text = ""
 
-    if status_code == 429:
-        suffix = f" Retry after about {retry_after:.0f} seconds." if retry_after is not None else " Please wait and retry."
-        return GeminiInteractionError(
-            f"Gemini rate limit/quota reached.{suffix} OpenAI/Groq or another configured model can be used while the Gemini limit resets.",
-            code=str(code) if code else None,
-            status_code=status_code,
-        )
+    normalized = f"{code or ''} {provider_text}".lower()
+    if "deadline_exceeded" in normalized or "timed out" in normalized or status_code == 504:
+        category = "timeout"
+        user_message = "Gemini took too long to complete this request. Please try again."
+        retryable = True
+    elif status_code == 429:
+        category = "quota"
+        user_message = "Gemini rate limit or quota was reached. Please wait and try again."
+        retryable = True
+    elif status_code in {401, 403}:
+        category = "authentication"
+        user_message = "Gemini is not authorized for this request. Please check the server configuration."
+        retryable = False
+    elif status_code == 404:
+        category = "not_found"
+        user_message = "The Gemini conversation state is no longer available. Please retry the request."
+        retryable = True
+    elif status_code >= 500:
+        category = "provider_unavailable"
+        user_message = "Gemini is temporarily unavailable. Please try again."
+        retryable = True
+    else:
+        category = "provider_error"
+        user_message = "Gemini could not complete this request. Please try again."
+        retryable = True
 
     return GeminiInteractionError(
-        f"Gemini interaction request failed ({status_code}): {message}",
-        code=str(code) if code else None,
+        f"Gemini HTTP {status_code}",
+        category=category,
+        user_message=user_message,
+        code=code,
         status_code=status_code,
+        retryable=retryable,
     )
-
 
 def _stream_gemini_interaction(
     system_prompt: str,
@@ -318,15 +412,8 @@ def _stream_gemini_interaction(
     previous_interaction_id: str | None,
     interaction_state: dict | None,
 ) -> Iterator[str]:
-    store_count = sum(
-        1 for ref in file_refs if ref.get("file_search_store_name")
-    )
-    logger.warning(
-        "gemini_interaction_request file_search_stores=%s has_previous_interaction=%s",
-        store_count,
-        bool(previous_interaction_id),
-    )
-    payload = _gemini_interaction_payload(
+    started = time.perf_counter()
+    payload, mode = _gemini_interaction_payload(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         model=model,
@@ -335,22 +422,92 @@ def _stream_gemini_interaction(
         previous_interaction_id=previous_interaction_id,
     )
 
-    response = requests.post(
-        _gemini_interactions_url(),
-        headers=_gemini_native_headers(api_key),
-        json=payload,
-        timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT),
-        stream=True,
+    log_event(
+        logger,
+        "gemini_interaction_start",
+        mode=mode,
+        model=model,
+        file_search_stores=sum(1 for ref in file_refs if ref.get("file_search_store_name")),
+        document_refs=sum(1 for ref in file_refs if ref.get("include_document")),
+        document_inputs=sum(1 for ref in file_refs if ref.get("include_document") and ref.get("file_uri")),
+        has_previous_interaction=bool(previous_interaction_id),
+    )
+
+    http_started = time.perf_counter()
+    try:
+        response = requests.post(
+            _gemini_interactions_url(),
+            headers=_gemini_native_headers(api_key),
+            json=payload,
+            timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT),
+            stream=True,
+        )
+    except requests.exceptions.Timeout as exc:
+        log_event(
+            logger,
+            "gemini_interaction_http_error",
+            level=logging.ERROR,
+            duration_ms=elapsed_ms(http_started),
+            error_type=type(exc).__name__,
+            category="timeout",
+        )
+        raise LLMServiceError(
+            "Gemini request timed out",
+            category="timeout",
+            user_message="The AI service took too long to respond. Please try again.",
+            retryable=True,
+        ) from exc
+    except requests.exceptions.ConnectionError as exc:
+        log_event(
+            logger,
+            "gemini_interaction_http_error",
+            level=logging.ERROR,
+            duration_ms=elapsed_ms(http_started),
+            error_type=type(exc).__name__,
+            category="network",
+        )
+        raise LLMServiceError(
+            "Gemini connection failed",
+            category="network",
+            user_message="We couldn't connect to Gemini. Please try again.",
+            retryable=True,
+        ) from exc
+    except requests.RequestException as exc:
+        log_event(
+            logger,
+            "gemini_interaction_http_error",
+            level=logging.ERROR,
+            duration_ms=elapsed_ms(http_started),
+            error_type=type(exc).__name__,
+            category="network",
+        )
+        raise LLMServiceError(
+            "Gemini request failed",
+            category="network",
+            user_message="We couldn't reach the AI service. Please try again.",
+            retryable=True,
+        ) from exc
+
+    log_event(
+        logger,
+        "gemini_interaction_http_response",
+        duration_ms=elapsed_ms(http_started),
+        status_code=response.status_code,
     )
     if response.status_code >= 400:
+        log_event(
+            logger,
+            "gemini_interaction_api_error",
+            level=logging.ERROR,
+            status_code=response.status_code,
+        )
         raise _format_gemini_api_error(response.status_code, response.text)
 
     response.encoding = "utf-8"
     completed_id = None
+
     for raw_line in response.iter_lines(decode_unicode=True):
-        if not raw_line:
-            continue
-        if not raw_line.startswith("data:"):
+        if not raw_line or not raw_line.startswith("data:"):
             continue
         raw_payload = raw_line[len("data:"):].strip()
         if not raw_payload:
@@ -361,6 +518,7 @@ def _stream_gemini_interaction(
             continue
 
         event_type = event.get("event_type")
+
         if event_type == "interaction.created":
             interaction = event.get("interaction") or {}
             interaction_id = interaction.get("id")
@@ -372,49 +530,63 @@ def _stream_gemini_interaction(
             delta = event.get("delta") or {}
             delta_type = delta.get("type")
 
-            if delta_type == "text":
+            if delta_type == "file_search_call":
+                if interaction_state is not None:
+                    interaction_state.setdefault("tool_started_at", time.perf_counter())
+                log_event(logger, "gemini_tool_start", tool="file_search")
+
+            elif delta_type == "file_search_result":
+                tool_started_at = (interaction_state or {}).get("tool_started_at")
+                log_event(
+                    logger,
+                    "gemini_tool_complete",
+                    tool="file_search",
+                    result_chars=len(str(delta.get("result") or "")),
+                    duration_ms=elapsed_ms(tool_started_at) if tool_started_at else None,
+                )
+                if interaction_state is not None:
+                    interaction_state.pop("tool_started_at", None)
+
+            elif delta_type == "text":
                 text = delta.get("text")
                 if text:
                     yield text
 
             elif delta_type == "code_execution_call":
-                arguments = delta.get("arguments") or {}
-                code = arguments.get("code") or ""
-                logger.info("gemini_code_execution_call code_chars=%s", len(code))
+                code = str((delta.get("arguments") or {}).get("code") or "")
+                if interaction_state is not None:
+                    interaction_state.setdefault("tool_started_at", time.perf_counter())
+                log_event(logger, "gemini_tool_start", tool="code_execution", code_chars=len(code))
 
             elif delta_type == "code_execution_result":
-                result = delta.get("result") or ""
-                logger.info(
-                    "gemini_code_execution_result is_error=%s result_chars=%s",
-                    delta.get("is_error"),
-                    len(str(result)),
+                result = str(delta.get("result") or "")
+                tool_started_at = (interaction_state or {}).get("tool_started_at")
+                log_event(
+                    logger,
+                    "gemini_tool_complete",
+                    tool="code_execution",
+                    is_error=delta.get("is_error"),
+                    result_chars=len(result),
+                    duration_ms=elapsed_ms(tool_started_at) if tool_started_at else None,
                 )
-
+                if interaction_state is not None:
+                    interaction_state.pop("tool_started_at", None)
             continue
 
         if event_type == "interaction.completed":
             interaction = event.get("interaction") or {}
-
             completed_id = (
                 interaction.get("id")
                 or (interaction_state or {}).get("latest_interaction_id")
             )
-
             if completed_id and interaction_state is not None:
                 interaction_state["latest_interaction_id"] = str(completed_id)
 
             usage = interaction.get("usage") or {}
-
-            logger.warning(
-                "gemini_usage "
-                "interaction_id=%s "
-                "previous_interaction_id=%s "
-                "input_tokens=%s "
-                "cached_tokens=%s "
-                "output_tokens=%s "
-                "thought_tokens=%s "
-                "tool_use_tokens=%s "
-                "total_tokens=%s",
+            logger.info(
+                "gemini_usage interaction_id=%s previous_interaction_id=%s "
+                "input_tokens=%s cached_tokens=%s output_tokens=%s "
+                "thought_tokens=%s tool_use_tokens=%s total_tokens=%s",
                 completed_id,
                 previous_interaction_id,
                 usage.get("total_input_tokens"),
@@ -424,14 +596,26 @@ def _stream_gemini_interaction(
                 usage.get("total_tool_use_tokens"),
                 usage.get("total_tokens"),
             )
-
             continue
 
         if event_type == "error":
             error = event.get("error") or {}
-            message = str(error.get("message") or "Gemini interaction failed")
             code = str(error.get("code") or error.get("status") or "") or None
-            raise GeminiInteractionError(message, code=code)
+            log_event(
+                logger,
+                "gemini_interaction_error",
+                level=logging.ERROR,
+                code=code,
+                duration_ms=elapsed_ms(started),
+                error_type="provider_event",
+            )
+            raise GeminiInteractionError(
+                "Gemini provider event failed",
+                category="provider_error",
+                user_message="Gemini could not complete this request. Please try again.",
+                code=code,
+                retryable=True,
+            )
 
 
 def _stream_gemini_with_state(
@@ -441,7 +625,7 @@ def _stream_gemini_with_state(
     model: str,
     max_tokens: int,
     file_refs: list[dict],
-    interaction_id: str | None,
+    interaction_id: str,
     interaction_state: dict,
 ) -> Iterator[str]:
     try:
@@ -457,10 +641,9 @@ def _stream_gemini_with_state(
         )
     except GeminiInteractionError as exc:
         if exc.status_code == 404 or exc.code in {"not_found", "NOT_FOUND"}:
-            # The interaction retention window is finite. Let the caller
-            # start a fresh chain while reusing the persistent File Search store.
             interaction_state["reset_required"] = True
         raise
+
 
 def stream_llm(
     system_prompt: str,
@@ -485,8 +668,8 @@ def stream_llm(
     if provider == "gemini":
         state = interaction_state if interaction_state is not None else {}
         state.setdefault("latest_interaction_id", interaction_id)
-        previous_id = interaction_id
-        if previous_id:
+
+        if interaction_id:
             try:
                 yield from _stream_gemini_with_state(
                     system_prompt,
@@ -495,62 +678,84 @@ def stream_llm(
                     resolved_model,
                     max_tokens,
                     file_refs,
-                    previous_id,
+                    interaction_id,
                     state,
                 )
-            except GeminiInteractionError as exc:
+                return
+            except GeminiInteractionError:
                 if not state.get("reset_required"):
                     raise
                 state.pop("reset_required", None)
                 state["latest_interaction_id"] = None
-                yield from _stream_gemini_interaction(
-                    system_prompt,
-                    user_prompt,
-                    resolved_key,
-                    resolved_model,
-                    max_tokens,
-                    file_refs,
-                    None,
-                    state,
-                )
-        else:
-            yield from _stream_gemini_interaction(
-                system_prompt,
-                user_prompt,
-                resolved_key,
-                resolved_model,
-                max_tokens,
-                file_refs,
-                None,
-                state,
-            )
-        return
 
-    response = requests.post(
-        base_url,
-        headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
-        json=_post_payload(
+        yield from _stream_gemini_interaction(
             system_prompt,
             user_prompt,
+            resolved_key,
             resolved_model,
-            temperature,
             max_tokens,
-            True,
-            provider,
-        ),
-        timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT),
-        stream=True,
-    )
-    response.raise_for_status()
+            file_refs,
+            None,
+            state,
+        )
+        return
+
+    try:
+        response = requests.post(
+            base_url,
+            headers={"Authorization": f"Bearer {resolved_key}", "Content-Type": "application/json"},
+            json=_post_payload(
+                system_prompt,
+                user_prompt,
+                resolved_model,
+                temperature,
+                max_tokens,
+                True,
+                provider,
+            ),
+            timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT),
+            stream=True,
+        )
+    except requests.exceptions.Timeout as exc:
+        raise LLMServiceError(
+            "LLM request timed out",
+            category="timeout",
+            user_message="The AI service took too long to respond. Please try again.",
+            retryable=True,
+        ) from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise LLMServiceError(
+            "LLM connection failed",
+            category="network",
+            user_message="We couldn't connect to the AI service. Please try again.",
+            retryable=True,
+        ) from exc
+    except requests.RequestException as exc:
+        raise LLMServiceError(
+            "LLM request failed",
+            category="network",
+            user_message="We couldn't reach the AI service. Please try again.",
+            retryable=True,
+        ) from exc
+
+    if response.status_code >= 400:
+        user_message, retryable = _safe_provider_user_message(provider, response.status_code)
+        raise LLMServiceError(
+            f"{provider} HTTP {response.status_code}",
+            category="provider_error" if response.status_code < 500 else "provider_unavailable",
+            user_message=user_message,
+            status_code=response.status_code,
+            retryable=retryable,
+        )
     response.encoding = "utf-8"
     for raw_line in response.iter_lines(decode_unicode=True):
         if not raw_line or not raw_line.startswith("data:"):
             continue
-        payload = raw_line[len("data:"):].strip()
-        if payload == "[DONE]":
+        raw_payload = raw_line[len("data:"):].strip()
+        if raw_payload == "[DONE]":
             break
         try:
-            chunk = json.loads(payload)
+            chunk = json.loads(raw_payload)
         except json.JSONDecodeError:
             continue
         choices = chunk.get("choices") or []
@@ -560,4 +765,3 @@ def stream_llm(
         content = delta.get("content")
         if content:
             yield content
-

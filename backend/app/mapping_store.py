@@ -17,6 +17,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal
+from .crypto import decrypt_text, encrypt_text, lookup_digest
 from .models import (
     AdminConfig,
     AuthSession,
@@ -468,14 +469,37 @@ def get_chat_messages(chat_id: str) -> list:
                 metadata = json.loads(r.metadata_json) if r.metadata_json else {}
             except (TypeError, ValueError):
                 metadata = {}
-            out.append({"role": r.role, "content": r.content, "masked_count": r.masked_count, "metadata": metadata})
+
+            content = decrypt_text(
+                r.content,
+                aad=f"chat-message:{r.chat_id}:{r.role}",
+            )
+            out.append({
+                "role": r.role,
+                "content": content,
+                "masked_count": r.masked_count,
+                "metadata": metadata,
+            })
         return out
 
 
 def add_message(chat_id: str, role: str, content: str, masked_count: int = 0, metadata: dict | None = None) -> None:
     now = time.time()
+    encrypted_content = encrypt_text(
+        content,
+        aad=f"chat-message:{chat_id}:{role}",
+    )
     with SessionLocal() as db:
-        db.add(ChatMessage(chat_id=chat_id, role=role, content=content, masked_count=masked_count, metadata_json=json.dumps(metadata or {}, ensure_ascii=True), created_at=now))
+        db.add(
+            ChatMessage(
+                chat_id=chat_id,
+                role=role,
+                content=encrypted_content,
+                masked_count=masked_count,
+                metadata_json=json.dumps(metadata or {}, ensure_ascii=True),
+                created_at=now,
+            )
+        )
         db.execute(update(Chat).where(Chat.chat_id == chat_id).values(updated_at=now))
         db.commit()
 
@@ -618,12 +642,11 @@ def get_or_create_tokens(
     values: Iterable[tuple[str, str]],
     counters: dict,
 ) -> dict[str, str]:
-    """Get or mint tokens for many values in one database transaction.
+    """Get or mint tokens while keeping sensitive mapping data encrypted at rest.
 
-    ``TokenEntry`` is unique per normalized value within a chat, so repeated
-    spreadsheet values need one lookup and one token, regardless of how many
-    cells contain them. Keeping this operation set-based avoids a PostgreSQL
-    round trip and commit for every masked cell.
+    PostgreSQL stores only a keyed HMAC blind index in ``value_norm`` and an
+    AES-256-GCM ciphertext in ``original``. Plaintext normalized values and
+    originals exist only in application memory while masking/unmasking runs.
     """
     requested: dict[str, tuple[str, str]] = {}
     for value_type, original_value in values:
@@ -641,15 +664,19 @@ def get_or_create_tokens(
         for value_norm, (value_type, original_value) in requested.items():
             if value_norm in tokens:
                 continue
+
             counters[value_type] = counters.get(value_type, 0) + 1
             token = f"[{value_type}_{counters[value_type]}]"
             tokens[value_norm] = token
             new_entries.append(
                 TokenEntry(
                     session_id=session_id,
-                    value_norm=value_norm,
+                    value_norm=lookup_digest(session_id, value_norm),
                     token=token,
-                    original=original_value,
+                    original=encrypt_text(
+                        original_value,
+                        aad=f"token:{session_id}:{value_type}",
+                    ),
                     value_type=value_type,
                 )
             )
@@ -661,37 +688,110 @@ def get_or_create_tokens(
             db.add_all(new_entries)
             db.commit()
         except IntegrityError:
-            # A concurrent request may have minted one of these values first.
-            # Roll back, fetch the now-authoritative mapping, and only retry
-            # values that are genuinely still absent.
+            # A concurrent request may have created one or more mappings first.
             db.rollback()
-            tokens.update(_get_existing_tokens(db, session_id, requested))
-            unresolved = [entry for entry in new_entries if entry.value_norm not in tokens]
+            tokens = _get_existing_tokens(db, session_id, requested)
+
+            unresolved: list[TokenEntry] = []
+            for entry in new_entries:
+                # Resolve the application-memory normalized value corresponding
+                # to this entry's blind index.
+                value_norm = next(
+                    (norm for norm in requested if lookup_digest(session_id, norm) == entry.value_norm),
+                    None,
+                )
+                if value_norm is not None and value_norm not in tokens:
+                    unresolved.append(entry)
+                    tokens[value_norm] = entry.token
+
             if unresolved:
                 db.add_all(unresolved)
                 db.commit()
-                tokens.update({entry.value_norm: entry.token for entry in unresolved})
 
         return tokens
 
 
-def _get_existing_tokens(db, session_id: str, value_norms) -> dict[str, str]:
-    """Fetch existing mappings in bounded query batches."""
-    value_norms = list(value_norms)
+def _get_existing_tokens(
+    db,
+    session_id: str,
+    requested: dict[str, tuple[str, str]],
+) -> dict[str, str]:
+    """Fetch existing mappings by blind index, with legacy-row migration.
+
+    Rows created before Phase 4 stored ``value_norm`` and ``original`` as
+    plaintext. Those rows are still readable and are converted to the new
+    representation when encountered.
+    """
+    normalized_values = list(requested)
     tokens: dict[str, str] = {}
-    for start in range(0, len(value_norms), TOKEN_QUERY_CHUNK_SIZE):
-        chunk = value_norms[start:start + TOKEN_QUERY_CHUNK_SIZE]
+
+    for start in range(0, len(normalized_values), TOKEN_QUERY_CHUNK_SIZE):
+        chunk = normalized_values[start:start + TOKEN_QUERY_CHUNK_SIZE]
+        blind_indexes = [lookup_digest(session_id, value_norm) for value_norm in chunk]
+
         rows = db.execute(
             select(TokenEntry.value_norm, TokenEntry.token).where(
+                TokenEntry.session_id == session_id,
+                TokenEntry.value_norm.in_(blind_indexes),
+            )
+        ).all()
+        by_digest = {value_norm: token for value_norm, token in rows}
+        for value_norm, blind_index in zip(chunk, blind_indexes):
+            token = by_digest.get(blind_index)
+            if token is not None:
+                tokens[value_norm] = token
+
+        # Legacy lookup: exact plaintext value_norm matching the requested
+        # normalized value. Migrate matching rows in-place.
+        legacy_rows = db.execute(
+            select(
+                TokenEntry.value_norm,
+                TokenEntry.token,
+                TokenEntry.original,
+                TokenEntry.value_type,
+            ).where(
                 TokenEntry.session_id == session_id,
                 TokenEntry.value_norm.in_(chunk),
             )
         ).all()
-        tokens.update({value_norm: token for value_norm, token in rows})
+
+        for legacy_norm, token, original, value_type in legacy_rows:
+            if legacy_norm in tokens:
+                continue
+
+            original_plain = decrypt_text(
+                original,
+                aad=f"token:{session_id}:{value_type}",
+            )
+            tokens[legacy_norm] = token
+
+            db.execute(
+                update(TokenEntry)
+                .where(
+                    TokenEntry.session_id == session_id,
+                    TokenEntry.value_norm == legacy_norm,
+                )
+                .values(
+                    value_norm=lookup_digest(session_id, legacy_norm),
+                    original=encrypt_text(
+                        original_plain,
+                        aad=f"token:{session_id}:{value_type}",
+                    ),
+                )
+            )
+
+        if legacy_rows:
+            db.commit()
+
     return tokens
 
 
-def get_or_create_token(session_id: str, value_type: str, original_value: str, counters: dict) -> str:
+def get_or_create_token(
+    session_id: str,
+    value_type: str,
+    original_value: str,
+    counters: dict,
+) -> str:
     """Single-value compatibility wrapper for chat masking call sites."""
     value_norm = str(original_value).strip().lower()
     return get_or_create_tokens(
@@ -704,7 +804,9 @@ def get_or_create_token(session_id: str, value_type: str, original_value: str, c
 def load_counters(session_id: str) -> dict:
     counters = {}
     with SessionLocal() as db:
-        tokens = db.scalars(select(TokenEntry.token).where(TokenEntry.session_id == session_id)).all()
+        tokens = db.scalars(
+            select(TokenEntry.token).where(TokenEntry.session_id == session_id)
+        ).all()
     for token in tokens:
         m = re.match(r"^\[(.+)_(\d+)\]$", token)
         if not m:
@@ -715,19 +817,45 @@ def load_counters(session_id: str) -> dict:
 
 
 def get_known_values(session_id: str) -> dict:
+    """Return normalized plaintext values only in application memory."""
     with SessionLocal() as db:
         rows = db.execute(
-            select(TokenEntry.value_norm, TokenEntry.token).where(TokenEntry.session_id == session_id)
+            select(
+                TokenEntry.token,
+                TokenEntry.original,
+                TokenEntry.value_type,
+            ).where(TokenEntry.session_id == session_id)
         ).all()
-    return {value_norm: token for value_norm, token in rows}
+
+    result: dict[str, str] = {}
+    for token, original, value_type in rows:
+        original_plain = decrypt_text(
+            original,
+            aad=f"token:{session_id}:{value_type}",
+        )
+        result[str(original_plain).strip().lower()] = token
+    return result
 
 
 def get_reverse_map(session_id: str) -> dict:
+    """Return token -> original plaintext only in application memory."""
     with SessionLocal() as db:
         rows = db.execute(
-            select(TokenEntry.token, TokenEntry.original).where(TokenEntry.session_id == session_id)
+            select(
+                TokenEntry.token,
+                TokenEntry.original,
+                TokenEntry.value_type,
+            ).where(TokenEntry.session_id == session_id)
         ).all()
-    return {token: original for token, original in rows}
+
+    result: dict[str, str] = {}
+    for token, original, value_type in rows:
+        result[token] = decrypt_text(
+            original,
+            aad=f"token:{session_id}:{value_type}",
+        )
+    return result
+
 
 
 def clear_session(session_id: str) -> None:

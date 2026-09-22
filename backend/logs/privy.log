@@ -1,0 +1,153 @@
+2026-09-22 09:27:27 | INFO | app.routers.messages | request_id=78f101847fff | privy event=request_start request_id=78f101847fff chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 question_chars=3 requested_model=gemini-3.5-flash-lite
+2026-09-22 09:27:36 | INFO | app.routers.messages | request_id=78f101847fff | privy event=masking_complete request_id=78f101847fff duration_ms=8794 masked_tokens=0
+2026-09-22 09:27:38 | INFO | app.routers.messages | request_id=78f101847fff | privy event=provider_selected request_id=78f101847fff provider=gemini model=gemini-3.5-flash-lite duration_ms=0
+2026-09-22 09:27:38 | INFO | app.routers.messages | request_id=78f101847fff | privy event=gemini_file_prepare_start request_id=78f101847fff file_count=1 tool_mode=file_search
+2026-09-22 09:27:38 | INFO | app.gemini_files | request_id=78f101847fff | privy event=gemini_file_prepare_start request_id=78f101847fff file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 bytes=1113659
+2026-09-22 09:27:39 | INFO | app.gemini_files | request_id=78f101847fff | privy event=gemini_file_search_store_check request_id=78f101847fff exists=True status_code=200 duration_ms=1450
+2026-09-22 09:27:39 | INFO | app.gemini_files | request_id=78f101847fff | privy event=gemini_file_cache_hit request_id=78f101847fff file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 duration_ms=1471 raw_file_reused=True file_search_store_reused=True
+2026-09-22 09:27:39 | INFO | app.routers.messages | request_id=78f101847fff | privy event=gemini_file_prepare_complete request_id=78f101847fff file_count=1 duration_ms=1471
+2026-09-22 09:27:39 | INFO | app.gemini_interactions | request_id=78f101847fff | privy event=gemini_interaction_cache_miss request_id=78f101847fff chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 reason=message_count_mismatch duration_ms=19
+2026-09-22 09:27:39 | INFO | app.routers.messages | request_id=78f101847fff | privy event=interaction_state_lookup_complete request_id=78f101847fff reused=False duration_ms=19
+2026-09-22 09:27:39 | INFO | app.routers.messages | request_id=78f101847fff | privy event=llm_stream_start request_id=78f101847fff provider=gemini model=gemini-3.5-flash-lite tool_mode=file_search reused_interaction=False
+2026-09-22 09:27:40 | INFO | app.llm | request_id=78f101847fff | privy event=gemini_interaction_start request_id=78f101847fff mode=file_search model=gemini-3.5-flash-lite file_search_stores=1 document_refs=0 document_inputs=0 has_previous_interaction=False
+2026-09-22 09:27:40 | INFO | app.llm | request_id=78f101847fff | privy event=gemini_interaction_http_response request_id=78f101847fff duration_ms=858 status_code=200
+2026-09-22 09:27:48 | INFO | app.llm | request_id=- | gemini_usage interaction_id=v1_ChZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNBEhZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNB previous_interaction_id=None input_tokens=1276 cached_tokens=0 output_tokens=14 thought_tokens=60 tool_use_tokens=0 total_tokens=1350
+2026-09-22 09:27:48 | INFO | app.routers.messages | request_id=- | privy event=unmask_complete duration_ms=8217 response_chars=66
+2026-09-22 09:27:48 | INFO | app.routers.messages | request_id=- | privy event=llm_stream_complete provider=gemini model=gemini-3.5-flash-lite duration_ms=8218 response_chars=66
+2026-09-22 09:27:48 | INFO | app.gemini_interactions | request_id=- | privy event=gemini_interaction_saved chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=file_search message_count=8
+2026-09-22 09:27:48 | INFO | app.routers.messages | request_id=- | privy event=request_complete chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=21056
+2026-09-22 09:27:57 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=request_start request_id=ea36ddd04ea3 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 question_chars=71 requested_model=gemini-3.5-flash-lite
+2026-09-22 09:27:58 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=masking_complete request_id=ea36ddd04ea3 duration_ms=1082 masked_tokens=0
+2026-09-22 09:28:02 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=provider_selected request_id=ea36ddd04ea3 provider=gemini model=gemini-3.5-flash-lite duration_ms=0
+2026-09-22 09:28:02 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=gemini_file_prepare_start request_id=ea36ddd04ea3 file_count=1 tool_mode=code_execution
+2026-09-22 09:28:02 | INFO | app.gemini_files | request_id=ea36ddd04ea3 | privy event=gemini_file_prepare_start request_id=ea36ddd04ea3 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 bytes=1113659
+2026-09-22 09:28:04 | INFO | app.gemini_files | request_id=ea36ddd04ea3 | privy event=gemini_file_search_store_check request_id=ea36ddd04ea3 exists=True status_code=200 duration_ms=1486
+2026-09-22 09:28:04 | INFO | app.gemini_files | request_id=ea36ddd04ea3 | privy event=gemini_file_cache_hit request_id=ea36ddd04ea3 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 duration_ms=1498 raw_file_reused=True file_search_store_reused=True
+2026-09-22 09:28:04 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=gemini_file_prepare_complete request_id=ea36ddd04ea3 file_count=1 duration_ms=1499
+2026-09-22 09:28:04 | INFO | app.gemini_interactions | request_id=ea36ddd04ea3 | privy event=gemini_interaction_cache_hit request_id=ea36ddd04ea3 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=22
+2026-09-22 09:28:04 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=interaction_state_lookup_complete request_id=ea36ddd04ea3 reused=True duration_ms=23
+2026-09-22 09:28:04 | INFO | app.gemini_interactions | request_id=ea36ddd04ea3 | privy event=gemini_interaction_tool_mode_lookup request_id=ea36ddd04ea3 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=file_search duration_ms=0
+2026-09-22 09:28:04 | INFO | app.routers.messages | request_id=ea36ddd04ea3 | privy event=llm_stream_start request_id=ea36ddd04ea3 provider=gemini model=gemini-3.5-flash-lite tool_mode=code_execution reused_interaction=True
+2026-09-22 09:28:04 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_interaction_start request_id=ea36ddd04ea3 mode=code_execution model=gemini-3.5-flash-lite file_search_stores=1 document_refs=1 document_inputs=1 has_previous_interaction=True
+2026-09-22 09:28:06 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_interaction_http_response request_id=ea36ddd04ea3 duration_ms=1997 status_code=200
+2026-09-22 09:28:12 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=1290
+2026-09-22 09:28:13 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=3 duration_ms=718
+2026-09-22 09:28:15 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=181
+2026-09-22 09:28:15 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=3 duration_ms=43
+2026-09-22 09:28:16 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=224
+2026-09-22 09:28:30 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=14197
+2026-09-22 09:28:32 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=410
+2026-09-22 09:28:32 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=57 duration_ms=1
+2026-09-22 09:28:35 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=655
+2026-09-22 09:28:35 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=True result_chars=328 duration_ms=2
+2026-09-22 09:28:38 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=842
+2026-09-22 09:28:38 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=38
+2026-09-22 09:28:39 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=212
+2026-09-22 09:28:39 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=908 duration_ms=1
+2026-09-22 09:28:42 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=56
+2026-09-22 09:28:42 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=3 duration_ms=32
+2026-09-22 09:28:43 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=114
+2026-09-22 09:28:43 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=6 duration_ms=0
+2026-09-22 09:28:45 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=497
+2026-09-22 09:28:45 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=28
+2026-09-22 09:28:48 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=773
+2026-09-22 09:28:48 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=20
+2026-09-22 09:28:51 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=92
+2026-09-22 09:28:51 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=8468 duration_ms=46
+2026-09-22 09:28:54 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=1793
+2026-09-22 09:28:54 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=2 duration_ms=0
+2026-09-22 09:28:57 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=956
+2026-09-22 09:28:57 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=15 duration_ms=41
+2026-09-22 09:28:59 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=238
+2026-09-22 09:28:59 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=1 duration_ms=1
+2026-09-22 09:29:01 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=905
+2026-09-22 09:29:01 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=1
+2026-09-22 09:29:05 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=890
+2026-09-22 09:29:05 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=25
+2026-09-22 09:29:07 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=373
+2026-09-22 09:29:07 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=32
+2026-09-22 09:29:13 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=481
+2026-09-22 09:29:13 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=0
+2026-09-22 09:29:15 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=689
+2026-09-22 09:29:15 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=40
+2026-09-22 09:29:17 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=287
+2026-09-22 09:29:17 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=0
+2026-09-22 09:29:19 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=131
+2026-09-22 09:29:19 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=2 duration_ms=32
+2026-09-22 09:29:21 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_start request_id=ea36ddd04ea3 tool=code_execution code_chars=81
+2026-09-22 09:29:21 | INFO | app.llm | request_id=ea36ddd04ea3 | privy event=gemini_tool_complete request_id=ea36ddd04ea3 tool=code_execution is_error=False result_chars=0 duration_ms=28
+2026-09-22 09:29:28 | INFO | app.llm | request_id=- | gemini_usage interaction_id=v1_ChZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNBEhd6dnl4YXZHOElyS25qdU1QLXJpUTJBTQ previous_interaction_id=v1_ChZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNBEhZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNB input_tokens=603493 cached_tokens=13559909 output_tokens=3734 thought_tokens=0 tool_use_tokens=13854156 total_tokens=14461383
+2026-09-22 09:29:28 | INFO | app.routers.messages | request_id=- | privy event=unmask_complete duration_ms=84536 response_chars=171
+2026-09-22 09:29:28 | INFO | app.routers.messages | request_id=- | privy event=llm_stream_complete provider=gemini model=gemini-3.5-flash-lite duration_ms=84537 response_chars=171
+2026-09-22 09:29:28 | INFO | app.gemini_interactions | request_id=- | privy event=gemini_interaction_saved chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=code_execution message_count=10
+2026-09-22 09:29:28 | INFO | app.routers.messages | request_id=- | privy event=request_complete chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=91158
+2026-09-22 10:09:57 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=request_start request_id=d7553bcf871e chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 question_chars=2 requested_model=gemini-3.5-flash-lite
+2026-09-22 10:10:09 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=masking_complete request_id=d7553bcf871e duration_ms=11660 masked_tokens=0
+2026-09-22 10:10:19 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=provider_selected request_id=d7553bcf871e provider=gemini model=gemini-3.5-flash-lite duration_ms=0
+2026-09-22 10:10:19 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=gemini_file_prepare_start request_id=d7553bcf871e file_count=1 tool_mode=file_search
+2026-09-22 10:10:19 | INFO | app.gemini_files | request_id=d7553bcf871e | privy event=gemini_file_prepare_start request_id=d7553bcf871e file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 bytes=1113659
+2026-09-22 10:10:21 | INFO | app.gemini_files | request_id=d7553bcf871e | privy event=gemini_file_search_store_check request_id=d7553bcf871e exists=True status_code=200 duration_ms=1562
+2026-09-22 10:10:21 | INFO | app.gemini_files | request_id=d7553bcf871e | privy event=gemini_file_cache_hit request_id=d7553bcf871e file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 duration_ms=1596 raw_file_reused=True file_search_store_reused=True
+2026-09-22 10:10:21 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=gemini_file_prepare_complete request_id=d7553bcf871e file_count=1 duration_ms=1598
+2026-09-22 10:10:21 | INFO | app.gemini_interactions | request_id=d7553bcf871e | privy event=gemini_interaction_cache_hit request_id=d7553bcf871e chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=40
+2026-09-22 10:10:21 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=interaction_state_lookup_complete request_id=d7553bcf871e reused=True duration_ms=40
+2026-09-22 10:10:21 | INFO | app.gemini_interactions | request_id=d7553bcf871e | privy event=gemini_interaction_tool_mode_lookup request_id=d7553bcf871e chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=code_execution duration_ms=0
+2026-09-22 10:10:21 | INFO | app.routers.messages | request_id=d7553bcf871e | privy event=llm_stream_start request_id=d7553bcf871e provider=gemini model=gemini-3.5-flash-lite tool_mode=file_search reused_interaction=True
+2026-09-22 10:10:21 | INFO | app.llm | request_id=d7553bcf871e | privy event=gemini_interaction_start request_id=d7553bcf871e mode=file_search model=gemini-3.5-flash-lite file_search_stores=1 document_refs=0 document_inputs=0 has_previous_interaction=True
+2026-09-22 10:10:23 | INFO | app.llm | request_id=d7553bcf871e | privy event=gemini_interaction_http_response request_id=d7553bcf871e duration_ms=1843 status_code=200
+2026-09-22 10:10:32 | INFO | app.llm | request_id=- | gemini_usage interaction_id=v1_ChZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNBEhd0Z2F5YXRMY083SFI0LUVQZ3JDQm1BTQ previous_interaction_id=v1_ChZ0Znl4YXBiQUI3R3VtTk1QeU9XNlNBEhd6dnl4YXZHOElyS25qdU1QLXJpUTJBTQ input_tokens=603634 cached_tokens=0 output_tokens=13 thought_tokens=0 tool_use_tokens=0 total_tokens=603647
+2026-09-22 10:10:32 | INFO | app.routers.messages | request_id=- | privy event=unmask_complete duration_ms=11762 response_chars=54
+2026-09-22 10:10:32 | INFO | app.routers.messages | request_id=- | privy event=llm_stream_complete provider=gemini model=gemini-3.5-flash-lite duration_ms=11763 response_chars=54
+2026-09-22 10:10:32 | INFO | app.gemini_interactions | request_id=- | privy event=gemini_interaction_saved chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=file_search message_count=12
+2026-09-22 10:10:32 | INFO | app.routers.messages | request_id=- | privy event=request_complete chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=35601
+2026-09-22 10:51:51 | INFO | app.routers.messages | request_id=e8668894f927 | privy event=request_start request_id=e8668894f927 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 question_chars=24 requested_model=gemini-3.5-flash-lite
+2026-09-22 10:51:51 | INFO | app.routers.messages | request_id=e8668894f927 | privy event=request_complete request_id=e8668894f927 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=12
+2026-09-22 10:56:08 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=request_start request_id=401e7150e355 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 question_chars=30 requested_model=gemini-3.5-flash-lite
+2026-09-22 10:56:19 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=masking_complete request_id=401e7150e355 duration_ms=11236 masked_tokens=0
+2026-09-22 10:56:30 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=provider_selected request_id=401e7150e355 provider=gemini model=gemini-3.5-flash-lite duration_ms=0
+2026-09-22 10:56:30 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=gemini_file_prepare_start request_id=401e7150e355 file_count=1 tool_mode=file_search
+2026-09-22 10:56:30 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_file_prepare_start request_id=401e7150e355 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 bytes=1113659
+2026-09-22 10:56:30 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_raw_file_upload_start request_id=401e7150e355 bytes=1113659
+2026-09-22 10:56:36 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_raw_file_active request_id=401e7150e355 duration_ms=0 state=ACTIVE
+2026-09-22 10:56:36 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_raw_file_upload_complete request_id=401e7150e355 duration_ms=5403 file_name=files/k4gqo7eer5fh state=ACTIVE
+2026-09-22 10:56:36 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_file_search_store_create_start request_id=401e7150e355 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5
+2026-09-22 10:56:38 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_file_search_store_create_complete request_id=401e7150e355 duration_ms=2248 store_name=fileSearchStores/privyfile8d2fc0254576e03ebc-wiu1qbdbfssq
+2026-09-22 10:56:38 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_file_search_import_start request_id=401e7150e355 store_name=fileSearchStores/privyfile8d2fc0254576e03ebc-wiu1qbdbfssq
+2026-09-22 10:56:50 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_operation_complete request_id=401e7150e355 duration_ms=5515
+2026-09-22 10:56:50 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_file_search_import_complete request_id=401e7150e355 duration_ms=12438 store_name=fileSearchStores/privyfile8d2fc0254576e03ebc-wiu1qbdbfssq
+2026-09-22 10:56:50 | INFO | app.gemini_files | request_id=401e7150e355 | privy event=gemini_file_registered request_id=401e7150e355 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5
+2026-09-22 10:56:50 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=gemini_file_prepare_complete request_id=401e7150e355 file_count=1 duration_ms=20134
+2026-09-22 10:56:50 | INFO | app.gemini_interactions | request_id=401e7150e355 | privy event=gemini_interaction_cache_miss request_id=401e7150e355 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 reason=fingerprint_mismatch duration_ms=24
+2026-09-22 10:56:50 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=interaction_state_lookup_complete request_id=401e7150e355 reused=False duration_ms=24
+2026-09-22 10:56:50 | INFO | app.routers.messages | request_id=401e7150e355 | privy event=llm_stream_start request_id=401e7150e355 provider=gemini model=gemini-3.5-flash-lite tool_mode=file_search reused_interaction=False
+2026-09-22 10:56:50 | INFO | app.llm | request_id=401e7150e355 | privy event=gemini_interaction_start request_id=401e7150e355 mode=file_search model=gemini-3.5-flash-lite file_search_stores=1 document_refs=0 document_inputs=0 has_previous_interaction=False
+2026-09-22 10:56:51 | INFO | app.llm | request_id=401e7150e355 | privy event=gemini_interaction_http_response request_id=401e7150e355 duration_ms=880 status_code=200
+2026-09-22 10:56:54 | INFO | app.llm | request_id=401e7150e355 | privy event=gemini_tool_start request_id=401e7150e355 tool=file_search
+2026-09-22 10:56:57 | INFO | app.llm | request_id=401e7150e355 | privy event=gemini_tool_complete request_id=401e7150e355 tool=file_search result_chars=0 duration_ms=2295
+2026-09-22 10:57:03 | INFO | app.llm | request_id=- | gemini_usage interaction_id=v1_ChdteEd5YXFMWExaXzRqdU1Qa2R5MDJRVRIXbXhHeWFxTFhMWl80anVNUGtkeTAyUVU previous_interaction_id=None input_tokens=1456 cached_tokens=0 output_tokens=52 thought_tokens=0 tool_use_tokens=16120 total_tokens=17628
+2026-09-22 10:57:03 | INFO | app.routers.messages | request_id=- | privy event=unmask_complete duration_ms=12499 response_chars=72
+2026-09-22 10:57:03 | INFO | app.routers.messages | request_id=- | privy event=llm_stream_complete provider=gemini model=gemini-3.5-flash-lite duration_ms=12500 response_chars=72
+2026-09-22 10:57:03 | INFO | app.gemini_interactions | request_id=- | privy event=gemini_interaction_saved chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=file_search message_count=14
+2026-09-22 10:57:03 | INFO | app.routers.messages | request_id=- | privy event=request_complete chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=55232
+2026-09-22 10:57:37 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=request_start request_id=aee1f60ac4d1 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 question_chars=24 requested_model=gemini-3.5-flash-lite
+2026-09-22 10:57:39 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=masking_complete request_id=aee1f60ac4d1 duration_ms=975 masked_tokens=0
+2026-09-22 10:57:52 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=provider_selected request_id=aee1f60ac4d1 provider=gemini model=gemini-3.5-flash-lite duration_ms=0
+2026-09-22 10:57:52 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=gemini_file_prepare_start request_id=aee1f60ac4d1 file_count=1 tool_mode=file_search
+2026-09-22 10:57:52 | INFO | app.gemini_files | request_id=aee1f60ac4d1 | privy event=gemini_file_prepare_start request_id=aee1f60ac4d1 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 bytes=1113659
+2026-09-22 10:57:52 | INFO | app.gemini_files | request_id=aee1f60ac4d1 | privy event=gemini_file_cache_hit request_id=aee1f60ac4d1 file_id=8d2fc025-ac6f-4246-8496-e60ba6df2fc5 duration_ms=27 raw_file_reused=True file_search_store_reused=True store_check_skipped=True
+2026-09-22 10:57:52 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=gemini_file_prepare_complete request_id=aee1f60ac4d1 file_count=1 duration_ms=28
+2026-09-22 10:57:52 | INFO | app.gemini_interactions | request_id=aee1f60ac4d1 | privy event=gemini_interaction_cache_hit request_id=aee1f60ac4d1 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=23
+2026-09-22 10:57:52 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=interaction_state_lookup_complete request_id=aee1f60ac4d1 reused=True duration_ms=23
+2026-09-22 10:57:52 | INFO | app.gemini_interactions | request_id=aee1f60ac4d1 | privy event=gemini_interaction_tool_mode_lookup request_id=aee1f60ac4d1 chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=file_search duration_ms=0
+2026-09-22 10:57:52 | INFO | app.routers.messages | request_id=aee1f60ac4d1 | privy event=llm_stream_start request_id=aee1f60ac4d1 provider=gemini model=gemini-3.5-flash-lite tool_mode=file_search reused_interaction=True
+2026-09-22 10:57:52 | INFO | app.llm | request_id=aee1f60ac4d1 | privy event=gemini_interaction_start request_id=aee1f60ac4d1 mode=file_search model=gemini-3.5-flash-lite file_search_stores=1 document_refs=0 document_inputs=0 has_previous_interaction=True
+2026-09-22 10:57:54 | INFO | app.llm | request_id=aee1f60ac4d1 | privy event=gemini_interaction_http_response request_id=aee1f60ac4d1 duration_ms=2380 status_code=200
+2026-09-22 10:57:58 | INFO | app.llm | request_id=aee1f60ac4d1 | privy event=gemini_tool_start request_id=aee1f60ac4d1 tool=file_search
+2026-09-22 10:58:00 | INFO | app.llm | request_id=aee1f60ac4d1 | privy event=gemini_tool_complete request_id=aee1f60ac4d1 tool=file_search result_chars=0 duration_ms=2296
+2026-09-22 10:58:04 | INFO | app.llm | request_id=- | gemini_usage interaction_id=v1_ChdteEd5YXFMWExaXzRqdU1Qa2R5MDJRVRIXMmhHeWFxZXRNc0x2ZzhVUDZ1YW53UUU previous_interaction_id=v1_ChdteEd5YXFMWExaXzRqdU1Qa2R5MDJRVRIXbXhHeWFxTFhMWl80anVNUGtkeTAyUVU input_tokens=15946 cached_tokens=0 output_tokens=131 thought_tokens=0 tool_use_tokens=30742 total_tokens=46819
+2026-09-22 10:58:04 | INFO | app.routers.messages | request_id=- | privy event=unmask_complete duration_ms=12816 response_chars=402
+2026-09-22 10:58:04 | INFO | app.routers.messages | request_id=- | privy event=llm_stream_complete provider=gemini model=gemini-3.5-flash-lite duration_ms=12817 response_chars=402
+2026-09-22 10:58:04 | INFO | app.gemini_interactions | request_id=- | privy event=gemini_interaction_saved chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 tool_mode=file_search message_count=16
+2026-09-22 10:58:04 | INFO | app.routers.messages | request_id=- | privy event=request_complete chat_id=46505ffd-7128-4221-b1ad-f610c7d63b59 duration_ms=27053
+2026-09-22 12:35:02 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log
+2026-09-22 12:35:17 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log

@@ -3,7 +3,6 @@
 import io
 import json
 import logging
-import os
 import time
 
 import pandas as pd
@@ -12,8 +11,9 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from .. import mapping_store as store
 from ..auth import get_current_app_user
 from ..detection import classify_dataframe_columns
-from ..gemini_files import delete_gemini_file_cache
-from ..gemini_interactions import delete_interaction
+from ..gemini_files import delete_gemini_file_cache, get_or_upload_gemini_file
+from ..llm import get_model_config
+from ..logging_utils import elapsed_ms, log_event
 from ..masking import (
     build_masked_context,
     build_masked_preview,
@@ -26,6 +26,7 @@ from ..security_scan import scan_for_unmasked_pii
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 logger = logging.getLogger(__name__)
+PREPARE_GEMINI_ON_UPLOAD = __import__("os").getenv("PRIVY_PREPARE_GEMINI_ON_UPLOAD", "true").strip().lower() not in {"0", "false", "no", "off"}
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 GUEST_MAX_FILES = int(__import__("os").getenv("PRIVY_GUEST_MAX_FILES", "3"))
 GUEST_MAX_FILE_SIZE_MB = int(__import__("os").getenv("PRIVY_GUEST_MAX_FILE_SIZE_MB", "10"))
@@ -50,6 +51,63 @@ def _read_dataframe(filename: str, raw_bytes: bytes) -> pd.DataFrame:
     )
 
 
+def _active_gemini_api_key() -> str | None:
+    """Return the configured Gemini key only when Gemini is the active default model."""
+    configured_model = store.get_admin_config("llm_model", "")
+    try:
+        if configured_model:
+            provider, _base_url, api_key, _model = get_model_config(configured_model)
+        else:
+            provider, _base_url, api_key, _model = get_model_config(None)
+    except RuntimeError:
+        return None
+    return api_key if provider == "gemini" else None
+
+
+def _prepare_gemini_provider_file(
+    *,
+    chat_id: str,
+    file_id: str,
+    filename: str,
+    masked_csv: str,
+    api_key: str,
+) -> None:
+    started = time.perf_counter()
+    log_event(
+        logger,
+        "gemini_upload_prepare_start",
+        file_id=file_id,
+        rows=masked_csv.count("\n"),
+    )
+    try:
+        get_or_upload_gemini_file(
+            file_id=file_id,
+            filename=filename,
+            masked_csv=masked_csv,
+            api_key=api_key,
+        )
+    except Exception as exc:
+        # The local upload is already valid and persisted. Provider preparation
+        # can be retried by the next Gemini question without losing the file.
+        log_event(
+            logger,
+            "gemini_upload_prepare_error",
+            level=logging.WARNING,
+            file_id=file_id,
+            duration_ms=elapsed_ms(started),
+            error_type=type(exc).__name__,
+        )
+        return
+
+    log_event(
+        logger,
+        "gemini_upload_prepare_complete",
+        chat_id=chat_id,
+        file_id=file_id,
+        duration_ms=elapsed_ms(started),
+    )
+
+
 @router.post("/{chat_id}/preview", response_model=UploadPreviewResult)
 async def preview_file(
     chat_id: str,
@@ -65,7 +123,7 @@ async def preview_file(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}") from e
+        raise HTTPException(status_code=400, detail="Couldn't read the uploaded file. Please check the file format and try again.") from e
 
     col_types = classify_dataframe_columns(df)
     columns = [
@@ -109,7 +167,7 @@ async def upload_file(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Couldn't read file: {e}") from e
+        raise HTTPException(status_code=400, detail="Couldn't read the uploaded file. Please check the file format and try again.") from e
     parsed_at = time.perf_counter()
 
     disabled = {c.strip() for c in disabled_columns.split(",") if c.strip()}
@@ -131,31 +189,15 @@ async def upload_file(
     leaked = find_leaked_values(df, masked_df, col_types, enabled_columns)
     if leaked:
         leaked_cols = sorted({col for col, _ in leaked})
-        examples_by_col: dict[str, list[str]] = {}
-        for col, val in leaked:
-            examples_by_col.setdefault(col, [])
-            if val not in examples_by_col[col] and len(examples_by_col[col]) < 3:
-                examples_by_col[col].append(val)
-        example_lines = "; ".join(
-            f"{col}: {', '.join(examples_by_col[col])}" for col in leaked_cols
-        )
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Masking failed for a structured field in column(s) "
-                f"{', '.join(leaked_cols)} -- its value is still raw in the data. "
-                f"Example(s): {example_lines}. Nothing was saved. This is a masking "
-                "bug, not a setting to adjust -- please report it."
+                f"{', '.join(leaked_cols)} -- a value is still raw in the data. "
+                "Nothing was saved. This is a masking bug, not a setting to adjust "
+                "-- please report it."
             ),
         )
-
-    # Any upload/edit changes the attachment set or file content, so an older
-    # Gemini interaction chain can no longer be treated as authoritative.
-    # Clear it before saving the new attachment; this is harmless when no chain exists.
-    delete_interaction(
-        chat_id,
-        api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
-    )
 
     # Store the complete masked dataset for LLM analysis. The UI preview is
     # generated separately below so it never reduces the analysis dataset.
@@ -192,6 +234,21 @@ async def upload_file(
         file_id=file_id,
     )
     persisted_at = time.perf_counter()
+
+    if PREPARE_GEMINI_ON_UPLOAD:
+        gemini_api_key = _active_gemini_api_key()
+        if gemini_api_key:
+            _prepare_gemini_provider_file(
+                chat_id=chat_id,
+                file_id=resolved_file_id,
+                filename=file.filename or "upload.csv",
+                masked_csv=masked_csv,
+                api_key=gemini_api_key,
+            )
+        else:
+            log_event(logger, "gemini_upload_prepare_skipped", reason="gemini_not_active")
+    else:
+        log_event(logger, "gemini_upload_prepare_skipped", reason="disabled_by_config")
 
     logger.info(
         "upload_masking_timing chat_id=%s rows=%d columns=%d parse_ms=%.1f "
@@ -252,17 +309,11 @@ def delete_upload(
     if not store.get_chat_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Removing/changing attachments invalidates the server-side Gemini
-    # conversation chain because it may contain references to the old files.
-    # Delete the interaction record where possible, then remove the cached
-    # provider file reference.
-    delete_interaction(
-        chat_id,
-        api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
-    )
-    delete_gemini_file_cache(
-        file_id,
-        api_key=os.environ.get("GEMINI_API_KEY", "").strip() or None,
-    )
+    # Best-effort provider cleanup. Gemini files expire on their own, but an
+    # explicit delete keeps lifecycle ownership aligned with the Privy file.
+    gemini_api_key = __import__("os").getenv("GEMINI_API_KEY", "").strip() or None
+    delete_gemini_file_cache(file_id, gemini_api_key)
+
     if not store.delete_chat_file(chat_id, file_id):
         raise HTTPException(status_code=404, detail="File not found")
+    log_event(logger, "file_deleted", chat_id=chat_id, file_id=file_id)
