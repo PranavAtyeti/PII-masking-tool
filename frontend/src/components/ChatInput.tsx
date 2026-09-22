@@ -1,231 +1,36 @@
-import {
-  useLayoutEffect,
-  useRef,
-  useState,
-  type ChangeEvent,
-  type KeyboardEvent,
-} from "react";
+import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 import { MAX_FILES_PER_SELECTION } from "../uploadLimits";
 
-export interface ChatAttachment {
-  fileId: string;
-  filename: string;
-  maskedCount: number;
-  canEdit: boolean;
+export interface ChatAttachment { fileId: string; filename: string; maskedCount: number; canEdit: boolean; }
+interface ChatInputProps { onSend: (text: string) => void; onUploadFiles: (files: File[]) => void; onEditFile?: (fileId: string) => void; onRemoveFile?: (fileId: string) => void; attachments?: ChatAttachment[]; disabled?: boolean; isStreaming?: boolean; isUploading?: boolean; hasPendingFile?: boolean; pendingQueueCount?: number; placeholder?: string; onStop?: () => void; }
+
+function Icon({ name, className = "h-4 w-4" }: { name: "plus" | "paperclip" | "send" | "stop" | "chevron" | "file"; className?: string }) {
+  const common = { className, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const, "aria-hidden": true };
+  if (name === "plus") return <svg {...common}><path d="M12 5v14M5 12h14" /></svg>;
+  if (name === "paperclip") return <svg {...common}><path d="m20.5 11.5-8.2 8.2a5 5 0 0 1-7.1-7.1l9.1-9.1a3.5 3.5 0 1 1 5 5l-9.2 9.2a2 2 0 1 1-2.8-2.8l8.3-8.3" /></svg>;
+  if (name === "send") return <svg {...common}><path d="m4 4 16 8-16 8 3-8-3-8Z" /><path d="M7 12h13" /></svg>;
+  if (name === "stop") return <svg {...common} fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>;
+  if (name === "chevron") return <svg {...common}><path d="m7 10 5 5 5-5" /></svg>;
+  return <svg {...common}><path d="M6 4.5h8l4 4V20H6V4.5Z" /><path d="M14 4.5V9h4M9 13h6M9 16h6" /></svg>;
 }
 
-interface ChatInputProps {
-  onSend: (text: string) => void;
-  onUploadFiles: (files: File[]) => void;
-  onEditFile?: (fileId: string) => void;
-  onRemoveFile?: (fileId: string) => void;
-  attachments?: ChatAttachment[];
-  disabled?: boolean;
-  isStreaming?: boolean;
-  isUploading?: boolean;
-  hasPendingFile?: boolean;
-  pendingQueueCount?: number;
-  placeholder?: string;
-  onStop?: () => void;
-}
+export function ChatInput({ onSend, onUploadFiles, onEditFile, onRemoveFile, attachments = [], disabled = false, isStreaming = false, isUploading = false, hasPendingFile = false, pendingQueueCount = 0, placeholder = "Ask anything about your data...", onStop }: ChatInputProps) {
+  const [value, setValue] = useState(""); const [attachmentsOpen, setAttachmentsOpen] = useState(false); const fileInputRef = useRef<HTMLInputElement>(null); const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerDisabled = disabled || isUploading || hasPendingFile; const totalMasked = attachments.reduce((sum, item) => sum + item.maskedCount, 0);
+  useLayoutEffect(() => { const textarea = textareaRef.current; if (!textarea) return; textarea.style.height = "auto"; const maxHeight = Math.max(150, Math.floor(window.innerHeight * 0.25)); textarea.style.height = `${Math.min(Math.max(42, textarea.scrollHeight), maxHeight)}px`; textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden"; }, [value]);
+  const submit = () => { const trimmed = value.trim(); if (!trimmed || composerDisabled) return; onSend(trimmed); setValue(""); };
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } };
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => { const files = Array.from(e.target.files ?? []); if (files.length > 0) onUploadFiles(files); e.target.value = ""; };
 
-export function ChatInput({
-  onSend,
-  onUploadFiles,
-  onEditFile,
-  onRemoveFile,
-  attachments = [],
-  disabled = false,
-  isStreaming = false,
-  isUploading = false,
-  hasPendingFile = false,
-  pendingQueueCount = 0,
-  placeholder = "Message Privy",
-  onStop,
-}: ChatInputProps) {
-  const [value, setValue] = useState("");
-  const [attachmentsOpen, setAttachmentsOpen] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  const composerDisabled = disabled || isUploading || hasPendingFile;
-  const totalMasked = attachments.reduce((sum, item) => sum + item.maskedCount, 0);
-
-  useLayoutEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea) return;
-
-    textarea.style.height = "auto";
-
-    const maxHeight = Math.max(180, Math.floor(window.innerHeight * 0.4));
-    const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
-
-    textarea.style.height = `${Math.max(44, nextHeight)}px`;
-    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
-  }, [value]);
-
-  const submit = () => {
-    const trimmed = value.trim();
-    if (!trimmed || composerDisabled) return;
-    onSend(trimmed);
-    setValue("");
-  };
-
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      submit();
-    }
-  };
-
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    if (files.length > 0) onUploadFiles(files);
-    e.target.value = "";
-  };
-
-  return (
-    <div className="rounded-2xl border border-border bg-surface p-2 shadow-sm transition-shadow focus-within:shadow-md">
-      {hasPendingFile && pendingQueueCount > 0 && (
-        <div className="mb-2 px-2 text-[11px] text-ink/45">
-          {pendingQueueCount} more file{pendingQueueCount === 1 ? "" : "s"} waiting to be prepared
-        </div>
-      )}
-
-      {attachmentsOpen && attachments.length > 0 && (
-        <div
-          id="privy-attachment-details"
-          className="mb-2 space-y-2 rounded-xl border border-border bg-bg p-2"
-        >
-          {attachments.map((attachment) => {
-            const ext = attachment.filename.split(".").pop()?.toLowerCase();
-            const fileIcon = ext === "xlsx" || ext === "xls" ? "▦" : "≡";
-
-            return (
-              <div
-                key={attachment.fileId}
-                className="flex items-center gap-3 rounded-lg border border-border bg-surface px-3 py-2.5"
-              >
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-bg text-base text-ink/70">
-                  {fileIcon}
-                </div>
-
-                <div className="min-w-0 flex-1">
-                  <p
-                    className="truncate text-sm font-medium text-ink"
-                    title={attachment.filename}
-                  >
-                    {attachment.filename}
-                  </p>
-                  <p className="mt-0.5 text-xs text-ink/50">
-                    {attachment.maskedCount.toLocaleString()} values masked
-                  </p>
-                </div>
-
-                <div className="flex shrink-0 items-center gap-1">
-                  {onEditFile && (
-                    <button
-                      type="button"
-                      onClick={() => onEditFile(attachment.fileId)}
-                      disabled={composerDisabled}
-                      className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-ink/60 hover:bg-bg hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
-                    >
-                      {attachment.canEdit ? "Edit masking" : "Re-attach to edit"}
-                    </button>
-                  )}
-
-                  {onRemoveFile && (
-                    <button
-                      type="button"
-                      onClick={() => onRemoveFile(attachment.fileId)}
-                      disabled={composerDisabled}
-                      aria-label={`Remove ${attachment.filename}`}
-                      title="Remove file"
-                      className="rounded-lg px-2 py-1.5 text-lg leading-none text-ink/35 hover:bg-bg hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
-                    >
-                      ×
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      <div className="flex items-end gap-1">
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          accept=".csv,.xlsx,.xls"
-          className="hidden"
-          onChange={handleFileChange}
-        />
-
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={composerDisabled}
-          aria-label="Attach files"
-          title={`Attach up to ${MAX_FILES_PER_SELECTION} files at a time`}
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xl text-ink/50 transition-colors hover:bg-bg hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
-        >
-          {isUploading ? "…" : "+"}
-        </button>
-
-        {attachments.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setAttachmentsOpen((open) => !open)}
-            disabled={composerDisabled}
-            aria-expanded={attachmentsOpen}
-            aria-controls="privy-attachment-details"
-            aria-label={attachmentsOpen ? "Collapse attachments" : "Show attachments"}
-            title={`${attachments.length} file${attachments.length === 1 ? "" : "s"} attached · ${totalMasked.toLocaleString()} values masked`}
-            className="flex h-9 shrink-0 items-center gap-1 rounded-full border border-border bg-bg px-2.5 text-xs font-medium text-ink/60 transition-colors hover:bg-white hover:text-ink disabled:cursor-not-allowed disabled:opacity-30"
-          >
-            <span aria-hidden>📎</span>
-            <span>{attachments.length}</span>
-            <span className="text-[10px] text-ink/40" aria-hidden>
-              {attachmentsOpen ? "⌃" : "⌄"}
-            </span>
-          </button>
-        )}
-
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={isUploading ? "Preparing your file…" : placeholder}
-          rows={1}
-          disabled={composerDisabled}
-          className="min-h-[44px] max-h-[40vh] flex-1 resize-none overflow-y-hidden bg-transparent px-1 py-1.5 text-sm leading-6 outline-none placeholder:text-ink/40"
-        />
-
-        {isStreaming ? (
-          <button
-            type="button"
-            onClick={onStop}
-            aria-label="Stop generating"
-            title="Stop generating"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-xs text-white transition-opacity hover:opacity-90"
-          >
-            ■
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={submit}
-            disabled={composerDisabled || !value.trim()}
-            aria-label="Send message"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-ink text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-20"
-          >
-            ↑
-          </button>
-        )}
-      </div>
+  return <div className="rounded-[18px] border border-[#dce5ef] bg-white shadow-[0_5px_24px_rgba(42,74,110,0.07)] transition-shadow focus-within:border-[#a9c9ed] focus-within:shadow-[0_7px_28px_rgba(42,111,190,0.10)]">
+    {hasPendingFile && pendingQueueCount > 0 && <div className="border-b border-[#edf1f6] px-4 py-2 text-[11px] text-[#73879d]"><span className="mr-2 inline-block h-1.5 w-1.5 rounded-full bg-[#2d73bf]" />{pendingQueueCount} more file{pendingQueueCount === 1 ? "" : "s"} waiting to be prepared</div>}
+    {attachmentsOpen && attachments.length > 0 && <div id="privy-attachment-details" className="border-b border-[#e5ebf2] bg-[#f8fbff] px-3 py-3"><div className="grid gap-2 sm:grid-cols-2">{attachments.map((attachment) => <div key={attachment.fileId} className="flex min-w-0 items-center gap-2.5 rounded-xl border border-[#dce5ef] bg-white px-3 py-2.5"><div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#edf4fd] text-[#4e7092]"><Icon name="file" className="h-4 w-4" /></div><div className="min-w-0 flex-1"><p className="truncate text-[11px] font-semibold text-[#294663]" title={attachment.filename}>{attachment.filename}</p><p className="mt-0.5 text-[10px] text-[#8295aa]">{attachment.filename.split(".").pop()?.toUpperCase()} · {attachment.maskedCount.toLocaleString()} values masked</p></div><div className="flex shrink-0 items-center gap-0.5">{onEditFile && <button type="button" onClick={() => onEditFile(attachment.fileId)} disabled={composerDisabled} className="rounded-lg px-2 py-1.5 text-[10px] font-medium text-[#58718c] hover:bg-[#edf4fd] disabled:opacity-30">{attachment.canEdit ? "Edit" : "Re-attach"}</button>}{onRemoveFile && <button type="button" onClick={() => onRemoveFile(attachment.fileId)} disabled={composerDisabled} aria-label={`Remove ${attachment.filename}`} className="flex h-7 w-7 items-center justify-center rounded-lg text-[#93a1b0] hover:bg-[#edf4fd] hover:text-[#294663] disabled:opacity-30">×</button>}</div></div>)}</div></div>}
+    <div className="flex items-end gap-1.5 p-2">
+      <input ref={fileInputRef} type="file" multiple accept=".csv,.xlsx,.xls" className="hidden" onChange={handleFileChange} />
+      <button type="button" onClick={() => fileInputRef.current?.click()} disabled={composerDisabled} aria-label="Attach files" title={`Attach up to ${MAX_FILES_PER_SELECTION} files at a time`} className="privy-focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-[#72869d] hover:bg-[#edf4fd] hover:text-[#285b8f] disabled:opacity-30"><Icon name="plus" className="h-[17px] w-[17px]" /></button>
+      {attachments.length > 0 && <button type="button" onClick={() => setAttachmentsOpen((open) => !open)} disabled={composerDisabled} aria-expanded={attachmentsOpen} aria-controls="privy-attachment-details" title={`${attachments.length} file${attachments.length === 1 ? "" : "s"} attached · ${totalMasked.toLocaleString()} values masked`} className="privy-focus-ring flex h-8 shrink-0 items-center gap-1 rounded-lg bg-[#f1f5f9] px-2 text-[10px] font-semibold text-[#61778f] hover:text-[#294663] disabled:opacity-30"><Icon name="paperclip" className="h-3 w-3" /><span>{attachments.length}</span><Icon name="chevron" className={`h-2.5 w-2.5 transition-transform ${attachmentsOpen ? "rotate-180" : ""}`} /></button>}
+      <textarea ref={textareaRef} value={value} onChange={(e) => setValue(e.target.value)} onKeyDown={handleKeyDown} placeholder={isUploading ? "Preparing your file…" : placeholder} rows={1} disabled={composerDisabled} className="privy-focus-ring min-h-[42px] max-h-[25vh] flex-1 resize-none overflow-y-hidden bg-transparent px-1.5 py-2 text-[13px] leading-6 text-[#304965] outline-none placeholder:text-[#9aa9b8]" />
+      {isStreaming ? <button type="button" onClick={onStop} aria-label="Stop generating" title="Stop generating" className="privy-focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#17385f] text-white hover:opacity-90"><Icon name="stop" className="h-3 w-3" /></button> : <button type="button" onClick={submit} disabled={composerDisabled || !value.trim()} aria-label="Send message" className="privy-focus-ring flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#17385f] text-white shadow-sm transition-opacity hover:opacity-90 disabled:bg-[#dce3eb] disabled:text-[#9aa8b7]"><Icon name="send" className="h-[15px] w-[15px]" /></button>}
     </div>
-  );
+  </div>;
 }

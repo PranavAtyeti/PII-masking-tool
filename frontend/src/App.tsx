@@ -709,8 +709,8 @@ export default function App() {
 
   if (authLoading) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink">
-        <div className="text-sm text-ink/60">Loading Privy…</div>
+      <div className="flex h-screen w-screen items-center justify-center bg-[#f7faff] text-[#203653]">
+        <div className="text-[14px] text-[#8295aa]">Loading Privy…</div>
       </div>
     );
   }
@@ -733,11 +733,11 @@ export default function App() {
             Privy couldn't sign you in
           </p>
 
-          <p className="text-sm text-ink/60">
+          <p className="text-[14px] text-[#8295aa]">
             {loadError}
           </p>
 
-          <p className="mt-4 text-sm text-ink/60">
+          <p className="mt-4 text-[14px] text-[#8295aa]">
             Check the FastAPI terminal for the exact error, then reload the
             page.
           </p>
@@ -745,7 +745,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => window.location.reload()}
-            className="mt-5 rounded-xl bg-ink px-4 py-2 text-sm font-medium text-white hover:opacity-90"
+            className="mt-5 rounded-xl bg-[#17385f] px-4 py-2.5 text-[13px] font-medium text-white hover:opacity-90"
           >
             Reload
           </button>
@@ -756,8 +756,8 @@ export default function App() {
 
   if (!backendAuthReady) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-bg text-ink">
-        <div className="text-sm text-ink/60">Signing you in…</div>
+      <div className="flex h-screen w-screen items-center justify-center bg-[#f7faff] text-[#203653]">
+        <div className="text-[14px] text-[#8295aa]">Signing you in…</div>
       </div>
     );
   }
@@ -807,6 +807,8 @@ export default function App() {
         models={models}
         selectedModelId={selectedModelId}
         onModelChange={handleModelChange}
+        onNewChat={handleNewChat}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       {currentUser?.role === "admin" && (

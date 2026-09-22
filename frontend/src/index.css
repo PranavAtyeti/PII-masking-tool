@@ -2,53 +2,23 @@
 @tailwind components;
 @tailwind utilities;
 
-html,
-body,
-#root {
-  height: 100%;
-}
-
-body {
-  @apply bg-bg text-ink font-sans antialiased;
-}
-
-h1,
-h2,
-h3 {
-  @apply font-display;
-}
-
-/* Streaming cursor -- a small pulsing bar at the end of an in-progress
-   assistant message, the thing Streamlit's request/response model could
-   never really do. This is one of the few genuinely new visual elements
-   in this pass, not a port of something that already existed. */
-@keyframes blink {
-  0%, 49% { opacity: 1; }
-  50%, 100% { opacity: 0; }
-}
-.stream-cursor {
-  display: inline-block;
-  width: 2px;
-  height: 1em;
-  background: currentColor;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: blink 1s step-start infinite;
-}
-
-@keyframes stream-dot-pulse {
-  0%, 70%, 100% { opacity: 0.25; transform: translateY(0); }
-  35% { opacity: 1; transform: translateY(-1px); }
-}
-
-.stream-dot {
-  display: inline-block;
-  width: 3px;
-  height: 3px;
-  border-radius: 999px;
-  background: currentColor;
-  animation: stream-dot-pulse 1.1s ease-in-out infinite;
-}
-
-.stream-dot-2 { animation-delay: 0.14s; }
-.stream-dot-3 { animation-delay: 0.28s; }
+html, body, #root { height: 100%; }
+body { @apply font-sans antialiased; background: #fff; color: #203653; scrollbar-color: rgba(79,110,143,.22) transparent; scrollbar-width: thin; }
+* { box-sizing: border-box; }
+button, textarea, input { font: inherit; }
+button { -webkit-tap-highlight-color: transparent; }
+::selection { background: rgba(42,111,190,.14); color: #17385f; }
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(79,110,143,.18); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(79,110,143,.28); }
+@keyframes blink { 0%,49% {opacity:1} 50%,100% {opacity:0} }
+.stream-cursor { display:inline-block; width:2px; height:1em; margin-left:2px; vertical-align:text-bottom; background:currentColor; animation:blink 1s step-start infinite; }
+@keyframes stream-dot-pulse { 0%,70%,100% {opacity:.25; transform:translateY(0)} 35% {opacity:1; transform:translateY(-1px)} }
+.stream-dot { display:inline-block; width:4px; height:4px; border-radius:999px; background:currentColor; animation:stream-dot-pulse 1.1s ease-in-out infinite; }
+.stream-dot-2 { animation-delay:.14s; } .stream-dot-3 { animation-delay:.28s; }
+.markdown-content > :first-child { margin-top:0; } .markdown-content > :last-child { margin-bottom:0; }
+.markdown-content strong { font-weight:650; }
+.markdown-content a { color:#276fb7; text-underline-offset:3px; }
+.privy-focus-ring:focus-visible { outline:2px solid rgba(42,111,190,.32); outline-offset:2px; }
+@media (prefers-reduced-motion: reduce) { .stream-cursor,.stream-dot { animation:none; } * { scroll-behavior:auto!important; } }
