@@ -1,8 +1,11 @@
 """Ask questions against masked files with bounded conversation memory."""
 
+import csv
+import io
 import json
 import logging
 import os
+import re
 import time
 
 import requests
@@ -14,7 +17,7 @@ from ..auth import get_current_app_user
 from ..llm import LLMServiceError, stream_llm, get_model_config
 from ..prompts import build_privy_system_prompt
 from ..context_limits import MAX_TOTAL_FILE_CONTEXT_TOKENS, limit_file_context
-from ..gemini_files import get_or_upload_gemini_file
+from ..gemini_files import get_or_upload_gemini_file, upload_calculation_projection
 from ..gemini_interactions import (
     get_interaction_id,
     get_interaction_tool_mode,
@@ -29,8 +32,7 @@ from ..masking import (
     count_masked_tokens,
 )
 from ..schemas import MessageIn
-from ..logging_utils import elapsed_ms, log_event, new_request_id, reset_request_id, set_request_id
-
+from ..logging_utils import elapsed_ms, log_event, new_request_id, set_request_id
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,104 @@ _CODE_EXECUTION_PATTERNS = [
     r"\b(calculate|calculation|compute|computed|analyze|analysis)\b",
 ]
 
+
+
+def _normalize_column_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _resolve_calculation_columns(question: str, columns: list[str]) -> tuple[list[str], list[str]]:
+    """Resolve explicit column references without calculating anything locally."""
+    text = _normalize_column_name(question)
+    normalized = {_normalize_column_name(column): column for column in columns}
+
+    aliases = {
+        "dept": "department",
+        "departments": "department",
+        "salary": "salary",
+        "salaries": "salary",
+        "wage": "salary",
+        "wages": "salary",
+        "pay": "salary",
+        "debit": "debit",
+        "debits": "debit",
+        "credit": "credit",
+        "credits": "credit",
+        "amount": "amount",
+        "amounts": "amount",
+        "tax": "tax amount",
+        "taxes": "tax amount",
+    }
+
+    requested: list[str] = []
+    missing: list[str] = []
+
+    # First use exact dataset column names.
+    for norm_name, original in normalized.items():
+        if norm_name and re.search(rf"(?<![a-z0-9]){re.escape(norm_name)}(?![a-z0-9])", text):
+            requested.append(original)
+
+    # Then recognize common natural-language aliases.
+    for alias, canonical in aliases.items():
+        if not re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text):
+            continue
+        if canonical in normalized:
+            if normalized[canonical] not in requested:
+                requested.append(normalized[canonical])
+        elif alias not in {"dept", "departments", "salaries", "wage", "wages", "pay", "debits", "credits", "amounts", "tax", "taxes"}:
+            missing.append(alias)
+
+    # Grouping language commonly refers to a column without saying "by".
+    if re.search(r"\bby\s+department\b", text) and "department" in normalized:
+        if normalized["department"] not in requested:
+            requested.append(normalized["department"])
+
+    return requested, missing
+
+
+def _build_calculation_projection(question: str, chat_files: list[dict]) -> tuple[str | None, list[str], str | None]:
+    """Build a small masked CSV projection for Gemini Code Execution.
+
+    Privy only selects columns and serializes already-masked values here. The
+    actual arithmetic/aggregation remains entirely inside Gemini Code Execution.
+    """
+    if not chat_files:
+        return None, [], None
+
+    sections: list[str] = []
+    selected_union: list[str] = []
+
+    for chat_file in chat_files:
+        try:
+            metadata = json.loads(chat_file.get("columns_json") or "[]")
+        except (TypeError, ValueError):
+            metadata = []
+        columns = [
+            str(item.get("name")) if isinstance(item, dict) else str(item)
+            for item in metadata
+        ]
+        selected, missing = _resolve_calculation_columns(question, columns)
+        if missing:
+            return None, [], missing[0]
+        if not selected:
+            return None, [], None
+
+        for column in selected:
+            if column not in selected_union:
+                selected_union.append(column)
+
+        reader = csv.DictReader(io.StringIO(str(chat_file.get("masked_csv") or "")))
+        rows: list[dict[str, str]] = []
+        for row in reader:
+            rows.append({column: str(row.get(column) or "") for column in selected})
+
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=selected, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        sections.append(f"FILE: {chat_file['filename']}\n{output.getvalue()}")
+
+    return "\n\n".join(sections), selected_union, None
 
 def _requires_code_execution(question: str) -> bool:
     """Route deterministic/structured-data questions to Gemini Code Execution.
@@ -432,6 +532,10 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
                 return
 
     file_refs: list[dict] = []
+    calculation_projection = None
+    calculation_columns: list[str] = []
+    calculation_missing_column = None
+
     if external_files and chat_files:
         file_prepare_started = time.perf_counter()
         log_event(
@@ -441,26 +545,60 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             tool_mode=gemini_tool_mode,
         )
         try:
-            for chat_file in chat_files:
-                cached_file = get_or_upload_gemini_file(
-                    file_id=chat_file["file_id"],
-                    filename=chat_file["filename"],
-                    masked_csv=chat_file["masked_csv"],
-                    api_key=api_key,
+            if gemini_tool_mode == "code_execution":
+                calculation_projection, calculation_columns, calculation_missing_column = _build_calculation_projection(
+                    masked_question,
+                    chat_files,
                 )
-                file_refs.append(
-                    {
-                        "file_search_store_name": cached_file["store_name"],
-                        "content_sha256": cached_file.get("content_sha256", ""),
-                        "include_document": False,
-                        "file_uri": cached_file.get("file_uri", ""),
-                        "mime_type": cached_file.get("mime_type", "text/csv"),
-                    }
-                )
+                if calculation_missing_column:
+                    answer = (
+                        f"I can't calculate that because the attached file does not contain a "
+                        f"'{calculation_missing_column}' column."
+                    )
+                    yield _sse({"delta": answer})
+                    store.add_message(chat_id, "assistant", answer, masked_count)
+                    yield _sse({"done": True, "masked_count": masked_count})
+                    return
+
+                if calculation_projection:
+                    projection_file = upload_calculation_projection(
+                        filename=chat_files[0]["filename"],
+                        masked_csv=calculation_projection,
+                        api_key=api_key,
+                    )
+                    file_refs.append(
+                        {
+                            "file_uri": projection_file["file_uri"],
+                            "mime_type": projection_file.get("mime_type", "text/csv"),
+                            "include_document": True,
+                            "content_sha256": projection_file.get("content_sha256", ""),
+                            "calculation_projection": True,
+                            "calculation_columns": calculation_columns,
+                        }
+                    )
+            else:
+                for chat_file in chat_files:
+                    cached_file = get_or_upload_gemini_file(
+                        file_id=chat_file["file_id"],
+                        filename=chat_file["filename"],
+                        masked_csv=chat_file["masked_csv"],
+                        api_key=api_key,
+                    )
+                    file_refs.append(
+                        {
+                            "file_search_store_name": cached_file["store_name"],
+                            "content_sha256": cached_file.get("content_sha256", ""),
+                            "include_document": False,
+                            "file_uri": cached_file.get("file_uri", ""),
+                            "mime_type": cached_file.get("mime_type", "text/csv"),
+                        }
+                    )
             log_event(
                 logger,
                 "gemini_file_prepare_complete",
                 file_count=len(file_refs),
+                tool_mode=gemini_tool_mode,
+                calculation_columns=calculation_columns,
                 duration_ms=elapsed_ms(file_prepare_started),
             )
         except RuntimeError as e:
@@ -485,11 +623,15 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
     interaction_state: dict = {}
     if provider == "gemini":
         interaction_lookup_started = time.perf_counter()
-        interaction_id = get_interaction_id(
-            chat_id,
-            model,
-            file_refs,
-            message_count=len(previous_messages),
+        interaction_id = (
+            None
+            if gemini_tool_mode == "code_execution"
+            else get_interaction_id(
+                chat_id,
+                model,
+                file_refs,
+                message_count=len(previous_messages),
+            )
         )
         log_event(
             logger,
@@ -512,9 +654,8 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         # Code Execution for the first time. Subsequent Code Execution turns
         # reuse the document carried in the prior stateful interaction.
         if gemini_tool_mode == "code_execution":
-            attach_document = previous_tool_mode != "code_execution"
             for file_ref in file_refs:
-                file_ref["include_document"] = attach_document
+                file_ref["include_document"] = True
 
         # Rebuild local masked history only when Gemini does not already have a
         # valid stateful chain. This keeps later requests small while still
@@ -578,6 +719,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             file_refs=file_refs,
             interaction_id=interaction_id,
             interaction_state=interaction_state,
+            tool_mode=gemini_tool_mode,
         )
         unmask_started = time.perf_counter()
         for piece in stream_unmask(raw_chunks, chat_id):
@@ -713,8 +855,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
 
 
 def _generate(chat_id: str, body: MessageIn, user_id: str):
+    # The StreamingResponse body is consumed after the endpoint function has
+    # returned. Resetting a ContextVar token in this generator can therefore
+    # happen in a different execution context and raise ValueError after an
+    # otherwise successful response. Set the correlation id for this generator
+    # and let its short-lived streaming task discard the context naturally.
     request_id = new_request_id()
-    token = set_request_id(request_id)
+    set_request_id(request_id)
     started = time.perf_counter()
     log_event(
         logger,
@@ -732,7 +879,6 @@ def _generate(chat_id: str, body: MessageIn, user_id: str):
             chat_id=chat_id,
             duration_ms=elapsed_ms(started),
         )
-        reset_request_id(token)
 
 
 @router.post("/{chat_id}/messages")

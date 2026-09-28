@@ -236,6 +236,50 @@ def _upload_raw_file(
     return active_file
 
 
+
+def upload_calculation_projection(
+    *,
+    filename: str,
+    masked_csv: str,
+    api_key: str,
+) -> dict[str, Any]:
+    """Upload a small masked calculation projection for one Gemini turn.
+
+    This is intentionally separate from the persistent full-file cache. The
+    projection contains only columns needed for the current calculation, so
+    Gemini Code Execution does not receive the entire 15-column dataset.
+    """
+    started = time.perf_counter()
+    digest = _content_hash(masked_csv)
+    display_name = f"privy-calc-{digest[:16]}-{filename[:32]}.csv"
+    log_event(
+        logger,
+        "gemini_calculation_projection_upload_start",
+        bytes=len(masked_csv.encode("utf-8")),
+        content_sha256=digest[:16],
+    )
+    file_obj = _upload_raw_file(
+        masked_csv=masked_csv,
+        display_name=display_name,
+        api_key=api_key,
+    )
+    file_uri = str(file_obj.get("uri") or "")
+    if not file_uri:
+        raise RuntimeError("Gemini calculation projection upload did not return a file URI")
+    result = {
+        "file_uri": file_uri,
+        "mime_type": str(file_obj.get("mimeType") or "text/csv"),
+        "content_sha256": digest,
+        "file_name": str(file_obj.get("name") or ""),
+    }
+    log_event(
+        logger,
+        "gemini_calculation_projection_upload_complete",
+        duration_ms=elapsed_ms(started),
+        bytes=len(masked_csv.encode("utf-8")),
+    )
+    return result
+
 def _get_file(file_name: str, api_key: str) -> dict[str, Any]:
     response = requests.get(
         f"{GEMINI_API_ROOT}/{file_name}",
