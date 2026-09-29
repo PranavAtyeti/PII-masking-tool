@@ -2,7 +2,7 @@ export interface AuthUser {
   sub: string;
   email: string | null;
   display_name: string | null;
-  role: string;
+  role: "admin" | "user" | "guest";
   created_at: number;
   last_login_at: number;
   email_verified?: boolean;
@@ -61,11 +61,14 @@ export async function authHeaders(): Promise<Record<string, string>> {
   return guestSession ? { "X-Guest-Session": guestSession } : {};
 }
 
+const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const API_BASE = `${API_ORIGIN}/api`;
+
 export async function refreshAccessToken(): Promise<AuthResponse | null> {
   if (refreshPromise) return refreshPromise;
 
   refreshPromise = (async () => {
-    const response = await fetch("/api/auth/refresh", {
+    const response = await fetch(`${API_BASE}/auth/refresh`, {
       method: "POST",
       credentials: "include",
     });

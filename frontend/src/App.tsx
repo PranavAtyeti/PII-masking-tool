@@ -70,7 +70,7 @@ export default function App() {
 
   // Wire local JWT and guest-session credentials into the API layer.
   useEffect(() => {
-    setAccessTokenGetter(() => getAccessToken() ?? "");
+    setAccessTokenGetter(async () => getAccessToken() ?? "");
     setGuestSessionGetter(() => guestSessionId);
 
     return () => {
@@ -642,33 +642,6 @@ export default function App() {
             setIsStreaming(false);
             streamControllerRef.current = null;
             api.listChats().then(setChats).catch(() => {});
-          },
-
-          onSecurityWarning: (warning) => {
-            if (allowUnmaskedRisk) return;
-
-            const types = warning.findings
-              .map(
-                (finding) =>
-                  `${finding.type.replaceAll("_", " ")} (${finding.count})`
-              )
-              .join(", ");
-
-            const detail = types
-              ? `Detected: ${types}.`
-              : warning.message;
-
-            const proceed = window.confirm(
-              `${warning.message}\n\n${detail}\n\nSend to the selected model anyway?`
-            );
-
-            if (proceed) {
-              void runStream(true);
-            } else {
-              setMessages((prev) => prev.slice(0, -2));
-              setIsStreaming(false);
-              streamControllerRef.current = null;
-            }
           },
 
           onError: (message) => {
