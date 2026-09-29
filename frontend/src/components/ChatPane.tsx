@@ -35,10 +35,69 @@ interface ChatPaneProps {
   onOpenSettings?: () => void;
 }
 
-function ShieldIcon({ className = "h-4 w-4" }: { className?: string }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className={className} aria-hidden><path d="M12 3.5 19 6v5.1c0 4.6-2.9 7.8-7 9.4-4.1-1.6-7-4.8-7-9.4V6l7-2.5Z" /><path d="m9.3 12 1.8 1.8 3.7-4" /></svg>; }
-function SlidersIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" className="h-4 w-4" aria-hidden><path d="M4 7h16M4 17h16" /><circle cx="9" cy="7" r="2" fill="white" /><circle cx="15" cy="17" r="2" fill="white" /></svg>; }
-function MenuIcon() { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4" aria-hidden><path d="M5 7h14M5 12h14M5 17h14" /></svg>; }
-function FileIcon({ className = "h-4 w-4" }: { className?: string }) { return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" className={className} aria-hidden><path d="M6 4.5h8l4 4V20H6V4.5Z" /><path d="M14 4.5V9h4M9 13h6M9 16h4" /></svg>; }
+function ShieldIcon({ className = "h-4 w-4" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      className={className}
+      aria-hidden
+    >
+      <path d="M12 3.5 19 6v5.1c0 4.6-2.9 7.8-7 9.4-4.1-1.6-7-4.8-7-9.4V6l7-2.5Z" />
+      <path d="m9.3 12 1.8 1.8 3.7-4" />
+    </svg>
+  );
+}
+
+function SlidersIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      className="h-4 w-4"
+      aria-hidden
+    >
+      <path d="M4 7h16M4 17h16" />
+      <circle cx="9" cy="7" r="2" fill="white" />
+      <circle cx="15" cy="17" r="2" fill="white" />
+    </svg>
+  );
+}
+
+function MenuIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      className="h-4 w-4"
+      aria-hidden
+    >
+      <path d="M5 7h14M5 12h14M5 17h14" />
+    </svg>
+  );
+}
+
+function FileIcon({ className = "h-4 w-4" }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      className={className}
+      aria-hidden
+    >
+      <path d="M6 4.5h8l4 4V20H6V4.5Z" />
+      <path d="M14 4.5V9h4M9 13h6M9 16h4" />
+    </svg>
+  );
+}
 
 export function ChatPane({ messages, suggestions, attachments = [], isStreaming, isUploading, pendingFile, pendingColumns = [], pendingRowCount = 0, selectedColumns = [], useNerForFile = false, isEditingFile = false, onSelectedColumnsChange, onUseNerForFileChange, onCancelFile, onApplyFile, onEditFile, onRemoveFile, onStop, onSend, onUploadFiles, pendingQueueCount = 0, models = [], selectedModelId = "", onModelChange, onNewChat, onOpenSettings }: ChatPaneProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -64,7 +123,26 @@ export function ChatPane({ messages, suggestions, attachments = [], isStreaming,
         {suggestions.length > 0 && <div className="mt-7 w-full max-w-2xl"><SuggestionChips suggestions={suggestions} onPick={onSend} /></div>}
         <div className="mt-7 flex items-center gap-1.5 text-[10px] text-[#7890a8]"><ShieldIcon className="h-3 w-3 text-[#2f72bb]" /><span>Your data is protected. Sensitive values are masked before AI processing.</span></div>
       </div> : <div className="mx-auto w-full max-w-4xl px-5 pb-8 pt-6 sm:px-8">
-        {attachments.length > 0 && <div className="mb-6 flex items-center gap-2.5 border-b border-[#eef2f7] pb-3"><FileIcon className="text-[#55708d]" /><div><p className="text-[11px] font-semibold text-[#294663]">{attachments[0]?.filename}{attachments.length > 1 ? ` + ${attachments.length - 1} more` : ""}</p><p className="text-[9px] text-[#8a9bad]">Protected file · {attachments.length} file{attachments.length === 1 ? "" : "s"}</p></div></div>}
+        {attachments.length > 0 && (
+          <div className="mb-6 flex min-w-0 items-center gap-3 border-b border-[#eef2f7] pb-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#edf4fd] text-[#55708d]">
+              <FileIcon className="h-4 w-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p
+                className="truncate text-[11px] font-semibold text-[#294663]"
+                title={attachments[0]?.filename}
+              >
+                {attachments[0]?.filename}
+                {attachments.length > 1 ? ` + ${attachments.length - 1} more` : ""}
+              </p>
+              <p className="mt-0.5 text-[9px] text-[#8a9bad]">
+                Protected file · {attachments.length} file
+                {attachments.length === 1 ? "" : "s"}
+              </p>
+            </div>
+          </div>
+        )}
         <div className="flex flex-col gap-9">{messages.map((message, index) => <MessageBubble key={index} message={message} isStreaming={isStreaming && index === messages.length - 1 && message.role === "assistant"} />)}</div>
       </div>}
     </div>
