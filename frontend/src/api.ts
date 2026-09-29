@@ -16,7 +16,13 @@ import {
   refreshAccessToken,
 } from "./auth";
 
-const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const API_ORIGIN = (
+  (import.meta as ImportMeta & {
+    env?: {
+      VITE_API_BASE_URL?: string;
+    };
+  }).env?.VITE_API_BASE_URL ?? ""
+).replace(/\/$/, "");
 const BASE = `${API_ORIGIN}/api`;
 
 async function authedFetch(

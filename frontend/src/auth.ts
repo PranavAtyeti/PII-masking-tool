@@ -61,7 +61,13 @@ export async function authHeaders(): Promise<Record<string, string>> {
   return guestSession ? { "X-Guest-Session": guestSession } : {};
 }
 
-const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const API_ORIGIN = (
+  (import.meta as ImportMeta & {
+    env?: {
+      VITE_API_BASE_URL?: string;
+    };
+  }).env?.VITE_API_BASE_URL ?? ""
+).replace(/\/$/, "");
 const API_BASE = `${API_ORIGIN}/api`;
 
 export async function refreshAccessToken(): Promise<AuthResponse | null> {
