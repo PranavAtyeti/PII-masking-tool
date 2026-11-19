@@ -8,6 +8,14 @@ os.environ.setdefault("DATABASE_URL", "sqlite://")
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pandas as pd
+from fastapi import HTTPException
+
+from app.privacy_policy import (
+    build_outbound_csv,
+    policy_json,
+    validate_policy,
+)
+from app.crypto import decrypt_text, encrypt_text, generate_key, is_encrypted
 
 from app import masking
 
@@ -75,6 +83,85 @@ class MaskingBatchTests(unittest.TestCase):
         self.assertEqual(len(self.ner_inputs[0]), 1)
         self.assertEqual(len(self.tokens), 2)
         self.assertIn("rohan@example.com", known_values)
+
+    def test_privacy_policy_exclude_and_confirmed_sensitive_share(self):
+        policy = validate_policy(
+            ["Email", "Department", "Salary", "Notes"],
+            {
+                "Email": "EMAIL",
+                "Department": None,
+                "Salary": "AMOUNT",
+                "Notes": None,
+            },
+            {
+                "Email": {"action": "share", "share_confirmed": True},
+                "Department": {"action": "share", "share_confirmed": False},
+                "Salary": {"action": "share", "share_confirmed": False},
+                "Notes": {"action": "exclude", "share_confirmed": False},
+            },
+        )
+        csv_text = "Email,Department,Salary,Notes\nrohan@example.com,Engineering,95000,secret\n"
+        outbound = build_outbound_csv(csv_text, policy)
+        self.assertIn("rohan@example.com", outbound)
+        self.assertIn("Department", outbound)
+        self.assertIn("Salary", outbound)
+        self.assertNotIn("Notes", outbound)
+        self.assertNotIn("secret", outbound)
+        self.assertIn('"columns"', policy_json(policy))
+
+    def test_sensitive_share_requires_confirmation(self):
+        with self.assertRaises(HTTPException) as context:
+            validate_policy(
+                ["Bank Account"],
+                {"Bank Account": "ID"},
+                {"Bank Account": {"action": "share", "share_confirmed": False}},
+            )
+        self.assertEqual(context.exception.status_code, 422)
+
+    def test_masked_output_rejects_unmasked_pii(self):
+        policy = {
+            "Email": {
+                "action": "mask",
+                "share_confirmed": False,
+                "sensitive": True,
+            }
+        }
+        with self.assertRaises(HTTPException):
+            build_outbound_csv(
+                "Email\nrohan@example.com\n",
+                policy,
+            )
+
+
+class EncryptionTests(unittest.TestCase):
+    def setUp(self):
+        os.environ["PRIVY_ENVIRONMENT"] = "development"
+        os.environ["PRIVY_ENCRYPTION_KEY"] = generate_key()
+
+    def tearDown(self):
+        os.environ.pop("PRIVY_ENCRYPTION_KEY", None)
+
+    def test_encryption_round_trip_and_unique_ciphertext(self):
+        first = encrypt_text("Rohan Mehta", aad="test:a")
+        second = encrypt_text("Rohan Mehta", aad="test:a")
+        self.assertTrue(is_encrypted(first))
+        self.assertNotEqual(first, second)
+        self.assertEqual(decrypt_text(first, aad="test:a"), "Rohan Mehta")
+
+    def test_tampering_is_rejected(self):
+        ciphertext = encrypt_text("Rohan Mehta", aad="test:a")
+        tampered = ciphertext[:-2] + ("A" if ciphertext[-1] != "A" else "B")
+        with self.assertRaises(Exception):
+            decrypt_text(tampered, aad="test:a")
+
+    def test_legacy_plaintext_remains_readable(self):
+        self.assertEqual(decrypt_text("legacy plaintext", aad="test:a"), "legacy plaintext")
+
+    def test_production_kms_requires_configuration(self):
+        os.environ["PRIVY_ENVIRONMENT"] = "production"
+        os.environ.pop("PRIVY_KMS_KEY_NAME", None)
+        with self.assertRaises(Exception):
+            encrypt_text("Rohan Mehta", aad="test:a")
 
 
 if __name__ == "__main__":

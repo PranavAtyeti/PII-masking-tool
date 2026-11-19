@@ -23,6 +23,23 @@ export interface ColumnInfo {
   name: string;
   type: string | null;
   enabled: boolean;
+  recommended_action: PrivacyAction;
+  sensitive: boolean;
+  reason: string;
+  action: PrivacyAction;
+  share_confirmed: boolean;
+}
+
+export type PrivacyAction = "share" | "mask" | "exclude";
+
+export interface ColumnPrivacyChoice {
+  action: PrivacyAction;
+  share_confirmed: boolean;
+}
+
+export interface PrivacyPolicy {
+  version?: number;
+  columns: Record<string, ColumnPrivacyChoice>;
 }
 
 export interface UploadPreviewResult {
@@ -38,6 +55,7 @@ export interface ChatFileInfo {
   truncated: boolean;
   masked_count: number;
   columns: ColumnInfo[];
+  privacy_policy: Record<string, ColumnPrivacyChoice>;
 }
 
 export interface UploadResult {
@@ -49,6 +67,7 @@ export interface UploadResult {
   columns: ColumnInfo[];
   masked_count: number;
   preview_csv: string;
+  privacy_policy: PrivacyPolicy;
 }
 
 export interface AdminConfig {

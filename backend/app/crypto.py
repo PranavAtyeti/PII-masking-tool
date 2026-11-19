@@ -19,6 +19,7 @@ import os
 from typing import Final
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from .key_management import get_key_provider
 
 _CIPHERTEXT_PREFIX: Final[str] = "v1"
 _KEY_ENV = "PRIVY_ENCRYPTION_KEY"
@@ -65,24 +66,30 @@ def _aad_bytes(aad: str | None) -> bytes | None:
 
 
 def encrypt_text(value: str, *, aad: str | None = None) -> str:
-    """Encrypt text and return a versioned ASCII-safe representation."""
+    """Envelope-encrypt text and return a versioned ASCII-safe representation."""
     if value is None:
         raise TypeError("encrypt_text() does not accept None")
-
-    key = _load_key()
+    provider = get_key_provider()
+    dek = AESGCM.generate_key(bit_length=256)
+    wrapped_dek, key_id = provider.wrap_dek(dek)
     nonce = os.urandom(_NONCE_BYTES)
-    ciphertext = AESGCM(key).encrypt(
+    ciphertext = AESGCM(dek).encrypt(
         nonce,
         str(value).encode("utf-8"),
         _aad_bytes(aad),
     )
+    encoded_wrapped = base64.urlsafe_b64encode(wrapped_dek).decode("ascii")
+    encoded_key_id = base64.urlsafe_b64encode(key_id.encode("utf-8")).decode("ascii")
     encoded_nonce = base64.urlsafe_b64encode(nonce).decode("ascii")
     encoded_ciphertext = base64.urlsafe_b64encode(ciphertext).decode("ascii")
-    return f"{_CIPHERTEXT_PREFIX}:{encoded_nonce}:{encoded_ciphertext}"
+    return f"v2:{encoded_wrapped}:{encoded_key_id}:{encoded_nonce}:{encoded_ciphertext}"
 
 
 def is_encrypted(value: str | None) -> bool:
-    return isinstance(value, str) and value.startswith(f"{_CIPHERTEXT_PREFIX}:")
+    return isinstance(value, str) and (
+        value.startswith(f"{_CIPHERTEXT_PREFIX}:")
+        or value.startswith("v2:")
+    )
 
 
 def decrypt_text(value: str, *, aad: str | None = None) -> str:
@@ -93,6 +100,30 @@ def decrypt_text(value: str, *, aad: str | None = None) -> str:
     """
     if not is_encrypted(value):
         return value
+
+    if value.startswith("v2:"):
+        parts = value.split(":", 4)
+        if len(parts) != 5:
+            raise EncryptionConfigurationError("Invalid Privy envelope format")
+        try:
+            wrapped_dek = base64.urlsafe_b64decode(parts[1].encode("ascii"))
+            key_id = base64.urlsafe_b64decode(parts[2].encode("ascii")).decode("utf-8")
+            nonce = base64.urlsafe_b64decode(parts[3].encode("ascii"))
+            ciphertext = base64.urlsafe_b64decode(parts[4].encode("ascii"))
+        except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+            raise EncryptionConfigurationError("Invalid Privy envelope encoding") from exc
+        try:
+            dek = get_key_provider().unwrap_dek(wrapped_dek, key_id)
+            plaintext = AESGCM(dek).decrypt(
+                nonce,
+                ciphertext,
+                _aad_bytes(aad),
+            )
+        except Exception as exc:
+            raise EncryptionConfigurationError(
+                "Privy could not decrypt stored application data."
+            ) from exc
+        return plaintext.decode("utf-8")
 
     parts = value.split(":", 2)
     if len(parts) != 3 or parts[0] != _CIPHERTEXT_PREFIX:
@@ -124,6 +155,25 @@ def decrypt_text(value: str, *, aad: str | None = None) -> str:
 
 def lookup_digest(session_id: str, value_norm: str) -> str:
     """Create a keyed blind index for a normalized token value."""
-    key = _load_key()
+    environment = os.getenv("PRIVY_ENVIRONMENT", "development").strip().lower()
+    blind_key = os.getenv("PRIVY_BLIND_INDEX_KEY", "").strip()
+    if blind_key:
+        try:
+            padded = blind_key + "=" * (-len(blind_key) % 4)
+            key = base64.urlsafe_b64decode(padded.encode("ascii"))
+        except (ValueError, binascii.Error) as exc:
+            raise EncryptionConfigurationError(
+                "PRIVY_BLIND_INDEX_KEY is not valid URL-safe base64."
+            ) from exc
+        if len(key) != _KEY_BYTES:
+            raise EncryptionConfigurationError(
+                "PRIVY_BLIND_INDEX_KEY must decode to exactly 32 bytes."
+            )
+    elif environment in {"production", "prod"}:
+        raise EncryptionConfigurationError(
+            "PRIVY_BLIND_INDEX_KEY is required in production."
+        )
+    else:
+        key = _load_key()
     message = f"{session_id}\x1f{value_norm}".encode("utf-8")
     return hmac.new(key, message, hashlib.sha256).hexdigest()

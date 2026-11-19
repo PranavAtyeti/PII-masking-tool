@@ -31,6 +31,7 @@ from ..masking import (
     looks_unmasked,
     count_masked_tokens,
 )
+from ..privacy_policy import build_outbound_csv, load_policy, validate_outbound_text
 from ..schemas import MessageIn
 from ..logging_utils import elapsed_ms, log_event, new_request_id, set_request_id
 logger = logging.getLogger(__name__)
@@ -134,9 +135,12 @@ def _build_calculation_projection(question: str, chat_files: list[dict]) -> tupl
             metadata = json.loads(chat_file.get("columns_json") or "[]")
         except (TypeError, ValueError):
             metadata = []
+        policy, legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
         columns = [
             str(item.get("name")) if isinstance(item, dict) else str(item)
             for item in metadata
+            if (str(item.get("name")) if isinstance(item, dict) else str(item)) in policy
+            and policy[(str(item.get("name")) if isinstance(item, dict) else str(item))].get("action") != "exclude"
         ]
         selected, missing = _resolve_calculation_columns(question, columns)
         if missing:
@@ -148,7 +152,10 @@ def _build_calculation_projection(question: str, chat_files: list[dict]) -> tupl
             if column not in selected_union:
                 selected_union.append(column)
 
-        reader = csv.DictReader(io.StringIO(str(chat_file.get("masked_csv") or "")))
+        safe_csv = build_outbound_csv(
+            str(chat_file.get("masked_csv") or ""), policy, legacy=legacy
+        )
+        reader = csv.DictReader(io.StringIO(safe_csv))
         rows: list[dict[str, str]] = []
         for row in reader:
             rows.append({column: str(row.get(column) or "") for column in selected})
@@ -157,7 +164,7 @@ def _build_calculation_projection(question: str, chat_files: list[dict]) -> tupl
         writer = csv.DictWriter(output, fieldnames=selected, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
-        sections.append(f"FILE: {chat_file['filename']}\n{output.getvalue()}")
+        sections.append(f"FILE: dataset_{str(chat_file['file_id'])[:8]}\n{output.getvalue()}")
 
     return "\n\n".join(sections), selected_union, None
 
@@ -208,17 +215,31 @@ def _get_active_llm_config(model_id: str | None = None):
     return provider, api_key, model
 
 
-def _mask_history(messages: list[dict], known_values: dict) -> list[dict]:
-    """Return recent chat history with known sensitive values tokenized."""
+def _mask_history(
+    messages: list[dict],
+    known_values: dict,
+    chat_id: str,
+    ner_confidence: float,
+    use_ner: bool,
+) -> list[dict]:
+    """Return recent chat history with known and newly detected values tokenized."""
     masked: list[dict] = []
     for message in messages[-MAX_HISTORY_MESSAGES:]:
         role = message.get("role")
         content = str(message.get("content") or "")
         if role not in {"user", "assistant"} or not content:
             continue
+        content = _replace_known_values(content, known_values)
+        content = mask_free_text_cell(
+            content,
+            chat_id,
+            store.load_counters(chat_id),
+            ner_confidence,
+            use_ner,
+        )
         masked.append({
             "role": role,
-            "content": _replace_known_values(content, known_values),
+            "content": content,
         })
     return masked
 
@@ -276,12 +297,13 @@ def _build_prompt(
         total_rows = 0
         any_truncated = False
 
-        for chat_file in chat_files:
+        for index, chat_file in enumerate(chat_files, start=1):
             total_rows += chat_file["row_count"]
             any_truncated = any_truncated or bool(chat_file["truncated"])
-            column_names = _parse_columns(chat_file)
+            file_policy, _legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
+            column_names = [name for name, choice in file_policy.items() if choice.get("action") != "exclude"]
             file_descriptions.append(
-                f"{chat_file['filename']} — {chat_file['row_count']:,} rows"
+                f"Dataset {index} — {chat_file['row_count']:,} rows"
                 + (f"; columns: {', '.join(column_names)}" if column_names else "")
             )
 
@@ -338,8 +360,10 @@ def _build_prompt(
         remaining_tokens = MAX_TOTAL_FILE_CONTEXT_TOKENS
 
         for index, chat_file in enumerate(chat_files, start=1):
+            file_policy, legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
+            safe_csv = build_outbound_csv(str(chat_file["masked_csv"]), file_policy, legacy=legacy)
             limited_csv, used_tokens, limited = limit_file_context(
-                chat_file["filename"], chat_file["masked_csv"], remaining_tokens
+                f"dataset_{index}.csv", safe_csv, remaining_tokens
             )
             if used_tokens <= 0:
                 context_was_limited = True
@@ -348,7 +372,7 @@ def _build_prompt(
             remaining_tokens = max(0, remaining_tokens - used_tokens)
             context_was_limited = context_was_limited or limited
             sections.append(
-                f"=== FILE {index}: {chat_file['filename']} ===\n{limited_csv}"
+                f"=== DATASET {index} ===\n{limited_csv}"
             )
 
             if remaining_tokens <= 0:
@@ -441,7 +465,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
 
     # Reuse mappings from the current chat so stored prior responses containing PII
     # are tokenized before being included in model context.
-    history = _mask_history(previous_messages, store.get_known_values(chat_id))
+    history = _mask_history(
+        previous_messages,
+        store.get_known_values(chat_id),
+        chat_id,
+        body.ner_confidence,
+        body.use_ner,
+    )
 
     provider_started = time.perf_counter()
     try:
@@ -492,7 +522,9 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
     max_tokens = CONCISE_MAX_OUTPUT_TOKENS if body.concise else DETAILED_MAX_OUTPUT_TOKENS
     masked_count = badge_attachment_count + count_masked_tokens(badge_payload)
 
-    if looks_unmasked(payload_to_check):
+    try:
+        validate_outbound_text(payload_to_check)
+    except HTTPException:
         log_event(
             logger,
             "outbound_privacy_blocked",
@@ -514,7 +546,17 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
     # during upload, so a future code path cannot send an unsafe cached dataset.
     if external_files and chat_files:
         for chat_file in chat_files:
-            if looks_unmasked(str(chat_file.get("masked_csv") or "")):
+            file_policy, legacy = load_policy(
+                chat_file.get("privacy_policy_json"),
+                chat_file.get("columns_json"),
+            )
+            try:
+                build_outbound_csv(
+                    str(chat_file.get("masked_csv") or ""),
+                    file_policy,
+                    legacy=legacy,
+                )
+            except HTTPException:
                 log_event(
                     logger,
                     "outbound_privacy_blocked",
@@ -562,7 +604,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
 
                 if calculation_projection:
                     projection_file = upload_calculation_projection(
-                        filename=chat_files[0]["filename"],
+                        filename="dataset.csv",
                         masked_csv=calculation_projection,
                         api_key=api_key,
                     )
@@ -578,11 +620,14 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
                     )
             else:
                 for chat_file in chat_files:
+                    file_policy, legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
+                    safe_csv = build_outbound_csv(str(chat_file["masked_csv"]), file_policy, legacy=legacy)
                     cached_file = get_or_upload_gemini_file(
                         file_id=chat_file["file_id"],
-                        filename=chat_file["filename"],
-                        masked_csv=chat_file["masked_csv"],
+                        filename=f"privy-{chat_file['file_id']}.csv",
+                        masked_csv=safe_csv,
                         api_key=api_key,
+                        privacy_validated=True,
                     )
                     file_refs.append(
                         {
@@ -681,7 +726,9 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
 
     # Final pre-send prompt gate. This intentionally runs after interaction-state
     # reconstruction because that is the exact prompt that will be sent.
-    if looks_unmasked(payload_to_check):
+    try:
+        validate_outbound_text(payload_to_check)
+    except HTTPException:
         log_event(
             logger,
             "outbound_privacy_blocked",

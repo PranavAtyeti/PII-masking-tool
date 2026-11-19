@@ -60,6 +60,11 @@ class ColumnInfo(BaseModel):
     name: str
     type: str | None
     enabled: bool
+    recommended_action: str = "share"
+    sensitive: bool = False
+    reason: str = ""
+    action: str = "share"
+    share_confirmed: bool = False
 
 
 class ChatFileInfo(BaseModel):
@@ -69,6 +74,7 @@ class ChatFileInfo(BaseModel):
     truncated: bool
     masked_count: int
     columns: list[ColumnInfo]
+    privacy_policy: dict = Field(default_factory=dict)
 
 
 class UploadPreviewResult(BaseModel):

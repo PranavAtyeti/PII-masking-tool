@@ -251,7 +251,7 @@ def upload_calculation_projection(
     """
     started = time.perf_counter()
     digest = _content_hash(masked_csv)
-    display_name = f"privy-calc-{digest[:16]}-{filename[:32]}.csv"
+    display_name = f"privy-calc-{digest[:16]}.csv"
     log_event(
         logger,
         "gemini_calculation_projection_upload_start",
@@ -535,6 +535,7 @@ def get_or_upload_gemini_file(
     filename: str,
     masked_csv: str,
     api_key: str,
+    privacy_validated: bool = False,
 ) -> dict[str, Any]:
     """Return reusable Gemini resources for the current masked content.
 
@@ -547,7 +548,10 @@ def get_or_upload_gemini_file(
     """
     started = time.perf_counter()
 
-    if looks_unmasked(masked_csv):
+    # The exact policy projection is built centrally before this boundary.
+    # Privacy validation must be explicit; a caller cannot accidentally upload
+    # raw stored datasets by omitting the marker.
+    if not privacy_validated:
         log_event(
             logger,
             "gemini_outbound_file_blocked",

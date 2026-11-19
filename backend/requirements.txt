@@ -18,6 +18,7 @@ alembic>=1.16,<2
 
 # GCP (object storage / encryption — currently on hold per project status)
 google-cloud-storage>=2.18,<4
+google-cloud-kms>=2.20,<3
 cryptography>=43,<47
 
 argon2-cffi>=25.1.0

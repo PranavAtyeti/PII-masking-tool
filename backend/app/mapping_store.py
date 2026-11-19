@@ -531,6 +531,7 @@ def set_chat_file(
     truncated: bool,
     masked_count: int = 0,
     file_id: str | None = None,
+    privacy_policy_json: str | None = None,
 ) -> str:
     """Create or replace one file attachment for a chat.
 
@@ -542,24 +543,36 @@ def set_chat_file(
     with SessionLocal() as db:
         row = db.get(ChatFile, resolved_file_id)
         if row:
-            row.filename = filename
-            row.masked_csv = masked_csv
-            row.columns_json = columns_json
+            if row.chat_id != chat_id:
+                raise ValueError("File does not belong to the requested chat")
+            row.filename = encrypt_text(filename, aad=f"chat-file:{resolved_file_id}:filename")
+            row.masked_csv = encrypt_text(masked_csv, aad=f"chat-file:{resolved_file_id}:masked_csv")
+            row.columns_json = encrypt_text(columns_json, aad=f"chat-file:{resolved_file_id}:columns")
             row.row_count = row_count
             row.truncated = truncated
             row.masked_count = masked_count
+            row.privacy_policy_json = (
+                encrypt_text(privacy_policy_json, aad=f"chat-file:{resolved_file_id}:privacy")
+                if privacy_policy_json
+                else None
+            )
             row.updated_at = now
         else:
             db.add(
                 ChatFile(
                     file_id=resolved_file_id,
                     chat_id=chat_id,
-                    filename=filename,
-                    masked_csv=masked_csv,
-                    columns_json=columns_json,
+                    filename=encrypt_text(filename, aad=f"chat-file:{resolved_file_id}:filename"),
+                    masked_csv=encrypt_text(masked_csv, aad=f"chat-file:{resolved_file_id}:masked_csv"),
+                    columns_json=encrypt_text(columns_json, aad=f"chat-file:{resolved_file_id}:columns"),
                     row_count=row_count,
                     truncated=truncated,
                     masked_count=masked_count,
+                    privacy_policy_json=(
+                        encrypt_text(privacy_policy_json, aad=f"chat-file:{resolved_file_id}:privacy")
+                        if privacy_policy_json
+                        else None
+                    ),
                     created_at=now,
                     updated_at=now,
                 )
@@ -578,9 +591,14 @@ def get_chat_files(chat_id: str) -> list[dict]:
         return [
             {
                 "file_id": row.file_id,
-                "filename": row.filename,
-                "masked_csv": row.masked_csv,
-                "columns_json": row.columns_json,
+                "filename": decrypt_text(row.filename, aad=f"chat-file:{row.file_id}:filename"),
+                "masked_csv": decrypt_text(row.masked_csv, aad=f"chat-file:{row.file_id}:masked_csv"),
+                "columns_json": decrypt_text(row.columns_json, aad=f"chat-file:{row.file_id}:columns"),
+                "privacy_policy_json": (
+                    decrypt_text(row.privacy_policy_json, aad=f"chat-file:{row.file_id}:privacy")
+                    if row.privacy_policy_json
+                    else None
+                ),
                 "row_count": row.row_count,
                 "truncated": bool(row.truncated),
                 "masked_count": row.masked_count,
@@ -611,9 +629,14 @@ def get_chat_file(chat_id: str, file_id: str | None = None):
             return None
         return {
             "file_id": row.file_id,
-            "filename": row.filename,
-            "masked_csv": row.masked_csv,
-            "columns_json": row.columns_json,
+            "filename": decrypt_text(row.filename, aad=f"chat-file:{row.file_id}:filename"),
+            "masked_csv": decrypt_text(row.masked_csv, aad=f"chat-file:{row.file_id}:masked_csv"),
+            "columns_json": decrypt_text(row.columns_json, aad=f"chat-file:{row.file_id}:columns"),
+            "privacy_policy_json": (
+                decrypt_text(row.privacy_policy_json, aad=f"chat-file:{row.file_id}:privacy")
+                if row.privacy_policy_json
+                else None
+            ),
             "row_count": row.row_count,
             "truncated": bool(row.truncated),
             "masked_count": row.masked_count,

@@ -20,7 +20,9 @@ COLUMN_HINTS = {
            "account no", "account number", "card number", "bank account",
            "account id", "tax id", "national id", "government id"],
     "DOB": ["dob", "date of birth", "birth date"],
-    "AMOUNT": ["salary", "income", "wage", "compensation", "ctc"],
+    "AMOUNT": ["salary", "income", "wage", "compensation", "ctc",
+               "debit", "credit", "transaction amount", "transaction",
+               "debit amount", "credit amount", "total amount"],
 }
 
 # Words that mark a header as "identifier-shaped" -- if present, an

@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from app.crypto import decrypt_text, encrypt_text, is_encrypted, lookup_digest
 from app.db import SessionLocal
-from app.models import ChatMessage, TokenEntry
+from app.models import ChatFile, ChatMessage, TokenEntry
 
 
 def migrate_token_entries(db) -> int:
@@ -71,15 +71,66 @@ def migrate_messages(db) -> int:
     return changed
 
 
+def migrate_chat_files(db, batch_size: int = 100) -> tuple[int, int]:
+    changed = 0
+    failed = 0
+    offset = 0
+    while True:
+        rows = db.scalars(
+            select(ChatFile).order_by(ChatFile.file_id).offset(offset).limit(batch_size)
+        ).all()
+        if not rows:
+            break
+        offset += batch_size
+        for row in rows:
+            try:
+                encrypted = False
+                if not is_encrypted(row.filename):
+                    row.filename = encrypt_text(
+                        row.filename,
+                        aad=f"chat-file:{row.file_id}:filename",
+                    )
+                    encrypted = True
+                if not is_encrypted(row.masked_csv):
+                    row.masked_csv = encrypt_text(
+                        row.masked_csv,
+                        aad=f"chat-file:{row.file_id}:masked_csv",
+                    )
+                    encrypted = True
+                if not is_encrypted(row.columns_json):
+                    row.columns_json = encrypt_text(
+                        row.columns_json,
+                        aad=f"chat-file:{row.file_id}:columns",
+                    )
+                    encrypted = True
+                if row.privacy_policy_json and not is_encrypted(row.privacy_policy_json):
+                    row.privacy_policy_json = encrypt_text(
+                        row.privacy_policy_json,
+                        aad=f"chat-file:{row.file_id}:privacy",
+                    )
+                    encrypted = True
+                if encrypted:
+                    changed += 1
+                    decrypt_text(row.filename, aad=f"chat-file:{row.file_id}:filename")
+                    decrypt_text(row.masked_csv, aad=f"chat-file:{row.file_id}:masked_csv")
+            except Exception:
+                db.rollback()
+                failed += 1
+        db.commit()
+    return changed, failed
+
+
 def main() -> None:
     with SessionLocal() as db:
         token_changes = migrate_token_entries(db)
         message_changes = migrate_messages(db)
+        file_changes, file_failures = migrate_chat_files(db)
         db.commit()
 
     print(
         "Phase 4 encryption migration complete: "
-        f"token_changes={token_changes}, message_changes={message_changes}"
+        f"token_changes={token_changes}, message_changes={message_changes}, "
+        f"file_changes={file_changes}, file_failures={file_failures}"
     )
 
 

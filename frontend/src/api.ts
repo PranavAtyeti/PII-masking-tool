@@ -262,7 +262,7 @@ export const api = {
     opts: {
       useNer: boolean;
       nerConfidence: number;
-      disabledColumns?: string[];
+      privacyPolicy: { columns: Record<string, { action: "share" | "mask" | "exclude"; share_confirmed: boolean }> };
       fileId?: string;
     }
   ): Promise<UploadResult> {
@@ -270,7 +270,7 @@ export const api = {
     form.append("file", file);
     form.append("use_ner", String(opts.useNer));
     form.append("ner_confidence", String(opts.nerConfidence));
-    form.append("disabled_columns", (opts.disabledColumns ?? []).join(","));
+    form.append("privacy_policy", JSON.stringify(opts.privacyPolicy));
 
     if (opts.fileId) {
       form.append("file_id", opts.fileId);

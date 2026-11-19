@@ -78,27 +78,55 @@ app = FastAPI(
 )
 
 
+class RequestBodyTooLarge(Exception):
+    pass
+
+
+class RequestBodyLimitMiddleware:
+    """Count actual ASGI request bytes; Content-Length is only an early hint."""
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        received = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise RequestBodyTooLarge()
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except RequestBodyTooLarge:
+            if not response_started:
+                response = JSONResponse(status_code=413, content={"detail": "Request is too large."})
+                await response(scope, receive, send)
+
+
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
+
+
 @app.middleware("http")
 async def request_id_and_size_middleware(request: Request, call_next):
     request_id = new_request_id()
     token = set_request_id(request_id)
     try:
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                body_size = int(content_length)
-            except ValueError:
-                body_size = 0
-            if body_size > MAX_REQUEST_BYTES:
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "detail": "Request is too large.",
-                        "request_id": request_id,
-                    },
-                    headers={"X-Request-ID": request_id},
-                )
-
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response

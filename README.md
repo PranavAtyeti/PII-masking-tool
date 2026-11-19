@@ -9,7 +9,7 @@ The supported application is a React frontend, a FastAPI backend, and PostgreSQL
 1. A user starts a chat and can attach CSV, XLS, or XLSX files.
 2. The backend reads the file, identifies likely sensitive columns, and masks enabled values locally.
 3. Structured values such as email addresses, phone numbers, PANs, Aadhaar-like numbers, card numbers, and IP addresses are found with deterministic patterns. Optional Presidio/spaCy NER adds coverage for names and locations in free text.
-4. Tokenized file context, message text, and recent chat history are sent to the selected model. A residual-PII check blocks payloads that still contain high-confidence structured PII.
+4. Tokenized file context, message text, and recent chat history are sent to the selected model. With Gemini, masked CSV data can be registered for File Search or Code Execution so the provider can retrieve from or analyse the protected dataset. A residual-PII check blocks payloads that still contain high-confidence structured PII.
 5. The streamed model response is unmasked for display. Token mappings, chats, messages, and file metadata are stored in PostgreSQL.
 
 Privy is a mitigation layer, not a certified anonymization or compliance solution. Review sensitive free text carefully: NER can miss entities, especially outside English or with unusual phrasing.
@@ -26,6 +26,7 @@ FastAPI
   |-- chat, upload, and streaming-message APIs
   |-- regex + optional Presidio/spaCy masking
   |-- model-provider client (Groq or Gemini)
+  |-- Gemini File Search and Code Execution for masked files
           |
           +--> PostgreSQL
           |
@@ -109,9 +110,9 @@ The development UI runs at `http://localhost:5173` and proxies `/api` requests t
 | `GEMINI_API_KEY`, `GEMINI_MODEL` | Gemini credentials and default model. |
 | `MODEL_TEMPERATURE` | Default generation temperature. |
 | `PRIVY_GUEST_MAX_FILES`, `PRIVY_GUEST_MAX_FILE_SIZE_MB` | Guest attachment limits. |
-| `PRIVY_MAX_CONTEXT_TOKENS_PER_FILE`, `PRIVY_MAX_TOTAL_FILE_CONTEXT_TOKENS` | Per-file and per-request masked-data context budgets. Defaults: 40,000 and 100,000 tokens. |
+| `PRIVY_MAX_CONTEXT_TOKENS_PER_FILE`, `PRIVY_MAX_TOTAL_FILE_CONTEXT_TOKENS` | Per-file and per-request masked-data context budgets. Defaults: 90,000 and 110,000 tokens. |
 | `PRIVY_MAX_HISTORY_MESSAGES` | Recent turns preserved for conversational continuity. Default: 32. |
-| `PRIVY_CONCISE_MAX_OUTPUT_TOKENS`, `PRIVY_DETAILED_MAX_OUTPUT_TOKENS` | Response budgets. Defaults: 600 and 4,000 tokens. |
+| `PRIVY_CONCISE_MAX_OUTPUT_TOKENS`, `PRIVY_DETAILED_MAX_OUTPUT_TOKENS` | Response budgets. Defaults: 2,048 and 16,384 tokens. |
 
 Never commit populated `.env` files or provider credentials. An administrator can manage the active model configuration in the application; the API never returns a full stored key.
 
@@ -122,6 +123,15 @@ Never commit populated `.env` files or provider credentials. An administrator ca
 - Column suggestions can be reviewed before a file is persisted as masked context.
 - NER is an optional **Enhanced free-text PII scan** when attaching a file with selected non-structured columns. It is disabled by default to keep large uploads responsive; regex detection remains active even when NER is disabled.
 - Large attachments are stored as masked CSV context and limited again before inclusion in a model request. The model must not be assumed to see every row when context is truncated.
+- When Gemini is selected, Privy can upload the **masked** CSV to Gemini Files and a File Search store. Files API objects are temporary; File Search stores persist until Privy removes them. No raw spreadsheet values are uploaded by this integration.
+
+## Conversation context and tool-assisted analysis
+
+Privy keeps up to 32 recent messages for continuity by default, and supports up to 90,000 masked tokens per file and 110,000 total masked file tokens per request. It also permits up to 2,048 output tokens for concise answers and 16,384 for detailed answers.
+
+These are application budgets, not a guarantee that every configured model supports the resulting request. Lower the values in `backend/.env` if a provider reports context-window, latency, or cost issues.
+
+For Gemini spreadsheet questions, Privy selects File Search for retrieval-oriented questions and Code Execution for calculations or data analysis. Both modes operate on the masked CSV only. Groq uses the standard chat-completions path and receives masked prompt context.
 
 ## Project structure
 
@@ -129,6 +139,9 @@ Never commit populated `.env` files or provider credentials. An administrator ca
 frontend/                   React, Vite, Tailwind, Auth0 UI
 backend/
   app/                      FastAPI application and masking pipeline
+    gemini_files.py          Gemini masked-file cache and File Search integration
+    gemini_interactions.py   Gemini conversation-chain cache
+    logging_utils.py          Structured, PII-safe timing and event logging
   migrations/               Alembic PostgreSQL migrations
   requirements.txt          Backend runtime dependencies
   requirements-postgres.txt PostgreSQL, SQLAlchemy, and Alembic dependencies

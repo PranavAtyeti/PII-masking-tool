@@ -17,6 +17,7 @@ import type {
   CurrentUser,
   Message,
   ModelOption,
+  ColumnPrivacyChoice,
 } from "./types";
 import { api } from "./api";
 import { AuthPanel } from "./components/AuthPanel";
@@ -32,6 +33,7 @@ import {
 interface LocalAttachment extends ChatAttachment {
   file: File | null;
   columns: ColumnInfo[];
+  privacyPolicy: Record<string, ColumnPrivacyChoice>;
 }
 
 export default function App() {
@@ -55,7 +57,7 @@ export default function App() {
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingColumns, setPendingColumns] = useState<ColumnInfo[]>([]);
   const [pendingRowCount, setPendingRowCount] = useState(0);
-  const [selectedColumns, setSelectedColumns] = useState<string[]>([]);
+  const [pendingPrivacyPolicy, setPendingPrivacyPolicy] = useState<Record<string, ColumnPrivacyChoice>>({});
   const [useNerForFile, setUseNerForFile] = useState(false);
   const [pendingFileId, setPendingFileId] = useState<string | null>(null);
   const [pendingFileQueue, setPendingFileQueue] = useState<File[]>([]);
@@ -209,7 +211,7 @@ export default function App() {
     setPendingFile(null);
     setPendingColumns([]);
     setPendingRowCount(0);
-    setSelectedColumns([]);
+    setPendingPrivacyPolicy({});
     setUseNerForFile(false);
     setPendingFileId(null);
     setPendingFileQueue([]);
@@ -245,6 +247,7 @@ export default function App() {
       canEdit: false,
       file: null,
       columns: fileInfo.columns,
+      privacyPolicy: fileInfo.privacy_policy ?? {},
     };
   }
 
@@ -364,9 +367,7 @@ export default function App() {
       setPendingFileId(null);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
-      setSelectedColumns(
-        preview.columns.filter((c) => c.type).map((c) => c.name)
-      );
+      setPendingPrivacyPolicy(Object.fromEntries(preview.columns.map((column) => [column.name, { action: column.recommended_action, share_confirmed: false }])));
       setUseNerForFile(false);
     } catch (e) {
       window.alert(
@@ -444,16 +445,8 @@ export default function App() {
       setPendingFileId(fileId);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
-
-      const enabledNames = attachment.columns
-        .filter((column) => column.enabled)
-        .map((column) => column.name);
-
-      setSelectedColumns(
-        enabledNames.length > 0
-          ? enabledNames
-          : preview.columns.filter((column) => column.type).map((c) => c.name)
-      );
+      const existingPolicy = attachment.privacyPolicy ?? {};
+      setPendingPrivacyPolicy(Object.fromEntries(preview.columns.map((column) => [column.name, existingPolicy[column.name] ?? { action: column.recommended_action, share_confirmed: false }])));
     } catch (e) {
       setIsEditingFile(false);
       window.alert(
@@ -501,7 +494,6 @@ export default function App() {
     if (
       !activeChatId ||
       !pendingFile ||
-      selectedColumns.length === 0 ||
       isUploading
     ) {
       return;
@@ -510,16 +502,10 @@ export default function App() {
     setIsUploading(true);
 
     try {
-      const selected = new Set(selectedColumns);
-
-      const disabledColumns = pendingColumns
-        .map((column) => column.name)
-        .filter((name) => !selected.has(name));
-
       const result = await api.uploadFile(activeChatId, pendingFile, {
         useNer: useNerForFile,
         nerConfidence: 0.6,
-        disabledColumns,
+        privacyPolicy: { columns: pendingPrivacyPolicy },
         fileId: pendingFileId ?? undefined,
       });
 
@@ -530,6 +516,7 @@ export default function App() {
         canEdit: true,
         file: pendingFile,
         columns: result.columns,
+        privacyPolicy: result.privacy_policy.columns,
       };
 
       setAttachments((prev) => {
@@ -549,7 +536,7 @@ export default function App() {
       setPendingFile(null);
       setPendingColumns([]);
       setPendingRowCount(0);
-      setSelectedColumns([]);
+      setPendingPrivacyPolicy({});
       setIsEditingFile(false);
 
       if (nextFile) {
@@ -764,10 +751,10 @@ export default function App() {
         pendingFile={pendingFile}
         pendingColumns={pendingColumns}
         pendingRowCount={pendingRowCount}
-        selectedColumns={selectedColumns}
+        privacyPolicy={pendingPrivacyPolicy}
         useNerForFile={useNerForFile}
         isEditingFile={isEditingFile}
-        onSelectedColumnsChange={setSelectedColumns}
+        onPrivacyPolicyChange={setPendingPrivacyPolicy}
         onUseNerForFileChange={setUseNerForFile}
         onCancelFile={clearPendingFileState}
         onApplyFile={handleApplyFile}

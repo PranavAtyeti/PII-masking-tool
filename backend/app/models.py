@@ -110,6 +110,7 @@ class ChatFile(Base):
     filename: Mapped[str] = mapped_column(String(512), nullable=False)
     masked_csv: Mapped[str] = mapped_column(Text, nullable=False)
     columns_json: Mapped[str] = mapped_column(Text, nullable=False)
+    privacy_policy_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     row_count: Mapped[int] = mapped_column(Integer, nullable=False)
     truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     masked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
