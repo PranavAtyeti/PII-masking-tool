@@ -1,16 +1,17 @@
 # Privy
 
-Privy is a privacy-focused AI chat application for conversations and spreadsheet analysis. It detects and tokenizes sensitive data before sending a prompt to a configured LLM provider, then restores the original values only in the response shown to the user.
+Privy is a privacy-focused AI chat application for conversations, spreadsheet analysis, and DOCX document retrieval. It detects and tokenizes sensitive data before sending a prompt to a configured LLM provider, then restores the original values only in the response shown to the user.
 
 The supported application is a React frontend, a FastAPI backend, and PostgreSQL.
 
 ## How it works
 
-1. A user starts a chat and can attach CSV, XLS, or XLSX files. Excel uploads include every worksheet.
+1. A user starts a chat and can attach CSV, XLS, XLSX, or DOCX files. Excel uploads include every worksheet.
 2. The backend preserves worksheet order and source rows, normalizes blank or duplicate headers, identifies likely sensitive columns, and masks selected values locally.
 3. Structured values such as email addresses, phone numbers, PANs, Aadhaar-like numbers, card numbers, and IP addresses are found with deterministic patterns. Optional Presidio/spaCy NER adds coverage for names and locations in free text.
 4. The selected Share/Mask/Exclude policy is persisted with the file. A shared privacy projection enforces that policy for local workbook tools and both providers: excluded columns are unavailable, masked values remain tokenized, and sensitive Share choices require explicit confirmation.
-5. The streamed model response is unmasked for display. Token mappings, chats, messages, and file metadata are stored in PostgreSQL.
+5. DOCX uploads are parsed locally into ordered paragraphs/headings and table rows. Retrieval sends only bounded, privacy-filtered excerpts to Gemini or Groq, with stable paragraph/table citations; complete documents are not uploaded and page numbers are not inferred.
+6. The streamed model response is unmasked for display. Token mappings, chats, messages, and file metadata are stored in PostgreSQL.
 
 Privy is a mitigation layer, not a certified anonymization or compliance solution. Review sensitive free text carefully: NER can miss entities, especially outside English or with unusual phrasing.
 
@@ -103,6 +104,8 @@ The development UI runs at `http://localhost:5173` and proxies `/api` requests t
 | `PRIVY_MAX_FILE_SIZE_BYTES`, `PRIVY_MAX_FILES_PER_CHAT` | Per-file byte limit and maximum attachments per chat. Defaults: 10 MiB and 10 files. |
 | `PRIVY_MAX_ROWS_PER_FILE`, `PRIVY_MAX_CELLS_PER_FILE` | Hard spreadsheet parsing limits. Defaults: 100,000 rows and 2,000,000 cells. |
 | `PRIVY_MAX_XLSX_ZIP_ENTRIES`, `PRIVY_MAX_XLSX_UNCOMPRESSED_BYTES`, `PRIVY_MAX_XLSX_ENTRY_BYTES`, `PRIVY_MAX_XLSX_COMPRESSION_RATIO` | XLSX archive-bomb protections. |
+| `PRIVY_MAX_DOCX_ZIP_ENTRIES`, `PRIVY_MAX_DOCX_UNCOMPRESSED_BYTES`, `PRIVY_MAX_DOCX_ENTRY_BYTES`, `PRIVY_MAX_DOCX_COMPRESSION_RATIO`, `PRIVY_MAX_DOCX_XML_BYTES` | DOCX archive and XML protections. Defaults: 5,000 entries, 50 MiB total decompressed, 10 MiB per entry/XML, and 200:1 maximum compression ratio. |
+| `PRIVY_MAX_DOCX_SECTIONS`, `PRIVY_MAX_DOCX_TEXT_CHARS` | Maximum extracted DOCX sections and text characters. Defaults: 100,000 and 10,000,000. |
 | `PRIVY_MAX_CONTEXT_TOKENS_PER_FILE`, `PRIVY_MAX_TOTAL_FILE_CONTEXT_TOKENS` | Per-file and per-request masked-data context budgets. Defaults: 90,000 and 110,000 tokens. |
 | `PRIVY_MAX_HISTORY_MESSAGES` | Recent turns preserved for conversational continuity. Default: 32. |
 | `PRIVY_ACTIVE_TURN_TIMEOUT_SECONDS` | Treat an in-progress turn older than this threshold as interrupted so a crashed worker can be retried. Default: 1,800 seconds. |

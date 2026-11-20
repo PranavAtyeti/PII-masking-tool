@@ -18,7 +18,19 @@ export interface Message {
     security_override?: boolean;
     usage?: ProviderUsage;
     error?: ProviderErrorMetadata;
+    sources?: DocumentSource[];
   };
+}
+
+export interface DocumentSource {
+  reference: string;
+  file_id: string;
+  display_filename: string;
+  heading_path: string[];
+  source_id: string;
+  kind: string;
+  order: number;
+  page_number: number | null;
 }
 
 export interface ProviderErrorMetadata {
@@ -101,6 +113,9 @@ export interface UploadPreviewResult {
   columns: ColumnInfo[];
   worksheet_count: number;
   worksheets: WorksheetInfo[];
+  file_format?: string;
+  section_count?: number;
+  warnings?: string[];
 }
 
 export interface ChatFileInfo {
@@ -113,6 +128,8 @@ export interface ChatFileInfo {
   privacy_policy: Record<string, ColumnPrivacyChoice>;
   worksheet_count: number;
   worksheets: WorksheetInfo[];
+  file_format?: string;
+  processing_status?: string;
 }
 
 export interface UploadResult {
@@ -127,6 +144,9 @@ export interface UploadResult {
   privacy_policy: PrivacyPolicy;
   worksheet_count: number;
   worksheets: WorksheetInfo[];
+  file_format?: string;
+  section_count?: number;
+  warnings?: string[];
 }
 
 export interface AdminConfig {

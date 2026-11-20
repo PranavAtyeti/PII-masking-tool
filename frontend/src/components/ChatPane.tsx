@@ -131,15 +131,21 @@ export function ChatPane({ messages, suggestions, attachments = [], isStreaming,
               <FileIcon className="h-4 w-4" />
             </div>
             <div className="min-w-0 flex-1">
-              <p
-                className="truncate text-[11px] font-semibold text-[#294663]"
-                title={attachments[0]?.filename}
-              >
-                {attachments[0]?.filename}
-                {attachments.length > 1 ? ` + ${attachments.length - 1} more` : ""}
-              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {attachments.map((attachment) => (
+                  <a
+                    key={attachment.fileId}
+                    id={`attachment-${attachment.fileId}`}
+                    href={`#attachment-${encodeURIComponent(attachment.fileId)}`}
+                    className="max-w-full truncate rounded-full bg-[#f4f8fc] px-2 py-1 text-[10px] font-semibold text-[#42688f] hover:bg-[#edf4fd]"
+                    title={attachment.filename}
+                  >
+                    {attachment.filename}
+                  </a>
+                ))}
+              </div>
               <p className="mt-0.5 text-[9px] text-[#8a9bad]">
-                Protected file · {attachments.length} file
+                Protected files · {attachments.length} file
                 {attachments.length === 1 ? "" : "s"}
               </p>
             </div>

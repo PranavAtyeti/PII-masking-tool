@@ -112,9 +112,17 @@ def policy_json(policy: dict[str, dict]) -> str:
     return json.dumps({"version": 1, "columns": policy}, ensure_ascii=True, separators=(",", ":"))
 
 
-def validate_outbound_text(text: str) -> None:
-    """Fail closed for known unmasked PII in provider prompts or history."""
-    if scan_for_unmasked_pii(text):
+def validate_outbound_text(
+    text: str,
+    *,
+    confirmed_share_segments: list[str] | None = None,
+) -> None:
+    """Fail closed except for source text the user explicitly confirmed sharing."""
+    checked_text = text
+    for segment in confirmed_share_segments or []:
+        if segment:
+            checked_text = checked_text.replace(segment, " " * len(segment), 1)
+    if scan_for_unmasked_pii(checked_text):
         raise HTTPException(
             status_code=422,
             detail="Outbound privacy validation found unmasked sensitive data.",

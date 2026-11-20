@@ -97,6 +97,8 @@ class ChatFileInfo(BaseModel):
     privacy_policy: dict = Field(default_factory=dict)
     worksheet_count: int = 1
     worksheets: list[WorksheetInfo] = Field(default_factory=list)
+    file_format: str = "spreadsheet"
+    processing_status: str = "complete"
 
 
 class UploadPreviewResult(BaseModel):
@@ -105,6 +107,9 @@ class UploadPreviewResult(BaseModel):
     columns: list[ColumnInfo]
     worksheet_count: int = 1
     worksheets: list[WorksheetInfo] = Field(default_factory=list)
+    file_format: str = "spreadsheet"
+    section_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
 
 
 class UploadResult(BaseModel):
@@ -119,6 +124,9 @@ class UploadResult(BaseModel):
     privacy_policy: dict = Field(default_factory=dict)
     worksheet_count: int = 1
     worksheets: list[WorksheetInfo] = Field(default_factory=list)
+    file_format: str = "spreadsheet"
+    section_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
 
 
 

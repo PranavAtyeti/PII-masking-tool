@@ -623,6 +623,19 @@ export default function App() {
 
           onToolStatus: setToolStatus,
 
+          onSources: (sources) => {
+            setMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (!last || last.role !== "assistant") return prev;
+              next[next.length - 1] = {
+                ...last,
+                metadata: { ...last.metadata, sources },
+              };
+              return next;
+            });
+          },
+
           onDone: (maskedCount, usage) => {
             setMessages((prev) => {
               const next = [...prev];

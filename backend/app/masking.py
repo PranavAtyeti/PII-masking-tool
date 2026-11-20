@@ -75,6 +75,24 @@ def mask_free_text_cell(text: str, session_id: str, counters: dict,
     ).get(str(text), str(text))
 
 
+def mask_free_texts(
+    texts: list[str],
+    session_id: str,
+    counters: dict,
+    min_confidence: float,
+    use_ner: bool = True,
+) -> dict[str, str]:
+    """Mask a set of document fragments in one detector and mapping pass."""
+    normalized = [str(text) for text in texts]
+    return _mask_free_texts(
+        normalized,
+        session_id,
+        counters,
+        min_confidence,
+        use_ner,
+    )
+
+
 def _mask_free_texts(
     texts: list[str],
     session_id: str,

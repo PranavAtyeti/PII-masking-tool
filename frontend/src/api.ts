@@ -2,6 +2,7 @@ import type {
   AdminConfig,
   Chat,
   ChatFileInfo,
+  DocumentSource,
   CurrentUser,
   Message,
   ModelOption,
@@ -307,6 +308,7 @@ export const api = {
     },
     handlers: {
       onDelta: (text: string) => void;
+      onSources?: (sources: DocumentSource[]) => void;
       onToolStatus?: (status: string | null) => void;
       onDone: (maskedCount: number, usage?: ProviderUsage) => void;
       onError: (message: string, error?: ProviderErrorMetadata) => void;
@@ -394,6 +396,7 @@ function handleEvent(
   rawEvent: string,
   handlers: {
     onDelta: (text: string) => void;
+    onSources?: (sources: DocumentSource[]) => void;
     onToolStatus?: (status: string | null) => void;
     onDone: (maskedCount: number, usage?: ProviderUsage) => void;
     onError: (message: string, error?: ProviderErrorMetadata) => void;
@@ -416,6 +419,7 @@ function handleEvent(
     usage?: ProviderUsage;
     tool_status?: { label?: string; status?: string };
     error?: string | ProviderErrorMetadata;
+    sources?: DocumentSource[];
   };
 
   try {
@@ -424,7 +428,9 @@ function handleEvent(
     return;
   }
 
-  if (obj.error) {
+  if (Array.isArray(obj.sources)) {
+    handlers.onSources?.(obj.sources);
+  } else if (obj.error) {
     handlers.onToolStatus?.(null);
     handlers.onError(
       typeof obj.delta === "string"
