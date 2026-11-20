@@ -16,6 +16,7 @@ import binascii
 import hashlib
 import hmac
 import os
+import re
 from typing import Final
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -42,7 +43,11 @@ def _load_key() -> bytes:
     # Accept standard URL-safe base64 output from the setup command.
     padded = raw + "=" * (-len(raw) % 4)
     try:
-        key = base64.urlsafe_b64decode(padded.encode("ascii"))
+        key = base64.b64decode(
+            padded.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
     except (ValueError, binascii.Error) as exc:
         raise EncryptionConfigurationError(
             f"{_KEY_ENV} is not valid URL-safe base64."
@@ -86,10 +91,7 @@ def encrypt_text(value: str, *, aad: str | None = None) -> str:
 
 
 def is_encrypted(value: str | None) -> bool:
-    return isinstance(value, str) and (
-        value.startswith(f"{_CIPHERTEXT_PREFIX}:")
-        or value.startswith("v2:")
-    )
+    return isinstance(value, str) and bool(re.match(r"^v\d+:", value))
 
 
 def decrypt_text(value: str, *, aad: str | None = None) -> str:
@@ -101,17 +103,23 @@ def decrypt_text(value: str, *, aad: str | None = None) -> str:
     if not is_encrypted(value):
         return value
 
+    version_prefix = value.split(":", 1)[0]
+    if version_prefix not in {_CIPHERTEXT_PREFIX, "v2"}:
+        raise EncryptionConfigurationError("Unsupported Privy ciphertext version")
+
     if value.startswith("v2:"):
         parts = value.split(":", 4)
         if len(parts) != 5:
             raise EncryptionConfigurationError("Invalid Privy envelope format")
         try:
-            wrapped_dek = base64.urlsafe_b64decode(parts[1].encode("ascii"))
-            key_id = base64.urlsafe_b64decode(parts[2].encode("ascii")).decode("utf-8")
-            nonce = base64.urlsafe_b64decode(parts[3].encode("ascii"))
-            ciphertext = base64.urlsafe_b64decode(parts[4].encode("ascii"))
+            wrapped_dek = base64.b64decode(parts[1].encode("ascii"), altchars=b"-_", validate=True)
+            key_id = base64.b64decode(parts[2].encode("ascii"), altchars=b"-_", validate=True).decode("utf-8")
+            nonce = base64.b64decode(parts[3].encode("ascii"), altchars=b"-_", validate=True)
+            ciphertext = base64.b64decode(parts[4].encode("ascii"), altchars=b"-_", validate=True)
         except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
             raise EncryptionConfigurationError("Invalid Privy envelope encoding") from exc
+        if len(nonce) != _NONCE_BYTES or len(ciphertext) < 16 or len(wrapped_dek) < 28 or not key_id:
+            raise EncryptionConfigurationError("Incomplete Privy envelope metadata")
         try:
             dek = get_key_provider().unwrap_dek(wrapped_dek, key_id)
             plaintext = AESGCM(dek).decrypt(
@@ -130,8 +138,8 @@ def decrypt_text(value: str, *, aad: str | None = None) -> str:
         raise EncryptionConfigurationError("Invalid Privy ciphertext format")
 
     try:
-        nonce = base64.urlsafe_b64decode(parts[1].encode("ascii"))
-        ciphertext = base64.urlsafe_b64decode(parts[2].encode("ascii"))
+        nonce = base64.b64decode(parts[1].encode("ascii"), altchars=b"-_", validate=True)
+        ciphertext = base64.b64decode(parts[2].encode("ascii"), altchars=b"-_", validate=True)
     except (ValueError, binascii.Error) as exc:
         raise EncryptionConfigurationError("Invalid Privy ciphertext encoding") from exc
 
@@ -160,7 +168,11 @@ def lookup_digest(session_id: str, value_norm: str) -> str:
     if blind_key:
         try:
             padded = blind_key + "=" * (-len(blind_key) % 4)
-            key = base64.urlsafe_b64decode(padded.encode("ascii"))
+            key = base64.b64decode(
+                padded.encode("ascii"),
+                altchars=b"-_",
+                validate=True,
+            )
         except (ValueError, binascii.Error) as exc:
             raise EncryptionConfigurationError(
                 "PRIVY_BLIND_INDEX_KEY is not valid URL-safe base64."

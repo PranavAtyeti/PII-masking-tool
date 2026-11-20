@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import os
-import time
+import logging
 
 from . import mapping_store as store
 from .gemini_files import delete_gemini_file_cache
 from .gemini_interactions import delete_interaction
 from .logging_utils import log_event
-import logging
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderCleanupPending(RuntimeError):
+    """Deletion is incomplete because remote provider cleanup did not finish."""
 
 
 def delete_file(chat_id: str, file_id: str) -> bool:
@@ -20,11 +23,18 @@ def delete_file(chat_id: str, file_id: str) -> bool:
         return False
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
-    delete_gemini_file_cache(file_id, api_key)
+    if not delete_gemini_file_cache(file_id, api_key):
+        log_event(
+            logger,
+            "file_deletion_pending",
+            level=logging.WARNING,
+            chat_id=chat_id,
+            file_id=file_id,
+            reason="provider_cleanup_pending",
+        )
+        raise ProviderCleanupPending("Provider cleanup is pending; retry file deletion.")
 
     deleted = store.delete_chat_file(chat_id, file_id)
-    if deleted and not store.get_chat_files(chat_id):
-        store.clear_session(chat_id)
     return deleted
 
 
@@ -37,17 +47,11 @@ def delete_chat(chat_id: str, user_id: str) -> bool:
     files = store.get_chat_files(chat_id)
     api_key = os.getenv("GEMINI_API_KEY", "").strip() or None
     for chat_file in files:
-        delete_gemini_file_cache(chat_file["file_id"], api_key)
-    delete_interaction(chat_id, api_key)
+        if not delete_gemini_file_cache(chat_file["file_id"], api_key):
+            raise ProviderCleanupPending("Provider cleanup is pending; retry chat deletion.")
+    if not delete_interaction(chat_id, api_key):
+        raise ProviderCleanupPending("Provider cleanup is pending; retry chat deletion.")
 
-    store.clear_session(chat_id)
     store.delete_chat(chat_id, user_id)
     log_event(logger, "chat_deleted", chat_id=chat_id)
     return True
-
-
-def cleanup_stale_provider_state(max_age_seconds: int) -> int:
-    """Configurable retention hook for expired provider resources."""
-    cutoff = time.time() - max(0, max_age_seconds)
-    log_event(logger, "retention_cleanup_complete", cutoff=cutoff)
-    return 0

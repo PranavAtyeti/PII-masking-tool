@@ -18,6 +18,7 @@ import type {
   Message,
   ModelOption,
   ColumnPrivacyChoice,
+  WorksheetInfo,
 } from "./types";
 import { api } from "./api";
 import { AuthPanel } from "./components/AuthPanel";
@@ -53,10 +54,12 @@ export default function App() {
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
   const [collapsed, setCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [toolStatus, setToolStatus] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingColumns, setPendingColumns] = useState<ColumnInfo[]>([]);
   const [pendingRowCount, setPendingRowCount] = useState(0);
+  const [pendingWorksheets, setPendingWorksheets] = useState<WorksheetInfo[]>([]);
   const [pendingPrivacyPolicy, setPendingPrivacyPolicy] = useState<Record<string, ColumnPrivacyChoice>>({});
   const [useNerForFile, setUseNerForFile] = useState(false);
   const [pendingFileId, setPendingFileId] = useState<string | null>(null);
@@ -211,6 +214,7 @@ export default function App() {
     setPendingFile(null);
     setPendingColumns([]);
     setPendingRowCount(0);
+    setPendingWorksheets([]);
     setPendingPrivacyPolicy({});
     setUseNerForFile(false);
     setPendingFileId(null);
@@ -367,6 +371,7 @@ export default function App() {
       setPendingFileId(null);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
+      setPendingWorksheets(preview.worksheets);
       setPendingPrivacyPolicy(Object.fromEntries(preview.columns.map((column) => [column.name, { action: column.recommended_action, share_confirmed: false }])));
       setUseNerForFile(false);
     } catch (e) {
@@ -445,6 +450,7 @@ export default function App() {
       setPendingFileId(fileId);
       setPendingColumns(preview.columns);
       setPendingRowCount(preview.row_count);
+      setPendingWorksheets(preview.worksheets);
       const existingPolicy = attachment.privacyPolicy ?? {};
       setPendingPrivacyPolicy(Object.fromEntries(preview.columns.map((column) => [column.name, existingPolicy[column.name] ?? { action: column.recommended_action, share_confirmed: false }])));
     } catch (e) {
@@ -536,6 +542,7 @@ export default function App() {
       setPendingFile(null);
       setPendingColumns([]);
       setPendingRowCount(0);
+      setPendingWorksheets([]);
       setPendingPrivacyPolicy({});
       setIsEditingFile(false);
 
@@ -579,6 +586,7 @@ export default function App() {
     ]);
 
     setIsStreaming(true);
+    setToolStatus(null);
 
     const runStream = async (allowUnmaskedRisk: boolean) => {
       const controller = new AbortController();
@@ -611,7 +619,9 @@ export default function App() {
             });
           },
 
-          onDone: (maskedCount) => {
+          onToolStatus: setToolStatus,
+
+          onDone: (maskedCount, usage) => {
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
@@ -621,17 +631,21 @@ export default function App() {
               next[next.length - 1] = {
                 ...last,
                 masked_count: maskedCount,
+                metadata: usage
+                  ? { ...last.metadata, usage }
+                  : last.metadata,
               };
 
               return next;
             });
 
             setIsStreaming(false);
+            setToolStatus(null);
             streamControllerRef.current = null;
             api.listChats().then(setChats).catch(() => {});
           },
 
-          onError: (message) => {
+          onError: (message, error) => {
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
@@ -642,17 +656,22 @@ export default function App() {
                 ...last,
                 content: message,
                 masked_count: 0,
+                metadata: error
+                  ? { ...last.metadata, error }
+                  : last.metadata,
               };
 
               return next;
             });
 
             setIsStreaming(false);
+            setToolStatus(null);
             streamControllerRef.current = null;
           },
 
           onAbort: () => {
             setIsStreaming(false);
+            setToolStatus(null);
             streamControllerRef.current = null;
           },
         },
@@ -744,6 +763,7 @@ export default function App() {
 
       <ChatPane
         messages={messages}
+        toolStatus={toolStatus}
         suggestions={SUGGESTION_CHIPS}
         attachments={attachments}
         isStreaming={isStreaming}
@@ -751,6 +771,7 @@ export default function App() {
         pendingFile={pendingFile}
         pendingColumns={pendingColumns}
         pendingRowCount={pendingRowCount}
+        pendingWorksheets={pendingWorksheets}
         privacyPolicy={pendingPrivacyPolicy}
         useNerForFile={useNerForFile}
         isEditingFile={isEditingFile}

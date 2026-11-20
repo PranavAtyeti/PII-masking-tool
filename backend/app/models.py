@@ -55,7 +55,7 @@ class Chat(Base):
         ForeignKey("users.auth0_sub", ondelete="CASCADE"),
         nullable=False,
     )
-    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float] = mapped_column(Float, nullable=False)
     updated_at: Mapped[float] = mapped_column(Float, nullable=False)
 
@@ -107,10 +107,11 @@ class ChatFile(Base):
         ForeignKey("chats.chat_id", ondelete="CASCADE"),
         nullable=False,
     )
-    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
     masked_csv: Mapped[str] = mapped_column(Text, nullable=False)
     columns_json: Mapped[str] = mapped_column(Text, nullable=False)
     privacy_policy_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    workbook_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     row_count: Mapped[int] = mapped_column(Integer, nullable=False)
     truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     masked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

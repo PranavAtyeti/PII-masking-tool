@@ -5,6 +5,8 @@ import type {
   CurrentUser,
   Message,
   ModelOption,
+  ProviderUsage,
+  ProviderErrorMetadata,
   UploadPreviewResult,
   UploadResult,
 } from "./types";
@@ -304,8 +306,9 @@ export const api = {
     },
     handlers: {
       onDelta: (text: string) => void;
-      onDone: (maskedCount: number) => void;
-      onError: (message: string) => void;
+      onToolStatus?: (status: string | null) => void;
+      onDone: (maskedCount: number, usage?: ProviderUsage) => void;
+      onError: (message: string, error?: ProviderErrorMetadata) => void;
       onAbort?: () => void;
     },
     signal?: AbortSignal
@@ -390,8 +393,9 @@ function handleEvent(
   rawEvent: string,
   handlers: {
     onDelta: (text: string) => void;
-    onDone: (maskedCount: number) => void;
-    onError: (message: string) => void;
+    onToolStatus?: (status: string | null) => void;
+    onDone: (maskedCount: number, usage?: ProviderUsage) => void;
+    onError: (message: string, error?: ProviderErrorMetadata) => void;
     onAbort?: () => void;
   }
 ) {
@@ -408,7 +412,9 @@ function handleEvent(
     delta?: string;
     done?: boolean;
     masked_count?: number;
-    error?: string;
+    usage?: ProviderUsage;
+    tool_status?: { label?: string; status?: string };
+    error?: string | ProviderErrorMetadata;
   };
 
   try {
@@ -417,11 +423,25 @@ function handleEvent(
     return;
   }
 
-  if (typeof obj.delta === "string") {
+  if (obj.error) {
+    handlers.onToolStatus?.(null);
+    handlers.onError(
+      typeof obj.delta === "string"
+        ? obj.delta
+        : "The AI provider could not complete the request.",
+      typeof obj.error === "string" ? undefined : obj.error
+    );
+  } else if (typeof obj.delta === "string") {
     handlers.onDelta(obj.delta);
+  } else if (obj.tool_status) {
+    const label = typeof obj.tool_status.label === "string"
+      ? obj.tool_status.label
+      : "Working with workbook data";
+    handlers.onToolStatus?.(
+      obj.tool_status.status === "complete" ? `${label} complete` : label
+    );
   } else if (obj.done) {
-    handlers.onDone(obj.masked_count ?? 0);
-  } else if (obj.error) {
-    handlers.onError(obj.error);
+    handlers.onToolStatus?.(null);
+    handlers.onDone(obj.masked_count ?? 0, obj.usage);
   }
 }

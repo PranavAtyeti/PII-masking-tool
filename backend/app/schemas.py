@@ -60,11 +60,28 @@ class ColumnInfo(BaseModel):
     name: str
     type: str | None
     enabled: bool
+    display_name: str | None = None
+    worksheet_name: str | None = None
+    worksheet_id: str | None = None
+    worksheet_visibility: str | None = None
+    column_id: str | None = None
     recommended_action: str = "share"
     sensitive: bool = False
     reason: str = ""
     action: str = "share"
     share_confirmed: bool = False
+
+
+class WorksheetInfo(BaseModel):
+    worksheet_id: str
+    name: str
+    position: int
+    row_count: int
+    column_count: int
+    visibility: str
+    has_header: bool
+    is_empty: bool
+    is_irregular: bool
 
 
 class ChatFileInfo(BaseModel):
@@ -75,12 +92,16 @@ class ChatFileInfo(BaseModel):
     masked_count: int
     columns: list[ColumnInfo]
     privacy_policy: dict = Field(default_factory=dict)
+    worksheet_count: int = 1
+    worksheets: list[WorksheetInfo] = Field(default_factory=list)
 
 
 class UploadPreviewResult(BaseModel):
     filename: str
     row_count: int
     columns: list[ColumnInfo]
+    worksheet_count: int = 1
+    worksheets: list[WorksheetInfo] = Field(default_factory=list)
 
 
 class UploadResult(BaseModel):
@@ -92,6 +113,9 @@ class UploadResult(BaseModel):
     columns: list[ColumnInfo]
     masked_count: int
     preview_csv: str
+    privacy_policy: dict = Field(default_factory=dict)
+    worksheet_count: int = 1
+    worksheets: list[WorksheetInfo] = Field(default_factory=list)
 
 
 

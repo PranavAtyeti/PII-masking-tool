@@ -267,6 +267,42 @@ def stream_unmask(chunks, session_id: str):
         yield _unmask(buffer)
 
 
+def stream_unmask_events(events, session_id: str):
+    """Unmask only text deltas while passing non-text stream events unchanged."""
+    reverse_map = store.get_reverse_map(session_id)
+    lookup = {tok.upper(): orig for tok, orig in reverse_map.items()} if reverse_map else {}
+
+    def unmask(value: str) -> str:
+        if not lookup:
+            return value
+
+        def replace_token(match):
+            raw = match.group(0)
+            normalized = "[" + re.sub(r"\s+", "", raw[1:-1]).upper() + "]"
+            return str(lookup.get(normalized, raw))
+
+        return _TOKEN_PATTERN.sub(replace_token, value)
+
+    buffer = ""
+    for event in events:
+        if event.get("type") != "delta":
+            last_open = buffer.rfind("[")
+            safe_end = len(buffer) if last_open == -1 or "]" in buffer[last_open:] else last_open
+            if safe_end:
+                yield {"type": "delta", "text": unmask(buffer[:safe_end])}
+                buffer = buffer[safe_end:]
+            yield event
+            continue
+        buffer += str(event.get("text") or "")
+        last_open = buffer.rfind("[")
+        safe_end = len(buffer) if last_open == -1 or "]" in buffer[last_open:] else last_open
+        if safe_end:
+            yield {"type": "delta", "text": unmask(buffer[:safe_end])}
+            buffer = buffer[safe_end:]
+    if buffer:
+        yield {"type": "delta", "text": unmask(buffer)}
+
+
 def build_masked_context(masked_df: pd.DataFrame) -> tuple[str, bool]:
     """Serialize the complete masked dataframe for model context/storage."""
     return masked_df.to_csv(index=False), False

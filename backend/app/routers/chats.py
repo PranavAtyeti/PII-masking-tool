@@ -5,7 +5,7 @@ from fastapi.responses import PlainTextResponse
 from .. import mapping_store as store
 from ..auth import get_current_app_user
 from ..schemas import ChatOut, ChatCreateIn, ChatRenameIn, MessageOut
-from ..lifecycle import delete_chat as delete_lifecycle_chat
+from ..lifecycle import ProviderCleanupPending, delete_chat as delete_lifecycle_chat
 
 router = APIRouter(prefix="/api/chats", tags=["chats"])
 
@@ -54,7 +54,11 @@ def rename_chat(chat_id: str, body: ChatRenameIn, user: dict = Depends(get_curre
 def delete_chat(chat_id: str, user: dict = Depends(get_current_app_user)):
     user_id = user["auth0_sub"]
     _get_chat_or_404(chat_id, user_id)
-    if not delete_lifecycle_chat(chat_id, user_id):
+    try:
+        deleted = delete_lifecycle_chat(chat_id, user_id)
+    except ProviderCleanupPending as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not deleted:
         raise HTTPException(status_code=404, detail="Chat not found")
 
 

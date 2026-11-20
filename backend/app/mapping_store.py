@@ -432,7 +432,15 @@ def create_chat(user_id: str, title: str = "New chat") -> str:
     chat_id = str(uuid.uuid4())
     now = time.time()
     with SessionLocal() as db:
-        db.add(Chat(chat_id=chat_id, user_id=user_id, title=title, created_at=now, updated_at=now))
+        db.add(
+            Chat(
+                chat_id=chat_id,
+                user_id=user_id,
+                title=encrypt_text(title, aad=f"chat-title:{chat_id}"),
+                created_at=now,
+                updated_at=now,
+            )
+        )
         db.commit()
     return chat_id
 
@@ -445,7 +453,12 @@ def list_chats(user_id: str) -> list:
             .order_by(Chat.updated_at.desc(), Chat.chat_id.desc())
         ).all()
         return [
-            {"chat_id": r.chat_id, "title": r.title, "created_at": r.created_at, "updated_at": r.updated_at}
+            {
+                "chat_id": r.chat_id,
+                "title": decrypt_text(r.title, aad=f"chat-title:{r.chat_id}"),
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            }
             for r in rows
         ]
 
@@ -455,7 +468,12 @@ def get_chat(chat_id: str, user_id: str) -> dict | None:
         row = db.scalar(select(Chat).where(Chat.chat_id == chat_id, Chat.user_id == user_id))
         if not row:
             return None
-        return {"chat_id": row.chat_id, "title": row.title, "created_at": row.created_at, "updated_at": row.updated_at}
+        return {
+            "chat_id": row.chat_id,
+            "title": decrypt_text(row.title, aad=f"chat-title:{row.chat_id}"),
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
 
 
 def get_chat_messages(chat_id: str) -> list:
@@ -509,7 +527,10 @@ def rename_chat(chat_id: str, user_id: str, title: str) -> None:
         db.execute(
             update(Chat)
             .where(Chat.chat_id == chat_id, Chat.user_id == user_id)
-            .values(title=title, updated_at=time.time())
+            .values(
+                title=encrypt_text(title, aad=f"chat-title:{chat_id}"),
+                updated_at=time.time(),
+            )
         )
         db.commit()
 
@@ -518,6 +539,7 @@ def delete_chat(chat_id: str, user_id: str) -> None:
     with SessionLocal() as db:
         row = db.scalar(select(Chat).where(Chat.chat_id == chat_id, Chat.user_id == user_id))
         if row:
+            db.execute(delete(TokenEntry).where(TokenEntry.session_id == chat_id))
             db.delete(row)
             db.commit()
 
@@ -532,6 +554,7 @@ def set_chat_file(
     masked_count: int = 0,
     file_id: str | None = None,
     privacy_policy_json: str | None = None,
+    workbook_json: str | None = None,
 ) -> str:
     """Create or replace one file attachment for a chat.
 
@@ -556,6 +579,11 @@ def set_chat_file(
                 if privacy_policy_json
                 else None
             )
+            row.workbook_json = (
+                encrypt_text(workbook_json, aad=f"chat-file:{resolved_file_id}:workbook")
+                if workbook_json
+                else None
+            )
             row.updated_at = now
         else:
             db.add(
@@ -571,6 +599,11 @@ def set_chat_file(
                     privacy_policy_json=(
                         encrypt_text(privacy_policy_json, aad=f"chat-file:{resolved_file_id}:privacy")
                         if privacy_policy_json
+                        else None
+                    ),
+                    workbook_json=(
+                        encrypt_text(workbook_json, aad=f"chat-file:{resolved_file_id}:workbook")
+                        if workbook_json
                         else None
                     ),
                     created_at=now,
@@ -599,6 +632,11 @@ def get_chat_files(chat_id: str) -> list[dict]:
                     if row.privacy_policy_json
                     else None
                 ),
+                "workbook_json": (
+                    decrypt_text(row.workbook_json, aad=f"chat-file:{row.file_id}:workbook")
+                    if row.workbook_json
+                    else None
+                ),
                 "row_count": row.row_count,
                 "truncated": bool(row.truncated),
                 "masked_count": row.masked_count,
@@ -607,6 +645,15 @@ def get_chat_files(chat_id: str) -> list[dict]:
             }
             for row in rows
         ]
+
+
+def get_chat_file_revisions(chat_id: str) -> dict[str, float]:
+    """Return file revision timestamps without decrypting persisted file data."""
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(ChatFile.file_id, ChatFile.updated_at).where(ChatFile.chat_id == chat_id)
+        ).all()
+        return {str(file_id): float(updated_at) for file_id, updated_at in rows}
 
 
 def get_chat_file(chat_id: str, file_id: str | None = None):
@@ -637,6 +684,11 @@ def get_chat_file(chat_id: str, file_id: str | None = None):
                 if row.privacy_policy_json
                 else None
             ),
+            "workbook_json": (
+                decrypt_text(row.workbook_json, aad=f"chat-file:{row.file_id}:workbook")
+                if row.workbook_json
+                else None
+            ),
             "row_count": row.row_count,
             "truncated": bool(row.truncated),
             "masked_count": row.masked_count,
@@ -656,6 +708,11 @@ def delete_chat_file(chat_id: str, file_id: str) -> bool:
         if not row:
             return False
         db.delete(row)
+        remaining_files = db.scalar(
+            select(func.count()).select_from(ChatFile).where(ChatFile.chat_id == chat_id)
+        ) or 0
+        if remaining_files == 0:
+            db.execute(delete(TokenEntry).where(TokenEntry.session_id == chat_id))
         db.commit()
         return True
 

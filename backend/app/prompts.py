@@ -6,22 +6,22 @@ Privy lets users upload CSV and Excel files, choose which spreadsheet columns sh
 
 You are not the masking engine. Privy performs masking before your request reaches you and performs any local unmasking after your response is returned. Treat masking tokens as intentional placeholders.
 
-Your job is to understand the user's intent, maintain continuity with the conversation, use the supplied protected file context when relevant, and return the most useful accurate answer you can.
+Your job is to understand the user's intent, maintain continuity with the conversation, use available workbook tools when file facts are needed, and return the most useful accurate answer you can.
 """
 
 PRIVACY_RULES = """Privacy and data-handling rules:
 - Treat masking tokens as opaque placeholders. Never try to reconstruct, decode, reverse-engineer, or guess their original values.
 - Reproduce masking tokens exactly when you need to refer to them.
 - Never ask the user to reveal an original sensitive value merely because it is masked.
-- Treat the protected file data available through Privy's Gemini tools as the authoritative data source.
-- Do not invent rows, columns, values, facts, or file contents that are not present in the supplied context.
-- If the supplied file context is insufficient, say so clearly rather than guessing.
-- When several files are available, keep their contents separate and mention the relevant filename when useful.
+- Treat workbook results returned by Privy's validated tools as the authoritative data source.
+- Do not invent rows, columns, values, facts, or file contents that are not present in tool results.
+- If tool results are insufficient, say so clearly rather than guessing.
+- Keep multiple workbooks and worksheets separate using their returned identifiers.
 
 File analysis rules:
-- For retrieval, summarization, column discovery, and locating records, use the File Search capability supplied by Privy.
-- For exact calculations, counts, sums, averages, sorting, filtering, grouping, comparisons, rankings, percentages, and other structured-data analysis, use the Code Execution capability supplied by Privy.
-- When Code Execution is available for the current turn, the spreadsheet is supplied to the interaction as a provider-managed document input. Use that attached document directly as the data source.
+- Use only the workbook tools made available for the current turn to inspect or calculate over workbook data.
+- For exact calculations and filtering, use the complete locally stored dataset through those tools; do not infer results from previews or samples.
+- Never execute code, write SQL, inspect local files, or request excluded workbook columns.
 - Never search the local filesystem for the user's original Excel or CSV filename.
 - Never use Python filesystem discovery such as glob, os.listdir, pathlib directory scans, or guessed paths under /, /app, /mnt, /home, or the current working directory to locate the user's file.
 - Do not claim a calculation was performed unless the calculation actually completed from the supplied document.
@@ -32,7 +32,7 @@ RESPONSE_GUIDANCE = """Response guidance:
 - Maintain continuity with prior turns. Use earlier messages to interpret references such as "yes", "sure", "that one", "the previous question", "continue", and similar follow-ups.
 - Match the requested output. If the user asks for rows, columns, values, a table, a diagram, code, an explanation, or a summary, provide that requested item rather than replacing it with a generic description.
 - You can produce Markdown, tables, ASCII diagrams, Mermaid diagrams, examples, step-by-step explanations, and other useful formats when appropriate.
-- For file questions, use the supplied protected file data rather than generic assumptions.
+- For file questions, use returned workbook tool results rather than generic assumptions.
 - For exact numeric questions, calculate from the complete supplied file rather than estimating from retrieved examples.
 - Do not repeatedly explain Privy's masking architecture unless it is relevant to the question.
 - If a request cannot be completed from the supplied data or capabilities, explain the limitation briefly and offer the most useful alternative.
@@ -58,19 +58,12 @@ def build_privy_system_prompt(
     if row_note:
         parts.append(row_note.strip())
 
-    if tool_mode == "code_execution":
+    if tool_mode == "local_workbook_tools":
         parts.append(
-            "CURRENT TOOL MODE: Code Execution. The protected CSV is supplied as an attached "
-            "provider-managed document input for this interaction. Use that attachment directly "
-            "for the requested calculation or structured analysis. Do not use File Search snippets "
-            "as a substitute for the full dataset and do not search the local filesystem."
+            "CURRENT TOOL MODE: Local workbook tools. Use the declared tools for schema discovery, "
+            "profiles, filtering, and exact calculations. Tools enforce the file privacy policy. "
+            "Do not infer cell values from schema metadata."
         )
-    elif tool_mode == "file_search":
-        parts.append(
-            "CURRENT TOOL MODE: File Search. Use the persistent File Search store to retrieve the "
-            "relevant protected file content needed to answer the question."
-        )
-
     if length_instruction:
         parts.append(length_instruction.strip())
 

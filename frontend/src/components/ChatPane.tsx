@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { ColumnInfo, ColumnPrivacyChoice, Message, ModelOption } from "../types";
+import type { ColumnInfo, ColumnPrivacyChoice, Message, ModelOption, WorksheetInfo } from "../types";
 import { MessageBubble } from "./MessageBubble";
 import { SuggestionChips } from "./SuggestionChips";
 import { ChatInput, type ChatAttachment } from "./ChatInput";
@@ -11,10 +11,12 @@ interface ChatPaneProps {
   suggestions: string[];
   attachments?: ChatAttachment[];
   isStreaming: boolean;
+  toolStatus?: string | null;
   isUploading: boolean;
   pendingFile?: File | null;
   pendingColumns?: ColumnInfo[];
   pendingRowCount?: number;
+  pendingWorksheets?: WorksheetInfo[];
   privacyPolicy?: Record<string, ColumnPrivacyChoice>;
   useNerForFile?: boolean;
   isEditingFile?: boolean;
@@ -99,7 +101,7 @@ function FileIcon({ className = "h-4 w-4" }: { className?: string }) {
   );
 }
 
-export function ChatPane({ messages, suggestions, attachments = [], isStreaming, isUploading, pendingFile, pendingColumns = [], pendingRowCount = 0, privacyPolicy = {}, useNerForFile = false, isEditingFile = false, onPrivacyPolicyChange, onUseNerForFileChange, onCancelFile, onApplyFile, onEditFile, onRemoveFile, onStop, onSend, onUploadFiles, pendingQueueCount = 0, models = [], selectedModelId = "", onModelChange, onNewChat, onOpenSettings }: ChatPaneProps) {
+export function ChatPane({ messages, suggestions, attachments = [], isStreaming, toolStatus, isUploading, pendingFile, pendingColumns = [], pendingRowCount = 0, pendingWorksheets = [], privacyPolicy = {}, useNerForFile = false, isEditingFile = false, onPrivacyPolicyChange, onUseNerForFileChange, onCancelFile, onApplyFile, onEditFile, onRemoveFile, onStop, onSend, onUploadFiles, pendingQueueCount = 0, models = [], selectedModelId = "", onModelChange, onNewChat, onOpenSettings }: ChatPaneProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const isEmpty = messages.length === 0;
   useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" }); }, [messages]);
@@ -144,11 +146,12 @@ export function ChatPane({ messages, suggestions, attachments = [], isStreaming,
           </div>
         )}
         <div className="flex flex-col gap-9">{messages.map((message, index) => <MessageBubble key={index} message={message} isStreaming={isStreaming && index === messages.length - 1 && message.role === "assistant"} />)}</div>
+        {toolStatus && <p role="status" className="mt-4 text-[12px] text-[#7890a8]">{toolStatus}</p>}
       </div>}
     </div>
 
     <div className="z-20 shrink-0 bg-white px-4 pb-3 pt-2 sm:px-6 sm:pb-4"><div className="mx-auto w-full max-w-3xl"><ChatInput onSend={onSend} onUploadFiles={onUploadFiles} onEditFile={onEditFile} onRemoveFile={onRemoveFile} onStop={onStop} attachments={attachments} disabled={false} isStreaming={isStreaming} isUploading={isUploading} hasPendingFile={Boolean(pendingFile)} pendingQueueCount={pendingQueueCount} /><div className="mt-2 text-center text-[9px] text-[#8c9caf]">Protected workspace · sensitive values stay masked</div></div></div>
 
-    {pendingFile && onPrivacyPolicyChange && onUseNerForFileChange && onCancelFile && onApplyFile && <MaskingColumnsPanel filename={pendingFile.name} rowCount={pendingRowCount} columns={pendingColumns} privacyPolicy={privacyPolicy} useNer={useNerForFile} isApplying={isUploading} mode={isEditingFile ? "edit" : "new"} onPrivacyPolicyChange={onPrivacyPolicyChange} onUseNerChange={onUseNerForFileChange} onCancel={onCancelFile} onApply={onApplyFile} />}
+    {pendingFile && onPrivacyPolicyChange && onUseNerForFileChange && onCancelFile && onApplyFile && <MaskingColumnsPanel filename={pendingFile.name} rowCount={pendingRowCount} columns={pendingColumns} worksheets={pendingWorksheets} privacyPolicy={privacyPolicy} useNer={useNerForFile} isApplying={isUploading} mode={isEditingFile ? "edit" : "new"} onPrivacyPolicyChange={onPrivacyPolicyChange} onUseNerChange={onUseNerForFileChange} onCancel={onCancelFile} onApply={onApplyFile} />}
   </main>;
 }

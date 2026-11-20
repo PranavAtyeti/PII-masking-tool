@@ -1068,3 +1068,36 @@
 2026-09-28 17:29:10 | INFO | app.routers.messages | request_id=ea0ea118c679 | privy event=llm_stream_complete request_id=ea0ea118c679 provider=gemini model=gemini-3.7-flash duration_ms=27677 response_chars=330
 2026-09-28 17:29:10 | INFO | app.gemini_interactions | request_id=ea0ea118c679 | privy event=gemini_interaction_saved request_id=ea0ea118c679 chat_id=e334c139-4a3f-44fb-8285-8b11fe1f7c5a tool_mode=file_search message_count=2
 2026-09-28 17:29:10 | INFO | app.routers.messages | request_id=ea0ea118c679 | privy event=request_complete request_id=ea0ea118c679 chat_id=e334c139-4a3f-44fb-8285-8b11fe1f7c5a duration_ms=31512
+2026-09-29 12:28:33 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log
+2026-11-19 14:57:44 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 14:58:14 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 14:59:20 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 15:01:22 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 15:03:29 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 15:04:22 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:07:58 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:09:42 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:11:01 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:13:13 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:14:10 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:20:56 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log
+2026-11-19 17:22:24 | INFO | app.routers.messages | request_id=06f2d0732189 | privy event=request_start request_id=06f2d0732189 chat_id=6c477c00-82a2-459a-b5a8-3322993c4981 question_chars=21 requested_model=gemini-3.7-flash
+2026-11-19 17:22:37 | INFO | app.routers.messages | request_id=06f2d0732189 | privy event=masking_complete request_id=06f2d0732189 duration_ms=12796 masked_tokens=0
+2026-11-19 17:22:37 | INFO | app.routers.messages | request_id=06f2d0732189 | privy event=provider_selected request_id=06f2d0732189 provider=gemini model=gemini-3.7-flash duration_ms=0
+2026-11-19 17:22:37 | INFO | app.routers.messages | request_id=06f2d0732189 | privy event=request_complete request_id=06f2d0732189 chat_id=6c477c00-82a2-459a-b5a8-3322993c4981 duration_ms=12912
+2026-11-19 17:22:37 | ERROR | app.main | request_id=- | privy event=unhandled_exception path=/api/chats/6c477c00-82a2-459a-b5a8-3322993c4981/messages method=POST exception_type=ProgrammingError
+2026-11-19 17:25:26 | ERROR | app.main | request_id=- | privy event=unhandled_exception path=/api/upload/6c477c00-82a2-459a-b5a8-3322993c4981 method=GET exception_type=ProgrammingError
+2026-11-19 17:25:28 | ERROR | app.main | request_id=- | privy event=unhandled_exception path=/api/upload/6c477c00-82a2-459a-b5a8-3322993c4981 method=GET exception_type=ProgrammingError
+2026-11-19 17:25:29 | ERROR | app.main | request_id=- | privy event=unhandled_exception path=/api/upload/6c477c00-82a2-459a-b5a8-3322993c4981 method=GET exception_type=ProgrammingError
+2026-11-19 17:25:31 | ERROR | app.main | request_id=- | privy event=unhandled_exception path=/api/upload/6c477c00-82a2-459a-b5a8-3322993c4981 method=GET exception_type=ProgrammingError
+2026-11-19 17:26:26 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log
+2026-11-19 17:27:01 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log
+2026-11-19 17:29:27 | INFO | app.main | request_id=- | Privy API started environment=development log_file=C:\Users\PranavChothave\OneDrive - Atyeti Inc\Desktop\Python Tasks\PII_Mask_FastReact\backend\logs\privy.log
+2026-11-19 17:39:15 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:44:48 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-19 17:49:50 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-20 11:25:37 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-20 11:31:58 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-20 11:33:22 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-20 11:35:03 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-20 11:36:22 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending

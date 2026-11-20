@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import os
+import re
 from typing import Protocol
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -34,7 +35,12 @@ class LocalDevelopmentKeyProvider:
                 "PRIVY_ENCRYPTION_KEY is required outside production."
             )
         try:
-            raw = base64.urlsafe_b64decode(encoded.encode("ascii"))
+            padded = encoded + "=" * (-len(encoded) % 4)
+            raw = base64.b64decode(
+                padded.encode("ascii"),
+                altchars=b"-_",
+                validate=True,
+            )
         except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
             raise KeyManagementError("PRIVY_ENCRYPTION_KEY is invalid.") from exc
         if len(raw) != 32:
@@ -71,9 +77,12 @@ class CloudKMSKeyProvider:
             ) from exc
 
         resource = os.getenv("PRIVY_KMS_KEY_NAME", "").strip()
-        if not resource:
+        if not re.fullmatch(
+            r"projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+",
+            resource,
+        ):
             raise KeyManagementError(
-                "PRIVY_KMS_KEY_NAME is required in production."
+                "PRIVY_KMS_KEY_NAME must identify a Cloud KMS CryptoKey."
             )
         self.key_id = resource
         self._client = kms.KeyManagementServiceClient()
@@ -86,13 +95,20 @@ class CloudKMSKeyProvider:
                     "plaintext": dek,
                 }
             )
-            return bytes(response.ciphertext), str(response.name)
+            versioned_key_id = str(getattr(response, "key_name", "") or "")
+            if not versioned_key_id:
+                raise KeyManagementError("Cloud KMS returned no key version identifier.")
+            return bytes(response.ciphertext), versioned_key_id
         except Exception as exc:
             raise KeyManagementError("Cloud KMS is unavailable for encryption.") from exc
 
     def unwrap_dek(self, wrapped_dek: bytes, key_id: str) -> bytes:
-        if not key_id:
-            raise KeyManagementError("Missing KMS key identifier.")
+        if not re.fullmatch(
+            r"projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+"
+            r"(?:/cryptoKeyVersions/\d+)?",
+            key_id,
+        ):
+            raise KeyManagementError("Invalid KMS key version identifier.")
         try:
             response = self._client.decrypt(
                 request={

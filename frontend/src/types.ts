@@ -16,11 +16,52 @@ export interface Message {
     files_skipped?: string[];
     masked_token_count?: number;
     security_override?: boolean;
+    usage?: ProviderUsage;
+    error?: ProviderErrorMetadata;
   };
+}
+
+export interface ProviderErrorMetadata {
+  category: string;
+  retryable: boolean;
+  retry_after_seconds?: number | null;
+}
+
+export interface ProviderUsage {
+  provider: string;
+  model: string;
+  source: "provider_reported" | "estimated";
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  tool_tokens?: number | null;
+  total_tokens?: number | null;
+  estimated_input_tokens?: number | null;
+  estimated_output_tokens?: number | null;
+  estimated_cost?: number | null;
+}
+
+export interface ModelCapabilities {
+  context_window_tokens: number | null;
+  max_output_tokens: number | null;
+  streaming: boolean | null;
+  file_input: boolean | null;
+  persistent_resources: boolean | null;
+  cached_context: boolean | null;
+  tool_calling: boolean | null;
+  structured_output: boolean | null;
+  token_usage_reporting: boolean | null;
+  modalities: string[];
 }
 
 export interface ColumnInfo {
   name: string;
+  display_name?: string | null;
+  worksheet_name?: string | null;
+  worksheet_id?: string | null;
+  worksheet_visibility?: string | null;
+  column_id?: string | null;
   type: string | null;
   enabled: boolean;
   recommended_action: PrivacyAction;
@@ -31,6 +72,18 @@ export interface ColumnInfo {
 }
 
 export type PrivacyAction = "share" | "mask" | "exclude";
+
+export interface WorksheetInfo {
+  worksheet_id: string;
+  name: string;
+  position: number;
+  row_count: number;
+  column_count: number;
+  visibility: string;
+  has_header: boolean;
+  is_empty: boolean;
+  is_irregular: boolean;
+}
 
 export interface ColumnPrivacyChoice {
   action: PrivacyAction;
@@ -46,6 +99,8 @@ export interface UploadPreviewResult {
   filename: string;
   row_count: number;
   columns: ColumnInfo[];
+  worksheet_count: number;
+  worksheets: WorksheetInfo[];
 }
 
 export interface ChatFileInfo {
@@ -56,6 +111,8 @@ export interface ChatFileInfo {
   masked_count: number;
   columns: ColumnInfo[];
   privacy_policy: Record<string, ColumnPrivacyChoice>;
+  worksheet_count: number;
+  worksheets: WorksheetInfo[];
 }
 
 export interface UploadResult {
@@ -68,6 +125,8 @@ export interface UploadResult {
   masked_count: number;
   preview_csv: string;
   privacy_policy: PrivacyPolicy;
+  worksheet_count: number;
+  worksheets: WorksheetInfo[];
 }
 
 export interface AdminConfig {
@@ -93,6 +152,7 @@ export interface ModelOption {
   model: string;
   label: string;
   description: string;
+  capabilities?: ModelCapabilities;
 }
 
 export interface ModelCatalogResponse {

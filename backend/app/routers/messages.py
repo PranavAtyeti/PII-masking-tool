@@ -14,9 +14,11 @@ from fastapi.responses import StreamingResponse
 
 from .. import mapping_store as store
 from ..auth import get_current_app_user
-from ..llm import LLMServiceError, stream_llm, get_model_config
+from ..llm import LLMServiceError, stream_llm_events, get_model_config
+from ..context_builder import build_prompt, PromptBudgetExceeded
 from ..prompts import build_privy_system_prompt
-from ..context_limits import MAX_TOTAL_FILE_CONTEXT_TOKENS, limit_file_context
+from ..context_limits import MAX_TOTAL_FILE_CONTEXT_TOKENS, estimate_tokens, limit_file_context
+from ..provider_registry import model_capabilities
 from ..gemini_files import get_or_upload_gemini_file, upload_calculation_projection
 from ..gemini_interactions import (
     get_interaction_id,
@@ -27,11 +29,20 @@ from ..gemini_interactions import (
 from ..masking import (
     mask_free_text_cell,
     _replace_known_values,
-    stream_unmask,
+    stream_unmask_events,
     looks_unmasked,
     count_masked_tokens,
 )
 from ..privacy_policy import build_outbound_csv, load_policy, validate_outbound_text
+from ..workbook import deserialize_workbook, sample_csv_context, workbook_provider_context
+from ..tools import (
+    MAX_TOOL_CALLS_PER_REQUEST,
+    MAX_TOOL_ROUNDS,
+    ToolExecutionError,
+    create_tool_context,
+    execute_tool_safely,
+    provider_tool_schemas,
+)
 from ..schemas import MessageIn
 from ..logging_utils import elapsed_ms, log_event, new_request_id, set_request_id
 logger = logging.getLogger(__name__)
@@ -43,6 +54,45 @@ router = APIRouter(prefix="/api/chats", tags=["messages"])
 MAX_HISTORY_MESSAGES = int(os.getenv("PRIVY_MAX_HISTORY_MESSAGES", "32"))
 CONCISE_MAX_OUTPUT_TOKENS = int(os.getenv("PRIVY_CONCISE_MAX_OUTPUT_TOKENS", "2048"))
 DETAILED_MAX_OUTPUT_TOKENS = int(os.getenv("PRIVY_DETAILED_MAX_OUTPUT_TOKENS", "16384"))
+
+
+def _safe_outbound_file_context(
+    chat_file: dict,
+    selected_columns: set[str] | None = None,
+    question: str | None = None,
+    sample_rows: bool = False,
+) -> str:
+    policy, legacy = load_policy(
+        chat_file.get("privacy_policy_json"),
+        chat_file.get("columns_json"),
+    )
+    workbook_json = chat_file.get("workbook_json")
+    if workbook_json:
+        if legacy:
+            raise HTTPException(status_code=422, detail="A persisted workbook is missing its privacy policy.")
+        workbook = deserialize_workbook(workbook_json)
+        selected_keys = None
+        if selected_columns is not None:
+            selected_keys = {
+                column["policy_key"]
+                for sheet in workbook["worksheets"]
+                for column in sheet.get("columns", [])
+                if column.get("display_name") in selected_columns
+                and policy.get(column.get("policy_key"), {}).get("action") != "exclude"
+            }
+        return workbook_provider_context(
+            workbook,
+            policy,
+            selected_keys,
+            query=question,
+            sample_rows=sample_rows,
+        )
+    safe_csv = build_outbound_csv(
+        str(chat_file.get("masked_csv") or ""),
+        policy,
+        legacy=legacy,
+    )
+    return sample_csv_context(safe_csv, question) if sample_rows and question is not None else safe_csv
 
 
 # This is only a provider-tool router. Privy does not perform spreadsheet
@@ -131,6 +181,31 @@ def _build_calculation_projection(question: str, chat_files: list[dict]) -> tupl
     selected_union: list[str] = []
 
     for chat_file in chat_files:
+        if chat_file.get("workbook_json"):
+            policy, legacy = load_policy(
+                chat_file.get("privacy_policy_json"),
+                chat_file.get("columns_json"),
+            )
+            if legacy:
+                raise HTTPException(status_code=422, detail="A persisted workbook is missing its privacy policy.")
+            workbook = deserialize_workbook(chat_file["workbook_json"])
+            columns = list(dict.fromkeys(
+                column["display_name"]
+                for sheet in workbook["worksheets"]
+                for column in sheet.get("columns", [])
+                if policy.get(column.get("policy_key"), {}).get("action") != "exclude"
+            ))
+            selected, missing = _resolve_calculation_columns(question, columns)
+            if missing:
+                return None, [], missing[0]
+            if not selected:
+                return None, [], None
+            for column in selected:
+                if column not in selected_union:
+                    selected_union.append(column)
+            safe_context = _safe_outbound_file_context(chat_file, set(selected))
+            sections.append(f"FILE: dataset_{str(chat_file['file_id'])[:8]}\n{safe_context}")
+            continue
         try:
             metadata = json.loads(chat_file.get("columns_json") or "[]")
         except (TypeError, ValueError):
@@ -152,8 +227,10 @@ def _build_calculation_projection(question: str, chat_files: list[dict]) -> tupl
             if column not in selected_union:
                 selected_union.append(column)
 
-        safe_csv = build_outbound_csv(
-            str(chat_file.get("masked_csv") or ""), policy, legacy=legacy
+        safe_csv = _safe_outbound_file_context(
+            chat_file,
+            question=f"{masked_question}\n{history_block}",
+            sample_rows=True,
         )
         reader = csv.DictReader(io.StringIO(safe_csv))
         rows: list[dict[str, str]] = []
@@ -275,6 +352,11 @@ def _build_prompt(
     external_files: bool = False,
     server_state: bool = False,
     tool_mode: str | None = None,
+    model: str | None = None,
+    requested_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    chat_files: list[dict] | None = None,
+    tools_enabled: bool = False,
+    workbook_schema: str = "",
 ):
     """Build the text prompt.
 
@@ -289,7 +371,8 @@ def _build_prompt(
         "Give a complete, clearly explained answer. Use as much detail as genuinely helps the user, without padding."
     )
 
-    chat_files = store.get_chat_files(chat_id)
+    if chat_files is None:
+        chat_files = store.get_chat_files(chat_id)
     history_block = _format_history(history or [])
 
     if chat_files:
@@ -302,9 +385,51 @@ def _build_prompt(
             any_truncated = any_truncated or bool(chat_file["truncated"])
             file_policy, _legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
             column_names = [name for name, choice in file_policy.items() if choice.get("action") != "exclude"]
-            file_descriptions.append(
+            description = (
                 f"Dataset {index} — {chat_file['row_count']:,} rows"
-                + (f"; columns: {', '.join(column_names)}" if column_names else "")
+            )
+            if not tools_enabled and column_names:
+                description += f"; columns: {', '.join(column_names)}"
+            file_descriptions.append(description)
+
+        if tools_enabled:
+            truncation_note = (
+                "Some attached files were truncated during ingestion; exact calculations apply only to rows stored locally and must not be described as covering the original full files. "
+                if any_truncated
+                else ""
+            )
+            row_note = (
+                f"The complete attached datasets contain {total_rows:,} stored rows. "
+                f"{truncation_note}"
+                "Use the available local workbook tools for schema discovery, filtering, and exact calculations. "
+                "Do not infer data values from the schema."
+            )
+            system_prompt = build_privy_system_prompt(
+                file_descriptions=file_descriptions,
+                row_note=row_note,
+                length_instruction=length_instruction,
+                tool_mode="local_workbook_tools",
+            )
+            system_prompt += "\n\n" + workbook_schema
+            system_prompt += (
+                "\nUse a workbook tool for any question requiring workbook facts or calculations. "
+                "Never claim exact results unless a tool returns exact=true. Do not request or infer excluded columns."
+            )
+            built_prompt = build_prompt(
+                system_prompt=system_prompt,
+                file_context="",
+                history=history_block,
+                question=masked_question,
+                requested_output_tokens=requested_output_tokens,
+                model_capabilities=model_capabilities(model or ""),
+            )
+            return (
+                system_prompt,
+                built_prompt.user_prompt,
+                system_prompt + built_prompt.user_prompt,
+                masked_question,
+                chat_files,
+                0,
             )
 
         if external_files:
@@ -326,20 +451,25 @@ def _build_prompt(
                 length_instruction=length_instruction,
                 tool_mode=tool_mode,
             )
-            prompt_parts: list[str] = [
-                "ATTACHED FILES: The protected spreadsheet data is indexed in persistent Gemini "
-                "File Search stores for this chat. Use the File Search and Code Execution tools "
-                "as the source of truth for file-specific analysis."
-            ]
-            if history_block and not server_state:
-                prompt_parts.append(history_block)
-            prompt_parts.append(f"CURRENT USER QUESTION:\n{masked_question}")
-            user_prompt = "\n\n".join(prompt_parts)
+            attached_files_note = (
+                "The protected spreadsheet data is indexed in persistent provider resources. "
+                "Use the available retrieval or analysis tools as the source of truth."
+            )
+            built_prompt = build_prompt(
+                system_prompt=system_prompt,
+                file_context=attached_files_note,
+                history=history_block if not server_state else "",
+                question=masked_question,
+                requested_output_tokens=requested_output_tokens,
+                model_capabilities=model_capabilities(model or "", "gemini"),
+                context_label="ATTACHED FILES",
+            )
+            user_prompt = built_prompt.user_prompt
 
             # The outbound request now contains only the masked question and
             # conversation text. The dataset is represented by persistent
             # File Search store names rather than repeated file uploads.
-            payload_to_check = (history_block if not server_state else "") + masked_question
+            payload_to_check = user_prompt
             badge_attachment_count = sum(
                 max(0, int(chat_file.get("masked_count") or 0))
                 for chat_file in chat_files
@@ -360,8 +490,11 @@ def _build_prompt(
         remaining_tokens = MAX_TOTAL_FILE_CONTEXT_TOKENS
 
         for index, chat_file in enumerate(chat_files, start=1):
-            file_policy, legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
-            safe_csv = build_outbound_csv(str(chat_file["masked_csv"]), file_policy, legacy=legacy)
+            safe_csv = _safe_outbound_file_context(
+                chat_file,
+                question=masked_question,
+                sample_rows=True,
+            )
             limited_csv, used_tokens, limited = limit_file_context(
                 f"dataset_{index}.csv", safe_csv, remaining_tokens
             )
@@ -380,14 +513,20 @@ def _build_prompt(
                 break
 
         file_context = "\n\n".join(sections)
-        row_notes: list[str] = []
+        row_notes: list[str] = [
+            "Inline workbook content is a bounded, question-relevant sample, not the complete dataset. Do not present calculations over this sample as exact whole-dataset results."
+        ]
         if any_truncated:
             row_notes.append(
                 "One or more files were ingested with row truncation; do not imply you have rows that are not stored."
             )
+        elif context_was_limited:
+            row_notes.append(
+                f"Only selected portions of the stored data ({total_rows:,} rows total) fit this request."
+            )
         else:
             row_notes.append(
-                f"You are seeing the stored rows across the attached files ({total_rows:,} rows total)."
+                f"The attached files contain {total_rows:,} stored rows. Use the supplied relevant context to answer."
             )
         if context_was_limited:
             row_notes.append(
@@ -403,13 +542,17 @@ def _build_prompt(
         )
         # Keep the stable file dataset at the front so provider-side prompt
         # caching has the best chance to reuse the large static prefix.
-        prompt_parts = [f"MASKED DATA FROM ATTACHED FILES:\n{file_context}"]
-        if history_block:
-            prompt_parts.append(history_block)
-        prompt_parts.append(f"CURRENT USER QUESTION:\n{masked_question}")
-        user_prompt = "\n\n".join(prompt_parts)
-        payload_to_check = file_context + history_block + masked_question
-        badge_payload = file_context + masked_question
+        built_prompt = build_prompt(
+            system_prompt=system_prompt,
+            file_context=file_context,
+            history=history_block,
+            question=masked_question,
+            requested_output_tokens=requested_output_tokens,
+            model_capabilities=model_capabilities(model or ""),
+        )
+        user_prompt = built_prompt.user_prompt
+        payload_to_check = built_prompt.file_context + built_prompt.history + masked_question
+        badge_payload = built_prompt.file_context + masked_question
         return (
             system_prompt,
             user_prompt,
@@ -420,12 +563,16 @@ def _build_prompt(
         )
 
     system_prompt = build_privy_system_prompt(length_instruction=length_instruction)
-    prompt_parts = []
-    if history_block:
-        prompt_parts.append(history_block)
-    prompt_parts.append(f"CURRENT USER QUESTION:\n{masked_question}")
-    user_prompt = "\n\n".join(prompt_parts)
-    payload_to_check = masked_question + history_block
+    built_prompt = build_prompt(
+        system_prompt=system_prompt,
+        file_context="",
+        history=history_block,
+        question=masked_question,
+        requested_output_tokens=requested_output_tokens,
+        model_capabilities=model_capabilities(model or ""),
+    )
+    user_prompt = built_prompt.user_prompt
+    payload_to_check = user_prompt
     badge_payload = masked_question
     return (
         system_prompt,
@@ -494,32 +641,69 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         duration_ms=elapsed_ms(provider_started),
     )
 
-    external_files = provider == "gemini"
-    available_chat_files = store.get_chat_files(chat_id) if external_files else []
-    gemini_tool_mode = (
-        "code_execution"
-        if external_files and available_chat_files and _requires_code_execution(masked_question)
-        else "file_search"
-        if external_files and available_chat_files
-        else None
+    requested_max_tokens = CONCISE_MAX_OUTPUT_TOKENS if body.concise else DETAILED_MAX_OUTPUT_TOKENS
+    capabilities = model_capabilities(model or "", provider)
+    configured_output_limit = capabilities.get("max_output_tokens")
+    max_tokens = (
+        min(requested_max_tokens, configured_output_limit)
+        if isinstance(configured_output_limit, int)
+        else requested_max_tokens
     )
-    (
-        system_prompt,
-        user_prompt,
-        payload_to_check,
-        badge_payload,
-        chat_files,
-        badge_attachment_count,
-    ) = _build_prompt(
-        chat_id,
-        masked_question,
-        body.concise,
-        history,
-        external_files=external_files,
-        server_state=False,
-        tool_mode=gemini_tool_mode,
-    )
-    max_tokens = CONCISE_MAX_OUTPUT_TOKENS if body.concise else DETAILED_MAX_OUTPUT_TOKENS
+    external_files = False
+    gemini_tool_mode = None
+    chat_files = store.get_chat_files(chat_id)
+    tools_enabled = bool(chat_files)
+    tool_context = None
+    workbook_schema = ""
+    if tools_enabled:
+        if capabilities.get("tool_calling") is not True:
+            msg = "The selected AI model does not support workbook tools. Choose a model with tool-calling support."
+            yield _sse({"delta": msg, "error": {"category": "unsupported_capability", "retryable": False}})
+            store.add_message(chat_id, "assistant", msg, count_masked_tokens(masked_question))
+            yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
+            return
+        try:
+            tool_context = create_tool_context(chat_id, user_id, chat_files)
+        except (ToolExecutionError, HTTPException, RuntimeError) as exc:
+            log_event(
+                logger,
+                "workbook_tool_context_error",
+                level=logging.ERROR,
+                error_type=type(exc).__name__,
+            )
+            msg = "The attached workbook could not be safely prepared for this request."
+            yield _sse({"delta": msg, "error": {"category": "workbook_validation", "retryable": False}})
+            store.add_message(chat_id, "assistant", msg, count_masked_tokens(masked_question))
+            yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
+            return
+    try:
+        (
+            system_prompt,
+            user_prompt,
+            payload_to_check,
+            badge_payload,
+            chat_files,
+            badge_attachment_count,
+        ) = _build_prompt(
+            chat_id,
+            masked_question,
+            body.concise,
+            history,
+            external_files=False,
+            server_state=False,
+            tool_mode="local_workbook_tools" if tools_enabled else None,
+            model=model,
+            requested_output_tokens=max_tokens,
+            chat_files=chat_files,
+            tools_enabled=tools_enabled,
+            workbook_schema=workbook_schema,
+        )
+    except PromptBudgetExceeded:
+        msg = "This request exceeds the configured context limit. Shorten it or select a model with a larger configured limit."
+        yield _sse({"delta": msg, "error": {"category": "context_window", "retryable": False}})
+        store.add_message(chat_id, "assistant", msg, count_masked_tokens(masked_question))
+        yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
+        return
     masked_count = badge_attachment_count + count_masked_tokens(badge_payload)
 
     try:
@@ -541,238 +725,52 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         yield _sse({"done": True, "masked_count": masked_count})
         return
 
-    # Gemini receives the complete masked CSV through its provider-managed file
-    # resources. Validate those exact bytes at the outbound boundary as well as
-    # during upload, so a future code path cannot send an unsafe cached dataset.
-    if external_files and chat_files:
-        for chat_file in chat_files:
-            file_policy, legacy = load_policy(
-                chat_file.get("privacy_policy_json"),
-                chat_file.get("columns_json"),
-            )
-            try:
-                build_outbound_csv(
-                    str(chat_file.get("masked_csv") or ""),
-                    file_policy,
-                    legacy=legacy,
-                )
-            except HTTPException:
-                log_event(
-                    logger,
-                    "outbound_privacy_blocked",
-                    level=logging.ERROR,
-                    provider=provider,
-                    reason="gemini_file_contains_unmasked_sensitive_data",
-                )
-                answer = (
-                    "Request blocked: the protected file failed the outbound privacy check. "
-                    "Nothing was sent to the model."
-                )
-                yield _sse({"delta": answer})
-                store.add_message(chat_id, "assistant", answer, masked_count)
-                yield _sse({"done": True, "masked_count": masked_count})
-                return
-
-    file_refs: list[dict] = []
-    calculation_projection = None
-    calculation_columns: list[str] = []
-    calculation_missing_column = None
-
-    if external_files and chat_files:
-        file_prepare_started = time.perf_counter()
-        log_event(
-            logger,
-            "gemini_file_prepare_start",
-            file_count=len(chat_files),
-            tool_mode=gemini_tool_mode,
-        )
-        try:
-            if gemini_tool_mode == "code_execution":
-                calculation_projection, calculation_columns, calculation_missing_column = _build_calculation_projection(
-                    masked_question,
-                    chat_files,
-                )
-                if calculation_missing_column:
-                    answer = (
-                        f"I can't calculate that because the attached file does not contain a "
-                        f"'{calculation_missing_column}' column."
-                    )
-                    yield _sse({"delta": answer})
-                    store.add_message(chat_id, "assistant", answer, masked_count)
-                    yield _sse({"done": True, "masked_count": masked_count})
-                    return
-
-                if calculation_projection:
-                    projection_file = upload_calculation_projection(
-                        filename="dataset.csv",
-                        masked_csv=calculation_projection,
-                        api_key=api_key,
-                    )
-                    file_refs.append(
-                        {
-                            "file_uri": projection_file["file_uri"],
-                            "mime_type": projection_file.get("mime_type", "text/csv"),
-                            "include_document": True,
-                            "content_sha256": projection_file.get("content_sha256", ""),
-                            "calculation_projection": True,
-                            "calculation_columns": calculation_columns,
-                        }
-                    )
-            else:
-                for chat_file in chat_files:
-                    file_policy, legacy = load_policy(chat_file.get("privacy_policy_json"), chat_file.get("columns_json"))
-                    safe_csv = build_outbound_csv(str(chat_file["masked_csv"]), file_policy, legacy=legacy)
-                    cached_file = get_or_upload_gemini_file(
-                        file_id=chat_file["file_id"],
-                        filename=f"privy-{chat_file['file_id']}.csv",
-                        masked_csv=safe_csv,
-                        api_key=api_key,
-                        privacy_validated=True,
-                    )
-                    file_refs.append(
-                        {
-                            "file_search_store_name": cached_file["store_name"],
-                            "content_sha256": cached_file.get("content_sha256", ""),
-                            "include_document": False,
-                            "file_uri": cached_file.get("file_uri", ""),
-                            "mime_type": cached_file.get("mime_type", "text/csv"),
-                        }
-                    )
-            log_event(
-                logger,
-                "gemini_file_prepare_complete",
-                file_count=len(file_refs),
-                tool_mode=gemini_tool_mode,
-                calculation_columns=calculation_columns,
-                duration_ms=elapsed_ms(file_prepare_started),
-            )
-        except RuntimeError as e:
-            log_event(
-                logger,
-                "gemini_file_prepare_error",
-                level=logging.ERROR,
-                file_count=len(file_refs),
-                duration_ms=elapsed_ms(file_prepare_started),
-                error_type=type(e).__name__,
-            )
-            msg = "We couldn't prepare the protected file for Gemini. Please try again."
-            yield _sse({
-                "delta": msg,
-                "error": {"category": "file_preparation", "retryable": True},
-            })
-            store.add_message(chat_id, "assistant", msg, masked_count)
-            yield _sse({"done": True, "masked_count": masked_count})
-            return
-
-    interaction_id = None
-    interaction_state: dict = {}
-    if provider == "gemini":
-        interaction_lookup_started = time.perf_counter()
-        interaction_id = (
-            None
-            if gemini_tool_mode == "code_execution"
-            else get_interaction_id(
-                chat_id,
-                model,
-                file_refs,
-                message_count=len(previous_messages),
-            )
-        )
-        log_event(
-            logger,
-            "interaction_state_lookup_complete",
-            reused=bool(interaction_id),
-            duration_ms=elapsed_ms(interaction_lookup_started),
-        )
-        previous_tool_mode = (
-            get_interaction_tool_mode(
-                chat_id,
-                model,
-                file_refs,
-                message_count=len(previous_messages),
-            )
-            if interaction_id
-            else None
-        )
-
-        # The raw Gemini File is supplied as a document only when entering
-        # Code Execution for the first time. Subsequent Code Execution turns
-        # reuse the document carried in the prior stateful interaction.
-        if gemini_tool_mode == "code_execution":
-            for file_ref in file_refs:
-                file_ref["include_document"] = True
-
-        # Rebuild local masked history only when Gemini does not already have a
-        # valid stateful chain. This keeps later requests small while still
-        # recovering continuity after expiry/restart/model changes.
-        if interaction_id:
-            (
-                system_prompt,
-                user_prompt,
-                payload_to_check,
-                badge_payload,
-                chat_files,
-                badge_attachment_count,
-            ) = _build_prompt(
-                chat_id,
-                masked_question,
-                body.concise,
-                history,
-                external_files=True,
-                server_state=True,
-                tool_mode=gemini_tool_mode,
-            )
-            masked_count = badge_attachment_count + count_masked_tokens(badge_payload)
-
-    # Final pre-send prompt gate. This intentionally runs after interaction-state
-    # reconstruction because that is the exact prompt that will be sent.
-    try:
-        validate_outbound_text(payload_to_check)
-    except HTTPException:
-        log_event(
-            logger,
-            "outbound_privacy_blocked",
-            level=logging.WARNING,
-            provider=provider,
-            reason="final_prompt_contains_unmasked_sensitive_data",
-        )
-        answer = (
-            "Request blocked: content still looks like it contains unmasked personal data. "
-            "Nothing was sent to the model."
-        )
-        yield _sse({"delta": answer})
-        store.add_message(chat_id, "assistant", answer, masked_count)
-        yield _sse({"done": True, "masked_count": masked_count})
-        return
-
     answer_parts: list[str] = []
+    usage_state: dict = {}
+    estimated_input_tokens = estimate_tokens(system_prompt + user_prompt)
     llm_started = time.perf_counter()
-    log_event(
-        logger,
-        "llm_stream_start",
-        provider=provider,
-        model=model,
-        tool_mode=gemini_tool_mode,
-        reused_interaction=bool(interaction_id),
-    )
+    log_event(logger, "llm_stream_start", provider=provider, model=model, tools_enabled=tools_enabled)
     try:
-        raw_chunks = stream_llm(
+        provider_events = stream_llm_events(
             system_prompt,
             user_prompt,
             api_key,
             model,
             max_tokens=max_tokens,
             provider=provider,
-            file_refs=file_refs,
-            interaction_id=interaction_id,
-            interaction_state=interaction_state,
-            tool_mode=gemini_tool_mode,
+            tool_schemas=provider_tool_schemas() if tools_enabled else None,
+            tool_executor=(
+                lambda name, arguments: execute_tool_safely(tool_context, name, arguments)
+                if tool_context is not None
+                else {"ok": False, "error": {"code": "tool_context_unavailable", "message": "Workbook tools are unavailable."}}
+            ),
+            max_tool_rounds=MAX_TOOL_ROUNDS if tools_enabled else 0,
+            max_tool_calls=MAX_TOOL_CALLS_PER_REQUEST if tools_enabled else 0,
+            usage_state=usage_state,
         )
         unmask_started = time.perf_counter()
-        for piece in stream_unmask(raw_chunks, chat_id):
-            if piece:
-                answer_parts.append(piece)
-                yield _sse({"delta": piece})
+        operation_labels = {
+            "get_workbook_schema": "Reviewing workbook structure",
+            "get_column_profile": "Profiling a workbook column",
+            "filter_rows": "Filtering workbook rows",
+            "aggregate_data": "Calculating a workbook result",
+            "group_and_aggregate": "Comparing workbook groups",
+            "compare_groups": "Comparing workbook groups",
+        }
+        for event in stream_unmask_events(provider_events, chat_id):
+            if event.get("type") == "delta":
+                piece = str(event.get("text") or "")
+                if piece:
+                    answer_parts.append(piece)
+                    yield _sse({"delta": piece})
+            elif event.get("type") in {"tool_start", "tool_complete"}:
+                tool_name = str(event.get("name") or "")
+                yield _sse({
+                    "tool_status": {
+                        "label": operation_labels.get(tool_name, "Working with workbook data"),
+                        "status": "running" if event["type"] == "tool_start" else "complete",
+                    }
+                })
         log_event(
             logger,
             "unmask_complete",
@@ -787,17 +785,6 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             duration_ms=elapsed_ms(llm_started),
             response_chars=len("".join(answer_parts)),
         )
-        if provider == "gemini":
-            latest_interaction_id = interaction_state.get("latest_interaction_id")
-            if latest_interaction_id:
-                save_interaction_id(
-                    chat_id,
-                    model,
-                    file_refs,
-                    str(latest_interaction_id),
-                    message_count=len(previous_messages) + 2,
-                    tool_mode=gemini_tool_mode,
-                )
     except LLMServiceError as e:
         log_event(
             logger,
@@ -811,9 +798,6 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             error_code=e.code,
             retryable=e.retryable,
         )
-        if provider == "gemini" and interaction_state.get("reset_required"):
-            from ..gemini_interactions import clear_interaction_id
-            clear_interaction_id(chat_id)
         msg = e.user_message
         answer_parts = [msg]
         yield _sse({
@@ -821,6 +805,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             "error": {
                 "category": e.category,
                 "retryable": e.retryable,
+                "retry_after_seconds": e.retry_after_seconds,
             },
         })
     except RuntimeError as e:
@@ -833,9 +818,6 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             duration_ms=elapsed_ms(llm_started),
             error_type=type(e).__name__,
         )
-        if provider == "gemini" and interaction_state.get("reset_required"):
-            from ..gemini_interactions import clear_interaction_id
-            clear_interaction_id(chat_id)
         msg = "The AI service could not complete this request. Please try again."
         answer_parts = [msg]
         yield _sse({
@@ -897,8 +879,19 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         })
 
     answer = "".join(answer_parts)
-    store.add_message(chat_id, "assistant", answer, masked_count)
-    yield _sse({"done": True, "masked_count": masked_count})
+    usage_state.setdefault("provider", provider)
+    usage_state.setdefault("model", model)
+    usage_state.setdefault("source", "estimated")
+    usage_state["estimated_input_tokens"] = estimated_input_tokens
+    usage_state["estimated_output_tokens"] = estimate_tokens(answer)
+    store.add_message(
+        chat_id,
+        "assistant",
+        answer,
+        masked_count,
+        metadata={"provider": provider, "model": model, "usage": usage_state},
+    )
+    yield _sse({"done": True, "masked_count": masked_count, "usage": usage_state})
 
 
 def _generate(chat_id: str, body: MessageIn, user_id: str):

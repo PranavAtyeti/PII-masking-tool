@@ -193,15 +193,20 @@ def _clear_local(chat_id: str) -> dict[str, Any] | None:
 def delete_interaction(
     chat_id: str,
     api_key: str | None = None,
-) -> None:
-    """Delete the provider-side interaction when possible, then clear local state."""
-    entry = _clear_local(chat_id)
-    if not entry or not api_key:
-        return
+) -> bool:
+    """Delete remote interaction first, clearing the reference only on success."""
+    with _LOCK:
+        entry = _load().get(chat_id)
+    if not isinstance(entry, dict):
+        return True
+    if not api_key:
+        return False
 
     interaction_id = entry.get("interaction_id")
     if not interaction_id:
-        return
+        _clear_local(chat_id)
+        with _LOCK:
+            return chat_id not in _load()
 
     base_url = os.environ.get(
         "GEMINI_API_ROOT",
@@ -217,9 +222,11 @@ def delete_interaction(
             timeout=(10, 30),
         )
         if response.status_code not in {200, 204, 404}:
-            return
+            return False
     except requests.RequestException:
-        return
+        return False
+    _clear_local(chat_id)
+    return True
 
 
 def clear_interaction_id(chat_id: str) -> None:

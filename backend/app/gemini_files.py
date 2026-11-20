@@ -455,7 +455,7 @@ def _store_exists(store_name: str, api_key: str) -> bool:
     return exists
 
 
-def _delete_raw_file(file_name: str, api_key: str) -> None:
+def _delete_raw_file(file_name: str, api_key: str) -> bool:
     try:
         response = requests.delete(
             f"{GEMINI_API_ROOT}/{file_name}",
@@ -467,11 +467,14 @@ def _delete_raw_file(file_name: str, api_key: str) -> None:
         )
         if response.status_code not in {200, 204, 404}:
             log_event(logger, "gemini_raw_file_delete_failed", level=logging.WARNING, status_code=response.status_code)
+            return False
+        return True
     except requests.RequestException:
         log_event(logger, "gemini_raw_file_delete_request_failed", level=logging.WARNING)
+        return False
 
 
-def _delete_store(store_name: str, api_key: str) -> None:
+def _delete_store(store_name: str, api_key: str) -> bool:
     try:
         response = requests.delete(
             f"{GEMINI_API_ROOT}/{store_name}",
@@ -484,8 +487,11 @@ def _delete_store(store_name: str, api_key: str) -> None:
         )
         if response.status_code not in {200, 204, 404}:
             log_event(logger, "gemini_file_search_store_delete_failed", level=logging.WARNING, status_code=response.status_code)
+            return False
+        return True
     except requests.RequestException:
         log_event(logger, "gemini_file_search_store_delete_request_failed", level=logging.WARNING)
+        return False
 
 
 def _refresh_raw_file(
@@ -685,19 +691,26 @@ def get_or_upload_gemini_file(
         return entry
 
 
-def delete_gemini_file_cache(file_id: str, api_key: str | None = None) -> None:
-    """Delete both provider resources associated with a Privy file."""
+def delete_gemini_file_cache(file_id: str, api_key: str | None = None) -> bool:
+    """Delete both provider resources, retaining references on failures."""
     with _CACHE_LOCK:
         entries = _load_cache()
-        entry = entries.pop(file_id, None)
+        entry = entries.get(file_id)
+        if not entry:
+            return True
+        if not api_key:
+            return False
+        deleted = True
+        if entry.get("file_name"):
+            deleted = _delete_raw_file(str(entry["file_name"]), api_key) and deleted
+        if entry.get("store_name"):
+            deleted = _delete_store(str(entry["store_name"]), api_key) and deleted
+        if not deleted:
+            return False
+        entries.pop(file_id, None)
         try:
             _save_cache(entries)
         except OSError:
-            pass
-
-    if not entry or not api_key:
-        return
-    if entry.get("file_name"):
-        _delete_raw_file(str(entry["file_name"]), api_key)
-    if entry.get("store_name"):
-        _delete_store(str(entry["store_name"]), api_key)
+            log_event(logger, "gemini_file_cache_delete_failed", level=logging.WARNING)
+            return False
+        return True
