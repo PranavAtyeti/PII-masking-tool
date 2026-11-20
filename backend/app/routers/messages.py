@@ -357,7 +357,7 @@ def _build_prompt(
     server_state: bool = False,
     tool_mode: str | None = None,
     model: str | None = None,
-    requested_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    requested_output_tokens: int = DETAILED_MAX_OUTPUT_TOKENS,
     chat_files: list[dict] | None = None,
     tools_enabled: bool = False,
     workbook_schema: str = "",
