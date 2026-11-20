@@ -74,6 +74,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 The API health endpoint is available at `http://localhost:8000/api/health`.
+It checks database connectivity and returns HTTP 503 when PostgreSQL is unavailable.
 
 ### 3. Configure the frontend
 
@@ -95,7 +96,11 @@ The development UI runs at `http://localhost:5173` and proxies `/api` requests t
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL SQLAlchemy connection URL. |
 | `PRIVY_JWT_SECRET`, `PRIVY_JWT_ALGORITHM` | Signing secret and algorithm for local JWT authentication. |
-| `ALLOWED_ORIGINS` | Comma-separated frontend origins allowed by CORS. |
+| `PRIVY_ENVIRONMENT` | Set to `production` for deployments; this selects Cloud KMS and production security checks. |
+| `ALLOWED_ORIGINS`, `ALLOWED_HOSTS` | Explicit comma-separated frontend origins and API hostnames required in production. |
+| `PRIVY_KMS_KEY_NAME` | Production Cloud KMS CryptoKey resource name. The runtime identity needs permission to encrypt and decrypt. |
+| `PRIVY_BLIND_INDEX_KEY` | Production-only, stable URL-safe base64 key encoding exactly 32 random bytes; keep it separate from the KMS key. |
+| `PRIVY_ENCRYPTION_KEY` | Local-development 32-byte URL-safe base64 key. Production uses Cloud KMS instead. |
 | `LLM_PROVIDER` | Default provider: `groq` or `gemini`. |
 | `GROQ_API_KEY`, `GROQ_MODEL` | Groq credentials and default model. |
 | `GEMINI_API_KEY`, `GEMINI_MODEL` | Gemini credentials and default model. |
@@ -118,6 +123,16 @@ The development UI runs at `http://localhost:5173` and proxies `/api` requests t
 | `PRIVY_MAX_TOOL_RESULT_BYTES`, `PRIVY_MAX_TOOL_ARGUMENT_BYTES`, `PRIVY_MAX_TOOL_EXECUTION_SECONDS` | Limits for tool payload size and execution duration. |
 
 Never commit populated `.env` files or provider credentials. An administrator can manage the active model configuration in the application; the API never returns a full stored key.
+
+## Production deployment checklist
+
+1. Configure PostgreSQL and set `DATABASE_URL`, `PRIVY_ENVIRONMENT=production`, a random `PRIVY_JWT_SECRET` of at least 32 bytes, explicit `ALLOWED_ORIGINS` and `ALLOWED_HOSTS`, and a stable `PRIVY_BLIND_INDEX_KEY`.
+2. Set `PRIVY_KMS_KEY_NAME` to the production CryptoKey and provide Application Default Credentials to the Render service through its supported secure credential mechanism. Grant that runtime identity only the KMS permissions required to encrypt and decrypt. Do not set or reuse a local `PRIVY_ENCRYPTION_KEY` as a production substitute.
+3. Configure at least one provider API key and the desired provider/model settings. Keep all credentials in the hosting provider's secret environment configuration.
+4. From the `backend` root, install `requirements.txt` (which applies `constraints.txt`) and install the `en_core_web_sm` spaCy model. Apply migrations with `alembic upgrade head` before starting Uvicorn, as in the configured Render start command.
+5. Configure the hosting health check to use `/api/health`. A successful response means the API can reach PostgreSQL; it does not verify provider credentials or Cloud KMS access. Exercise an authenticated encryption/decryption flow separately before relying on production data.
+
+Do not rotate `PRIVY_BLIND_INDEX_KEY` without a planned mapping migration: existing token lookups depend on it. Do not claim production readiness from a successful build or migration alone.
 
 ## Privacy behavior
 

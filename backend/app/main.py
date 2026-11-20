@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import mapping_store as store
@@ -205,6 +206,18 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/health")
 def health():
+    try:
+        store.init_db()
+    except SQLAlchemyError:
+        log_event(
+            logger,
+            "health_check_database_unavailable",
+            level=logging.ERROR,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable"},
+        )
     return {"status": "ok"}
 
 

@@ -98,6 +98,7 @@ class ProviderNormalizationTests(unittest.TestCase):
                 "prompt_tokens": 120,
                 "completion_tokens": 30,
                 "total_tokens": 150,
+                "tool_tokens": 4,
                 "prompt_tokens_details": {"cached_tokens": 10},
                 "completion_tokens_details": {"reasoning_tokens": 5},
             },
@@ -107,6 +108,30 @@ class ProviderNormalizationTests(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 30)
         self.assertEqual(usage["cached_input_tokens"], 10)
         self.assertEqual(usage["reasoning_tokens"], 5)
+        self.assertEqual(usage["tool_tokens"], 4)
+        self.assertEqual(usage["total_tokens"], 150)
+        self.assertEqual(usage["source"], "provider_reported")
+
+    def test_usage_normalizes_gemini_cached_reasoning_and_tool_tokens(self):
+        usage = _normalize_usage(
+            "gemini",
+            "gemini-3.7-flash",
+            {
+                "total_input_tokens": 120,
+                "total_cached_tokens": 12,
+                "total_output_tokens": 30,
+                "total_thought_tokens": 5,
+                "total_tool_use_tokens": 3,
+                "total_tokens": 150,
+            },
+        )
+
+        self.assertEqual(usage["input_tokens"], 120)
+        self.assertEqual(usage["cached_input_tokens"], 12)
+        self.assertEqual(usage["output_tokens"], 30)
+        self.assertEqual(usage["reasoning_tokens"], 5)
+        self.assertEqual(usage["tool_tokens"], 3)
+        self.assertEqual(usage["total_tokens"], 150)
         self.assertEqual(usage["source"], "provider_reported")
 
     def test_error_categories_and_retry_after_are_normalized(self):

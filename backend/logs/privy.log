@@ -1102,3 +1102,4 @@
 2026-11-20 11:35:03 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
 2026-11-20 11:36:22 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
 2026-11-20 14:26:29 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-20 17:34:49 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending

@@ -31,6 +31,7 @@ from ..gemini_interactions import (
 )
 from ..masking import (
     mask_free_text_cell,
+    mask_free_texts,
     _replace_known_values,
     stream_unmask_events,
     looks_unmasked,
@@ -300,29 +301,34 @@ def _mask_history(
     messages: list[dict],
     known_values: dict,
     chat_id: str,
+    counters: dict,
     ner_confidence: float,
     use_ner: bool,
 ) -> list[dict]:
     """Return recent chat history with known and newly detected values tokenized."""
-    masked: list[dict] = []
+    prepared: list[tuple[str, str]] = []
     for message in messages[-MAX_HISTORY_MESSAGES:]:
         role = message.get("role")
         content = str(message.get("content") or "")
         if role not in {"user", "assistant"} or not content:
             continue
         content = _replace_known_values(content, known_values)
-        content = mask_free_text_cell(
-            content,
-            chat_id,
-            store.load_counters(chat_id),
-            ner_confidence,
-            use_ner,
-        )
-        masked.append({
-            "role": role,
-            "content": content,
-        })
-    return masked
+        prepared.append((role, content))
+
+    if not prepared:
+        return []
+
+    masked_by_content = mask_free_texts(
+        [content for _role, content in prepared],
+        chat_id,
+        counters,
+        ner_confidence,
+        use_ner,
+    )
+    return [
+        {"role": role, "content": masked_by_content[content]}
+        for role, content in prepared
+    ]
 
 
 def _format_history(history: list[dict]) -> str:
@@ -755,6 +761,7 @@ def _generate_active_impl(
         previous_messages,
         store.get_known_values(chat_id),
         chat_id,
+        counters,
         body.ner_confidence,
         body.use_ner,
     )
@@ -867,6 +874,7 @@ def _generate_active_impl(
             )
             yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
             return
+    prompt_started = time.perf_counter()
     try:
         (
             system_prompt,
@@ -902,6 +910,17 @@ def _generate_active_impl(
         )
         yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
         return
+    estimated_input_tokens = estimate_tokens(system_prompt + user_prompt)
+    log_event(
+        logger,
+        "prompt_build_complete",
+        provider=provider,
+        model=model,
+        duration_ms=elapsed_ms(prompt_started),
+        estimated_input_tokens=estimated_input_tokens,
+        reserved_output_tokens=max_tokens,
+        tools_enabled=tools_enabled,
+    )
     masked_count = badge_attachment_count + count_masked_tokens(badge_payload)
 
     try:
@@ -943,7 +962,6 @@ def _generate_active_impl(
     answer_parts: list[str] = []
     request_status = "completed"
     usage_state: dict = {}
-    estimated_input_tokens = estimate_tokens(system_prompt + user_prompt)
     llm_started = time.perf_counter()
     log_event(logger, "llm_stream_start", provider=provider, model=model, tools_enabled=tools_enabled)
     try:
