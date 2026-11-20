@@ -3,7 +3,7 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0008_persistent_conversation_turns"
+revision = "0008_persistent_turns"
 down_revision = "0007_encrypted_workbook_document"
 branch_labels = None
 depends_on = None
