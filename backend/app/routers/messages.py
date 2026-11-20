@@ -1,19 +1,22 @@
 """Ask questions against masked files with bounded conversation memory."""
 
 import csv
+import hashlib
+import hmac
 import io
 import json
 import logging
 import os
 import re
 import time
+import uuid
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .. import mapping_store as store
-from ..auth import get_current_app_user
+from ..auth import JWT_SECRET, get_current_app_user
 from ..llm import LLMServiceError, stream_llm_events, get_model_config
 from ..context_builder import build_prompt, PromptBudgetExceeded
 from ..prompts import build_privy_system_prompt
@@ -584,13 +587,91 @@ def _build_prompt(
     )
 
 
+def _context_revision(chat_id: str, body: MessageIn) -> str:
+    revisions = store.get_chat_file_revisions(chat_id)
+    material = {
+        "files": sorted((file_id, revision) for file_id, revision in revisions.items()),
+        "use_ner": body.use_ner,
+        "ner_confidence": body.ner_confidence,
+        "masking_revision": os.getenv("PRIVY_MASKING_REVISION", "1"),
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _request_fingerprint(body: MessageIn) -> str:
+    request = {
+        "question": body.question,
+        "use_ner": body.use_ner,
+        "ner_confidence": body.ner_confidence,
+        "concise": body.concise,
+        "model_id": body.model_id,
+        "allow_unmasked_risk": body.allow_unmasked_risk,
+    }
+    return hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
-    # Read prior turns before storing this turn so the current question is not duplicated.
-    previous_messages = store.get_chat_messages(chat_id)
-    is_first_message = len(previous_messages) == 0
+    request_id = body.request_id or str(uuid.uuid4())
+    turn = store.begin_conversation_turn(
+        chat_id=chat_id,
+        user_id=user_id,
+        request_id=request_id,
+        request_fingerprint=_request_fingerprint(body),
+        question=body.question,
+        context_revision=_context_revision(chat_id, body),
+    )
+    if turn["status"] == "conflict":
+        yield _sse({
+            "delta": "This request identifier was already used for a different message. Please submit again.",
+            "error": {"category": "request_id_conflict", "retryable": False},
+        })
+        return
+    if turn["status"] == "completed":
+        assistant = turn["assistant"]
+        yield _sse({"delta": assistant["content"]})
+        usage = assistant.get("metadata", {}).get("usage")
+        yield _sse({
+            "done": True,
+            "masked_count": assistant.get("masked_count", 0),
+            "usage": usage,
+        })
+        return
+    if turn["status"] == "busy":
+        yield _sse({
+            "delta": "Another request is already being processed in this chat. Please wait and retry.",
+            "error": {"category": "request_in_progress", "retryable": True},
+        })
+        return
+
+    try:
+        yield from _generate_active_impl(
+            chat_id,
+            body,
+            user_id,
+            request_id,
+            turn["previous_messages"],
+            turn["is_first_message"],
+        )
+    finally:
+        store.interrupt_conversation_turn(chat_id, request_id)
+
+
+def _generate_active_impl(
+    chat_id: str,
+    body: MessageIn,
+    user_id: str,
+    request_id: str,
+    previous_messages: list[dict],
+    is_first_message: bool,
+):
     known_values_before_turn = store.get_known_values(chat_id)
 
-    store.add_message(chat_id, "user", body.question)
     if is_first_message:
         fallback_title = " ".join(body.question.strip().split())
         if len(fallback_title) > 40:
@@ -629,7 +710,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         masked_count = count_masked_tokens(masked_question)
         msg = f"{e}. Ask an admin to check the model configuration in Settings."
         yield _sse({"delta": msg})
-        store.add_message(chat_id, "assistant", msg, masked_count)
+        store.finish_conversation_turn(
+            chat_id,
+            request_id,
+            msg,
+            masked_count,
+            status="failed",
+        )
         yield _sse({"done": True, "masked_count": masked_count})
         return
 
@@ -639,6 +726,12 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         provider=provider,
         model=model,
         duration_ms=elapsed_ms(provider_started),
+    )
+    store.update_conversation_turn(
+        chat_id,
+        request_id,
+        provider=provider,
+        model=model,
     )
 
     requested_max_tokens = CONCISE_MAX_OUTPUT_TOKENS if body.concise else DETAILED_MAX_OUTPUT_TOKENS
@@ -659,7 +752,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
         if capabilities.get("tool_calling") is not True:
             msg = "The selected AI model does not support workbook tools. Choose a model with tool-calling support."
             yield _sse({"delta": msg, "error": {"category": "unsupported_capability", "retryable": False}})
-            store.add_message(chat_id, "assistant", msg, count_masked_tokens(masked_question))
+            store.finish_conversation_turn(
+                chat_id,
+                request_id,
+                msg,
+                count_masked_tokens(masked_question),
+                status="failed",
+            )
             yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
             return
         try:
@@ -673,7 +772,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             )
             msg = "The attached workbook could not be safely prepared for this request."
             yield _sse({"delta": msg, "error": {"category": "workbook_validation", "retryable": False}})
-            store.add_message(chat_id, "assistant", msg, count_masked_tokens(masked_question))
+            store.finish_conversation_turn(
+                chat_id,
+                request_id,
+                msg,
+                count_masked_tokens(masked_question),
+                status="failed",
+            )
             yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
             return
     try:
@@ -701,7 +806,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
     except PromptBudgetExceeded:
         msg = "This request exceeds the configured context limit. Shorten it or select a model with a larger configured limit."
         yield _sse({"delta": msg, "error": {"category": "context_window", "retryable": False}})
-        store.add_message(chat_id, "assistant", msg, count_masked_tokens(masked_question))
+        store.finish_conversation_turn(
+            chat_id,
+            request_id,
+            msg,
+            count_masked_tokens(masked_question),
+            status="failed",
+        )
         yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
         return
     masked_count = badge_attachment_count + count_masked_tokens(badge_payload)
@@ -721,11 +832,18 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             "Nothing was sent to the model."
         )
         yield _sse({"delta": answer})
-        store.add_message(chat_id, "assistant", answer, masked_count)
+        store.finish_conversation_turn(
+            chat_id,
+            request_id,
+            answer,
+            masked_count,
+            status="failed",
+        )
         yield _sse({"done": True, "masked_count": masked_count})
         return
 
     answer_parts: list[str] = []
+    request_status = "completed"
     usage_state: dict = {}
     estimated_input_tokens = estimate_tokens(system_prompt + user_prompt)
     llm_started = time.perf_counter()
@@ -786,6 +904,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             response_chars=len("".join(answer_parts)),
         )
     except LLMServiceError as e:
+        request_status = "failed"
         log_event(
             logger,
             "llm_service_error",
@@ -809,6 +928,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             },
         })
     except RuntimeError as e:
+        request_status = "failed"
         log_event(
             logger,
             "llm_runtime_error",
@@ -828,6 +948,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             },
         })
     except requests.exceptions.Timeout as e:
+        request_status = "failed"
         log_event(
             logger,
             "llm_network_error",
@@ -845,6 +966,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             "error": {"category": "timeout", "retryable": True},
         })
     except requests.exceptions.ConnectionError as e:
+        request_status = "failed"
         log_event(
             logger,
             "llm_network_error",
@@ -862,6 +984,7 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
             "error": {"category": "network", "retryable": True},
         })
     except Exception as e:
+        request_status = "failed"
         log_event(
             logger,
             "llm_unexpected_error",
@@ -884,12 +1007,13 @@ def _generate_impl(chat_id: str, body: MessageIn, user_id: str):
     usage_state.setdefault("source", "estimated")
     usage_state["estimated_input_tokens"] = estimated_input_tokens
     usage_state["estimated_output_tokens"] = estimate_tokens(answer)
-    store.add_message(
+    store.finish_conversation_turn(
         chat_id,
-        "assistant",
+        request_id,
         answer,
         masked_count,
         metadata={"provider": provider, "model": model, "usage": usage_state},
+        status=request_status,
     )
     yield _sse({"done": True, "masked_count": masked_count, "usage": usage_state})
 

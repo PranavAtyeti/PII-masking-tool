@@ -4,6 +4,8 @@ schemas.py
 Pydantic models for request/response bodies.
 """
 
+import uuid
+
 from pydantic import BaseModel, Field
 
 
@@ -24,6 +26,7 @@ class ChatRenameIn(BaseModel):
 
 class MessageIn(BaseModel):
     question: str = Field(min_length=1)
+    request_id: str = Field(default_factory=lambda: str(uuid.uuid4()), min_length=1, max_length=64)
     use_ner: bool = True
     ner_confidence: float = 0.6
     concise: bool = True

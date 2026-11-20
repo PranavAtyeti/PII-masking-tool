@@ -24,7 +24,7 @@ from app.crypto import (
 )
 from app.db import Base
 from app.key_management import CloudKMSKeyProvider, KeyManagementError
-from app.models import Chat, ChatFile, ChatMessage, TokenEntry
+from app.models import Chat, ChatFile, ChatMessage, ConversationTurn, TokenEntry
 from migrate_phase4_encryption import (
     migrate_chat_files,
     migrate_chat_titles,
@@ -47,6 +47,7 @@ class EncryptedPersistenceTests(unittest.TestCase):
         ChatFile.__table__.create(self.engine)
         Chat.__table__.create(self.engine)
         ChatMessage.__table__.create(self.engine)
+        ConversationTurn.__table__.create(self.engine)
         self.original_factory = mapping_store.SessionLocal
         mapping_store.SessionLocal = self.factory
 
@@ -72,6 +73,142 @@ class EncryptedPersistenceTests(unittest.TestCase):
         self.assertEqual(mapping_store.get_known_values("chat-a"), {"alice@example.test": token})
         self.assertEqual(mapping_store.get_reverse_map("chat-a"), {token: "alice@example.test"})
         self.assertEqual(mapping_store.get_known_values("chat-b"), {})
+
+    def test_conversation_turn_persists_encrypted_messages_and_replays_idempotently(self):
+        with self.factory() as db:
+            db.add(Chat(
+                chat_id="turn-chat",
+                user_id="user-a",
+                title="title",
+                created_at=1,
+                updated_at=1,
+            ))
+            db.commit()
+
+        started = mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-1",
+            request_fingerprint="a" * 64,
+            question="private question",
+            context_revision="b" * 64,
+        )
+        self.assertEqual(started["status"], "started")
+        self.assertEqual(started["previous_messages"], [])
+
+        with self.factory() as db:
+            user_message = db.scalar(select(ChatMessage).where(ChatMessage.role == "user"))
+            self.assertTrue(is_encrypted(user_message.content))
+            self.assertNotIn("private question", user_message.content)
+
+        mapping_store.finish_conversation_turn(
+            "turn-chat",
+            "request-1",
+            "private answer",
+            1,
+            metadata={"provider": "groq"},
+        )
+        replay = mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-1",
+            request_fingerprint="a" * 64,
+            question="private question",
+            context_revision="b" * 64,
+        )
+        self.assertEqual(replay["status"], "completed")
+        self.assertEqual(replay["assistant"]["content"], "private answer")
+        self.assertEqual(replay["assistant"]["metadata"], {"provider": "groq"})
+
+        conflict = mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-1",
+            request_fingerprint="c" * 64,
+            question="different question",
+            context_revision="b" * 64,
+        )
+        self.assertEqual(conflict["status"], "conflict")
+
+    def test_interrupted_turn_can_resume_and_chat_turns_are_isolated(self):
+        with self.factory() as db:
+            db.add_all([
+                Chat(
+                    chat_id="turn-chat",
+                    user_id="user-a",
+                    title="title",
+                    created_at=1,
+                    updated_at=1,
+                ),
+                Chat(
+                    chat_id="other-chat",
+                    user_id="user-b",
+                    title="title",
+                    created_at=1,
+                    updated_at=1,
+                ),
+            ])
+            db.commit()
+
+        mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-1",
+            request_fingerprint="a" * 64,
+            question="question",
+            context_revision="b" * 64,
+        )
+        busy = mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-2",
+            request_fingerprint="c" * 64,
+            question="second question",
+            context_revision="b" * 64,
+        )
+        self.assertEqual(busy["status"], "busy")
+
+        mapping_store.interrupt_conversation_turn("turn-chat", "request-1")
+        resumed = mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-1",
+            request_fingerprint="a" * 64,
+            question="question",
+            context_revision="d" * 64,
+        )
+        self.assertEqual(resumed["status"], "resumed")
+        self.assertEqual(resumed["previous_messages"], [])
+        self.assertEqual(resumed["is_first_message"], True)
+
+        with self.factory() as db:
+            active_turn = db.scalar(
+                select(ConversationTurn).where(
+                    ConversationTurn.chat_id == "turn-chat",
+                    ConversationTurn.request_id == "request-1",
+                )
+            )
+            active_turn.updated_at = 0
+            db.commit()
+        recovered = mapping_store.begin_conversation_turn(
+            chat_id="turn-chat",
+            user_id="user-a",
+            request_id="request-4",
+            request_fingerprint="f" * 64,
+            question="new question after abandoned request",
+            context_revision="b" * 64,
+        )
+        self.assertEqual(recovered["status"], "started")
+
+        with self.assertRaises(LookupError):
+            mapping_store.begin_conversation_turn(
+                chat_id="turn-chat",
+                user_id="user-b",
+                request_id="request-3",
+                request_fingerprint="e" * 64,
+                question="unauthorized",
+                context_revision="b" * 64,
+            )
 
     def test_file_fields_persist_as_ciphertext_and_decrypt_after_new_session(self):
         raw_csv = "Email\nalice@example.test\n"

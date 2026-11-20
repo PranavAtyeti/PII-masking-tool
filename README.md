@@ -59,7 +59,7 @@ From the repository root on Windows:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r backend\requirements.txt -r backend\requirements-postgres.txt
+pip install -r backend\requirements.txt
 python -m spacy download en_core_web_sm
 Copy-Item backend\.env.example backend\.env
 ```
@@ -105,6 +105,7 @@ The development UI runs at `http://localhost:5173` and proxies `/api` requests t
 | `PRIVY_MAX_XLSX_ZIP_ENTRIES`, `PRIVY_MAX_XLSX_UNCOMPRESSED_BYTES`, `PRIVY_MAX_XLSX_ENTRY_BYTES`, `PRIVY_MAX_XLSX_COMPRESSION_RATIO` | XLSX archive-bomb protections. |
 | `PRIVY_MAX_CONTEXT_TOKENS_PER_FILE`, `PRIVY_MAX_TOTAL_FILE_CONTEXT_TOKENS` | Per-file and per-request masked-data context budgets. Defaults: 90,000 and 110,000 tokens. |
 | `PRIVY_MAX_HISTORY_MESSAGES` | Recent turns preserved for conversational continuity. Default: 32. |
+| `PRIVY_ACTIVE_TURN_TIMEOUT_SECONDS` | Treat an in-progress turn older than this threshold as interrupted so a crashed worker can be retried. Default: 1,800 seconds. |
 | `PRIVY_CONCISE_MAX_OUTPUT_TOKENS`, `PRIVY_DETAILED_MAX_OUTPUT_TOKENS` | Response budgets. Defaults: 2,048 and 16,384 tokens. |
 | `PRIVY_MODEL_METADATA` | Optional JSON keyed by registered model ID to configure verified `context_window_tokens`, `max_output_tokens`, and known capability overrides. Unconfigured limits remain unknown. |
 | `PRIVY_PROVIDER_OVERHEAD_TOKENS` | Approximate allowance for provider request overhead during prompt budgeting. Default: 256. |

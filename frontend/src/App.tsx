@@ -587,6 +587,7 @@ export default function App() {
 
     setIsStreaming(true);
     setToolStatus(null);
+    const requestId = crypto.randomUUID();
 
     const runStream = async (allowUnmaskedRisk: boolean) => {
       const controller = new AbortController();
@@ -595,6 +596,7 @@ export default function App() {
       await api.streamMessage(
         chatId!,
         {
+          request_id: requestId,
           question: text,
           use_ner: true,
           ner_confidence: 0.6,

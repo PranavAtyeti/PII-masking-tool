@@ -24,6 +24,7 @@ from .models import (
     Chat,
     ChatFile,
     ChatMessage,
+    ConversationTurn,
     GuestSession,
     TokenEntry,
     User,
@@ -499,6 +500,258 @@ def get_chat_messages(chat_id: str) -> list:
                 "metadata": metadata,
             })
         return out
+
+
+def _message_dict(row: ChatMessage) -> dict:
+    try:
+        metadata = json.loads(row.metadata_json) if row.metadata_json else {}
+    except (TypeError, ValueError):
+        metadata = {}
+    return {
+        "role": row.role,
+        "content": decrypt_text(
+            row.content,
+            aad=f"chat-message:{row.chat_id}:{row.role}",
+        ),
+        "masked_count": row.masked_count,
+        "metadata": metadata,
+    }
+
+
+def _history_before(db, chat_id: str, message_id: int) -> list[dict]:
+    rows = db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.chat_id == chat_id, ChatMessage.id < message_id)
+        .order_by(ChatMessage.id.asc())
+    ).all()
+    return [_message_dict(row) for row in rows]
+
+
+def begin_conversation_turn(
+    *,
+    chat_id: str,
+    user_id: str,
+    request_id: str,
+    request_fingerprint: str,
+    question: str,
+    context_revision: str,
+) -> dict:
+    """Atomically claim a chat turn and persist its encrypted user message."""
+    if not request_id or len(request_id) > 64:
+        raise ValueError("A valid request id is required")
+    now = time.time()
+    try:
+        with SessionLocal() as db:
+            chat = db.scalar(
+                select(Chat)
+                .where(Chat.chat_id == chat_id, Chat.user_id == user_id)
+                .with_for_update()
+            )
+            if chat is None:
+                raise LookupError("Chat not found")
+
+            stale_after = max(
+                60,
+                int(os.getenv("PRIVY_ACTIVE_TURN_TIMEOUT_SECONDS", "1800")),
+            )
+            stale_turns = db.scalars(
+                select(ConversationTurn)
+                .where(
+                    ConversationTurn.chat_id == chat_id,
+                    ConversationTurn.status == "in_progress",
+                    ConversationTurn.updated_at <= now - stale_after,
+                )
+                .with_for_update()
+            ).all()
+            for stale_turn in stale_turns:
+                stale_turn.status = "interrupted"
+                stale_turn.updated_at = now
+
+            turn = db.scalar(
+                select(ConversationTurn).where(
+                    ConversationTurn.chat_id == chat_id,
+                    ConversationTurn.request_id == request_id,
+                )
+            )
+            if turn is not None:
+                if turn.request_fingerprint != request_fingerprint:
+                    return {"status": "conflict", "previous_messages": [], "is_first_message": False}
+                if turn.status == "completed":
+                    assistant = db.get(ChatMessage, turn.assistant_message_id) if turn.assistant_message_id else None
+                    if assistant is None:
+                        raise RuntimeError("Completed conversation turn has no assistant message.")
+                    return {
+                        "status": "completed",
+                        "assistant": _message_dict(assistant),
+                        "previous_messages": [],
+                        "is_first_message": False,
+                    }
+                if turn.status == "in_progress":
+                    return {"status": "busy", "previous_messages": [], "is_first_message": False}
+                if turn.assistant_message_id is not None:
+                    old_assistant = db.get(ChatMessage, turn.assistant_message_id)
+                    if old_assistant is not None:
+                        db.delete(old_assistant)
+                    turn.assistant_message_id = None
+                history = _history_before(db, chat_id, turn.user_message_id)
+                turn.status = "in_progress"
+                turn.context_revision = context_revision
+                turn.provider = None
+                turn.model = None
+                turn.updated_at = now
+                db.commit()
+                return {
+                    "status": "resumed",
+                    "previous_messages": history,
+                    "is_first_message": not history,
+                }
+
+            prior_rows = db.scalars(
+                select(ChatMessage)
+                .where(ChatMessage.chat_id == chat_id)
+                .order_by(ChatMessage.id.asc())
+            ).all()
+            history = [_message_dict(row) for row in prior_rows]
+            user_message = ChatMessage(
+                chat_id=chat_id,
+                role="user",
+                content=encrypt_text(question, aad=f"chat-message:{chat_id}:user"),
+                masked_count=0,
+                metadata_json="{}",
+                created_at=now,
+            )
+            db.add(user_message)
+            db.flush()
+            db.add(
+                ConversationTurn(
+                    chat_id=chat_id,
+                    request_id=request_id,
+                    request_fingerprint=request_fingerprint,
+                    user_message_id=user_message.id,
+                    status="in_progress",
+                    context_revision=context_revision,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            chat.updated_at = now
+            db.commit()
+            return {
+                "status": "started",
+                "previous_messages": history,
+                "is_first_message": not history,
+            }
+    except IntegrityError:
+        with SessionLocal() as db:
+            same_request = db.scalar(
+                select(ConversationTurn).where(
+                    ConversationTurn.chat_id == chat_id,
+                    ConversationTurn.request_id == request_id,
+                )
+            )
+            if same_request is not None:
+                if same_request.request_fingerprint != request_fingerprint:
+                    return {"status": "conflict", "previous_messages": [], "is_first_message": False}
+                if same_request.status == "completed":
+                    assistant = (
+                        db.get(ChatMessage, same_request.assistant_message_id)
+                        if same_request.assistant_message_id
+                        else None
+                    )
+                    if assistant is None:
+                        raise RuntimeError("Completed conversation turn has no assistant message.")
+                    return {
+                        "status": "completed",
+                        "assistant": _message_dict(assistant),
+                        "previous_messages": [],
+                        "is_first_message": False,
+                    }
+            active_turn = db.scalar(
+                select(ConversationTurn).where(
+                    ConversationTurn.chat_id == chat_id,
+                    ConversationTurn.status == "in_progress",
+                )
+            )
+            if active_turn is not None:
+                return {"status": "busy", "previous_messages": [], "is_first_message": False}
+        raise
+
+
+def update_conversation_turn(
+    chat_id: str,
+    request_id: str,
+    *,
+    provider: str,
+    model: str,
+) -> None:
+    with SessionLocal() as db:
+        turn = db.scalar(
+            select(ConversationTurn).where(
+                ConversationTurn.chat_id == chat_id,
+                ConversationTurn.request_id == request_id,
+                ConversationTurn.status == "in_progress",
+            )
+        )
+        if turn is None:
+            raise RuntimeError("Conversation turn is no longer active.")
+        turn.provider = provider
+        turn.model = model
+        turn.updated_at = time.time()
+        db.commit()
+
+
+def finish_conversation_turn(
+    chat_id: str,
+    request_id: str,
+    content: str,
+    masked_count: int,
+    metadata: dict | None = None,
+    *,
+    status: str = "completed",
+) -> None:
+    if status not in {"completed", "failed"}:
+        raise ValueError("Invalid completed turn status")
+    now = time.time()
+    with SessionLocal() as db:
+        turn = db.scalar(
+            select(ConversationTurn).where(
+                ConversationTurn.chat_id == chat_id,
+                ConversationTurn.request_id == request_id,
+                ConversationTurn.status == "in_progress",
+            )
+        )
+        if turn is None:
+            raise RuntimeError("Conversation turn is no longer active.")
+        assistant = ChatMessage(
+            chat_id=chat_id,
+            role="assistant",
+            content=encrypt_text(content, aad=f"chat-message:{chat_id}:assistant"),
+            masked_count=masked_count,
+            metadata_json=json.dumps(metadata or {}, ensure_ascii=True),
+            created_at=now,
+        )
+        db.add(assistant)
+        db.flush()
+        turn.assistant_message_id = assistant.id
+        turn.status = status
+        turn.updated_at = now
+        db.execute(update(Chat).where(Chat.chat_id == chat_id).values(updated_at=now))
+        db.commit()
+
+
+def interrupt_conversation_turn(chat_id: str, request_id: str) -> None:
+    """Make an interrupted request eligible for a same-idempotency-key retry."""
+    with SessionLocal() as db:
+        db.execute(
+            update(ConversationTurn)
+            .where(
+                ConversationTurn.chat_id == chat_id,
+                ConversationTurn.request_id == request_id,
+                ConversationTurn.status == "in_progress",
+            )
+            .values(status="interrupted", updated_at=time.time())
+        )
+        db.commit()
 
 
 def add_message(chat_id: str, role: str, content: str, masked_count: int = 0, metadata: dict | None = None) -> None:

@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models for Privy."""
 
-from sqlalchemy import Boolean, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -95,6 +95,49 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("ix_chat_messages_chat_id", "chat_id", "id"),
+    )
+
+
+class ConversationTurn(Base):
+    """Non-content lifecycle metadata for one idempotent chat request."""
+
+    __tablename__ = "conversation_turns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("chats.chat_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_message_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("chat_messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    assistant_message_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("chat_messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    context_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "request_id", name="uq_conversation_turn_request"),
+        Index(
+            "uq_conversation_turn_active_chat",
+            "chat_id",
+            unique=True,
+            postgresql_where=text("status = 'in_progress'"),
+            sqlite_where=text("status = 'in_progress'"),
+        ),
+        Index("ix_conversation_turn_chat_created", "chat_id", "created_at"),
     )
 
 

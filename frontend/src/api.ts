@@ -297,6 +297,7 @@ export const api = {
   async streamMessage(
     chatId: string,
     body: {
+      request_id: string;
       question: string;
       use_ner: boolean;
       ner_confidence: number;

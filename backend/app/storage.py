@@ -21,8 +21,6 @@ from __future__ import annotations
 
 import os
 
-from google.cloud import storage
-
 from .encryption import decrypt_bytes, encrypt_bytes
 
 
@@ -32,6 +30,14 @@ class StorageConfigError(RuntimeError):
 
 class GCSStorage:
     def __init__(self) -> None:
+        try:
+            from google.cloud import storage
+        except ImportError as exc:
+            raise RuntimeError(
+                "Google Cloud Storage support requires the optional "
+                "'google-cloud-storage' package."
+            ) from exc
+
         self.bucket_name = os.getenv("GCS_BUCKET_NAME", "").strip()
         if not self.bucket_name:
             raise StorageConfigError(
