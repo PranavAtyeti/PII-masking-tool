@@ -1,0 +1,10 @@
+# Resolved as a compatible set for google-cloud-kms 2.24.2 on Python 3.14.
+# Update together after checking the upstream package metadata and Linux wheels.
+google-api-core==2.25.2
+google-auth==2.62.2
+googleapis-common-protos==1.75.0
+grpc-google-iam-v1==0.14.4
+grpcio==1.85.3
+grpcio-status==1.71.2
+proto-plus==1.28.2
+protobuf==5.29.6
