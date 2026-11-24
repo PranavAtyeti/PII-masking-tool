@@ -87,7 +87,7 @@ Status labels:
 
 ## Phase 3 — Advanced analytical intelligence
 
-**Status: Pending**
+**Status: Partially implemented locally (2026-11-24)**
 
 ### Objectives
 - Support adaptive multi-step investigation and bounded autonomous reasoning.
@@ -106,19 +106,22 @@ Status labels:
 - Verified result metadata.
 
 ### Deliverables
-- Investigation planner.
-- Tool-round policies.
-- Evidence and source lineage.
-- Stopping and escalation rules.
+- Structured `execute_analysis_plan` using the existing capability registry.
+- Sequential dependencies, output references, partial success, and bounded result summaries.
+- Tool-round policies shared by Gemini and Groq provider adapters.
+- Source lineage and request-scoped chained joins across three or more source tables.
+- Backend validated join confirmation for ambiguous initial joins.
+- Deterministic dataset quality profiles, typed filter/sort, multi-column grouping and ranking, group comparisons, date trends, and safe derived columns, composable through request-scoped plan references.
 
 ### Acceptance criteria
-- Investigation is bounded and privacy-preserving.
-- Tool plans terminate on contradictions or provider failures.
-- Results remain traceable to complete data or retrieved sources.
+- Plans use registered capabilities only and are bounded by five steps, depth three, 30 seconds, existing call/round limits, and join memory/row/result ceilings.
+- Dependency references are validated and dependent work is skipped after failure while unrelated steps may continue.
+- Results remain traceable to authorized source revisions and privacy-policy revisions.
+- Remaining work: provider-level orchestration failure injection, cancellation cleanup coverage, and cross-request follow-up context tests. Prompt 4 local tests and full-suite verification are recorded in the handover after execution.
 
 ### Testing requirements
 - Mocked provider tool-loop tests.
-- Multi-step planning tests.
+- Multi-step planning, partial-result, and three-source chained-join tests.
 - Loop, budget, quota, and failure tests.
 
 ## Phase 4 — Reliability and optimization

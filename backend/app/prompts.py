@@ -34,6 +34,8 @@ RESPONSE_GUIDANCE = """Response guidance:
 - You can produce Markdown, tables, ASCII diagrams, Mermaid diagrams, examples, step-by-step explanations, and other useful formats when appropriate.
 - For file questions, use returned workbook tool results rather than generic assumptions.
 - For exact numeric questions, calculate from the complete supplied file rather than estimating from retrieved examples.
+- A bounded row or group sample is not the complete dataset. State when displayed results are truncated, and distinguish an exact aggregate over full data from a sample of records.
+- Describe comparisons as differences, not causes. Use the returned baseline, period definitions, null handling, and precision or warning metadata.
 - Do not repeatedly explain Privy's masking architecture unless it is relevant to the question.
 - If a request cannot be completed from the supplied data or capabilities, explain the limitation briefly and offer the most useful alternative.
 """
@@ -61,8 +63,17 @@ def build_privy_system_prompt(
     if tool_mode == "local_workbook_tools":
         parts.append(
             "CURRENT TOOL MODE: Local workbook tools. Use the declared tools for schema discovery, "
-            "profiles, filtering, and exact calculations. Tools enforce the file privacy policy. "
-            "Do not infer cell values from schema metadata."
+            "dataset profiling, quality checks, filtering, sorting, grouping, ranking, comparisons, "
+            "date trends, safe derived columns, joins, and exact calculations. Tools enforce the file "
+            "privacy policy. Use exact tool results and retain their stated limits. "
+            "Do not infer cell values from schema metadata. For a question needing multiple dependent "
+            "operations, use execute_analysis_plan with only registered capabilities and explicit "
+            "dependencies. Reference prior outputs with {$ref:\"step_id.field\"}; never invent result "
+            "references. Keep plans within the declared step and call limits. If a tool reports a failed "
+            "or skipped step, do not claim that calculation succeeded. Ask for clarification when source "
+            "relationships or analytical intent materially affect the answer. If a plan reports pending "
+            "approval, stop and ask the user to approve it in the interface. Join confirmation is backend "
+            "verified and must come from the user interface; never treat your own text as approval."
         )
     if length_instruction:
         parts.append(length_instruction.strip())

@@ -37,7 +37,7 @@ Privy is a privacy-focused AI chat application for workbook and DOCX analysis. I
 
 ## Current implementation status
 
-Stages 1A through 2D functionality is established in the existing codebase.
+Stages 1A through 2D functionality is established in the existing codebase. Prompt 3 orchestration and Prompt 4 deterministic analytical capabilities are implemented and locally verified.
 
 Recent DOCX improvements were implemented locally:
 
@@ -48,6 +48,10 @@ Recent DOCX improvements were implemented locally:
 - Privacy fail-closed checks for excluded and sensitive Share documents.
 - Frontend duplicate-send protection and refresh retry cleanup.
 - Synthetic DOCX extraction, retrieval, privacy, and calculation regressions.
+- Bounded `execute_analysis_plan` operations through the existing tool registry, with dependency validation, request-scoped output references, partial success, and capability metadata.
+- Chained joins that reuse a complete request-scoped result to add more authorized source tables, preserving source and policy revisions through three-or-more-source workflows.
+- Complete-dataset profiles and quality metrics; composable typed filters and stable sorts; multi-column grouping, aggregates, ranking and comparisons; calendar trends; fixed-operation Decimal/date derived columns.
+- Request-scoped filtered and calculated outputs that feed later registered plan steps, with explicit precision/exactness, missing-data, result-size, and memory reporting.
 
 Eleven code-review comments were reportedly resolved in the local worktree. The fixes and resolution should be rechecked by the next agent if they depend on the final implementation.
 
@@ -71,6 +75,18 @@ Prompt 2 verification performed locally:
 - Alembic has one head, `0009_join_confirmations`; the migration was not applied.
 - Live PostgreSQL, Gemini, Groq, and Cloud KMS behavior remains unverified.
 
+Prompt 3 focused tool verification:
+
+- The analytical tool suite has 18 tests, including plan validation, partial success, confirmation pause, and a three-source chained join with an exact downstream aggregate.
+- Fresh verification: backend suite 93 tests passed; frontend TypeScript and Vite production build passed; Python compilation and `git diff --check` passed; Alembic reports one head, `0009_join_confirmations`.
+- No live provider verification was performed; the existing mocked Gemini/Groq shared tool-loop tests remain in the suite.
+
+Prompt 4 verification:
+
+- Focused workbook tool suite: 26 tests passed; full backend suite: 101 tests passed.
+- Python compilation and `git diff --check` passed. Alembic reports one head, `0009_join_confirmations`.
+- No migration was created or applied. Frontend files were unchanged; live PostgreSQL and provider behavior remain unverified.
+
 The informal 28-record DOCX experiment is not a project acceptance blocker; synthetic fixtures define acceptance.
 
 Independent Codex review is optional and should not be repeated unless a new implementation batch introduces meaningful risk.
@@ -83,7 +99,9 @@ Do not claim deployment success. Any deployment or migration execution requires 
 
 ## Outstanding issues
 
-- Extend joins to compose three or more sources through intermediate result references.
+- Add provider-loop failure injection and cross-request follow-up context tests for plans.
+- Add cancellation and memory-limit cleanup coverage for chained plans.
+- Chained join ambiguity currently fails closed and does not create a new confirmation workflow for the joined-result-to-source relationship.
 - Add frontend integration/browser coverage for the confirmation prompt and repeat-question approval flow.
 - Expand regression coverage for memory ceilings and cleanup on tool failure/cancellation.
 - Verify mixed spreadsheet/DOCX tool privacy in live provider calls.
@@ -95,11 +113,11 @@ Do not claim deployment success. Any deployment or migration execution requires 
 
 ## Next recommended task
 
-Continue Phase 2 verification and prepare Phase 3 work:
+Continue Phase 3 verification:
 
 1. Verify migration `0009_join_confirmations` against an isolated PostgreSQL database when one is available; it was not run here.
-2. Add multi-source chained joins and provider-loop tests for mixed-format workflows.
-3. Add frontend browser tests for explicit approval and the subsequent confirmed analysis.
+2. Add provider-loop failure injection and cancellation/resource-limit tests for plans.
+3. Add cross-request follow-up context tests and browser coverage for explicit approval followed by confirmed analysis.
 4. Keep persistent analytical workspace and secure sandbox work deferred to their planned phases.
 
 ## Documentation update rule

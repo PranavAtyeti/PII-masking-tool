@@ -11,8 +11,9 @@ import time
 import hashlib
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
+from fractions import Fraction
 from typing import Any, Callable
 
 import pandas as pd
@@ -40,6 +41,15 @@ MAX_TOOL_EXECUTION_SECONDS = float(os.getenv("PRIVY_MAX_TOOL_EXECUTION_SECONDS",
 MAX_JOIN_SOURCE_ROWS = max(1, min(int(os.getenv("PRIVY_MAX_JOIN_SOURCE_ROWS", "20000")), 20000))
 MAX_JOIN_OUTPUT_ROWS = max(1, min(int(os.getenv("PRIVY_MAX_JOIN_OUTPUT_ROWS", "10000")), 10000))
 MAX_JOIN_MEMORY_BYTES = max(1024, min(int(os.getenv("PRIVY_MAX_JOIN_MEMORY_BYTES", str(32 * 1024 * 1024))), 32 * 1024 * 1024))
+MAX_ANALYSIS_PLAN_STEPS = max(1, min(int(os.getenv("PRIVY_MAX_ANALYSIS_PLAN_STEPS", "5")), 5))
+MAX_ANALYSIS_PLAN_DEPTH = max(1, min(int(os.getenv("PRIVY_MAX_ANALYSIS_PLAN_DEPTH", "3")), 3))
+MAX_ANALYSIS_PLAN_SECONDS = max(1.0, min(float(os.getenv("PRIVY_MAX_ANALYSIS_PLAN_SECONDS", "30")), 30.0))
+MAX_ANALYSIS_GROUP_CARDINALITY = max(20, min(int(os.getenv("PRIVY_MAX_ANALYSIS_GROUP_CARDINALITY", "5000")), 5000))
+
+
+def _new_result_ref() -> str:
+    """Return an opaque high-entropy handle that cannot resemble numeric PII."""
+    return uuid.uuid4().hex.translate(str.maketrans("0123456789", "abcdefghij"))
 
 _AGGREGATIONS = {"count", "sum", "average", "minimum", "maximum", "distinct_count"}
 _FILTER_OPERATORS = {
@@ -85,15 +95,16 @@ _RESULT_SCHEMAS = {
     "filter_rows": {
         "type": "object",
         "properties": {
-            "workbook_id": {"type": "string"},
-            "worksheet_id": {"type": "string"},
+            "workbook_id": {"type": ["string", "null"]},
+            "worksheet_id": {"type": ["string", "null"]},
             "exact": {"type": "boolean"},
             "matched_row_count": {"type": "integer"},
             "returned_row_count": {"type": "integer"},
             "truncated": {"type": "boolean"},
+            "result_ref": {"type": "string"},
             "rows": {"type": "array", "items": {"type": "object"}},
         },
-        "required": ["workbook_id", "worksheet_id", "exact", "matched_row_count", "returned_row_count", "truncated", "rows"],
+        "required": ["exact", "matched_row_count", "returned_row_count", "truncated", "result_ref", "rows"],
     },
     "aggregate_data": {
         "type": "object",
@@ -112,25 +123,27 @@ _RESULT_SCHEMAS = {
     "group_and_aggregate": {
         "type": "object",
         "properties": {
-            "workbook_id": {"type": "string"},
-            "worksheet_id": {"type": "string"},
+            "workbook_id": {"type": ["string", "null"]},
+            "worksheet_id": {"type": ["string", "null"]},
             "aggregation": {"type": "string"},
             "row_count": {"type": "integer"},
             "group_count": {"type": "integer"},
             "exact": {"type": "boolean"},
             "groups": {"type": "array", "items": {"type": "object"}},
         },
-        "required": ["workbook_id", "worksheet_id", "aggregation", "row_count", "group_count", "exact", "groups"],
+        "required": ["aggregation", "row_count", "group_count", "exact", "groups"],
     },
     "compare_groups": {
         "type": "object",
         "properties": {
-            "workbook_id": {"type": "string"},
-            "worksheet_id": {"type": "string"},
+            "workbook_id": {"type": ["string", "null"]},
+            "worksheet_id": {"type": ["string", "null"]},
             "aggregation": {"type": "string"},
             "row_count": {"type": "integer"},
             "exact": {"type": "boolean"},
             "comparisons": {"type": "array", "items": {"type": "object"}},
+            "absolute_difference": {"type": ["string", "null"]},
+            "percentage_change": {"type": ["string", "null"]},
         },
         "required": ["workbook_id", "worksheet_id", "aggregation", "row_count", "exact", "comparisons"],
     },
@@ -163,18 +176,25 @@ class ProfileArgs(ColumnArgs):
 
 
 class FilterCondition(_StrictArgs):
-    column_id: str = Field(min_length=1, max_length=64)
+    column_id: str = Field(min_length=1, max_length=160)
     operator: str
     value: str | int | float | bool | None = None
 
 
+class SortOrder(_StrictArgs):
+    column_id: str = Field(min_length=1, max_length=160)
+    direction: str = "ascending"
+
+
 class FilterArgs(_StrictArgs):
-    file_id: str = Field(min_length=1, max_length=64)
-    worksheet_id: str = Field(min_length=1, max_length=64)
+    file_id: str | None = Field(default=None, min_length=1, max_length=64)
+    worksheet_id: str | None = Field(default=None, min_length=1, max_length=64)
+    result_ref: str | None = Field(default=None, min_length=32, max_length=32)
     conditions: list[FilterCondition] = Field(min_length=1, max_length=MAX_FILTER_CONDITIONS)
     match: str = "all"
     columns: list[str] = Field(min_length=1, max_length=MAX_FILTER_COLUMNS)
     limit: int = Field(default=MAX_TOOL_ROWS, ge=1, le=MAX_TOOL_ROWS)
+    sort_by: list[SortOrder] = Field(default_factory=list, max_length=3)
 
 
 class AggregateArgs(_StrictArgs):
@@ -184,22 +204,63 @@ class AggregateArgs(_StrictArgs):
     column_id: str | None = Field(default=None, max_length=64)
 
 
+class GroupMetric(_StrictArgs):
+    alias: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    aggregation: str
+    metric_column_id: str | None = Field(default=None, max_length=160)
+
+
 class GroupAggregateArgs(_StrictArgs):
+    file_id: str | None = Field(default=None, min_length=1, max_length=64)
+    worksheet_id: str | None = Field(default=None, min_length=1, max_length=64)
+    result_ref: str | None = Field(default=None, min_length=32, max_length=32)
+    group_column_id: str | None = Field(default=None, min_length=1, max_length=160)
+    group_column_ids: list[str] | None = Field(default=None, min_length=1, max_length=3)
+    aggregation: str
+    metric_column_id: str | None = Field(default=None, max_length=160)
+    limit: int = Field(default=MAX_TOOL_GROUPS, ge=1, le=MAX_TOOL_GROUPS)
+    additional_aggregations: list[GroupMetric] = Field(default_factory=list, max_length=4)
+    sort_direction: str = "none"
+    sort_metric: str = "primary"
+    rank_method: str = "first"
+    include_ties: bool = False
+
+
+class DatasetProfileArgs(_StrictArgs):
     file_id: str = Field(min_length=1, max_length=64)
     worksheet_id: str = Field(min_length=1, max_length=64)
-    group_column_id: str = Field(min_length=1, max_length=64)
+    include_outliers: bool = True
+
+
+class TrendArgs(_StrictArgs):
+    file_id: str = Field(min_length=1, max_length=64)
+    worksheet_id: str = Field(min_length=1, max_length=64)
+    date_column_id: str = Field(min_length=1, max_length=64)
+    interval: str
     aggregation: str
     metric_column_id: str | None = Field(default=None, max_length=64)
     limit: int = Field(default=MAX_TOOL_GROUPS, ge=1, le=MAX_TOOL_GROUPS)
 
 
+class DerivedColumnArgs(_StrictArgs):
+    file_id: str | None = Field(default=None, min_length=1, max_length=64)
+    worksheet_id: str | None = Field(default=None, min_length=1, max_length=64)
+    result_ref: str | None = Field(default=None, min_length=32, max_length=32)
+    operation: str
+    left_column_id: str = Field(min_length=1, max_length=160)
+    right_column_id: str = Field(min_length=1, max_length=160)
+    alias: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
 class CompareGroupsArgs(_StrictArgs):
-    file_id: str = Field(min_length=1, max_length=64)
-    worksheet_id: str = Field(min_length=1, max_length=64)
-    group_column_id: str = Field(min_length=1, max_length=64)
+    file_id: str | None = Field(default=None, min_length=1, max_length=64)
+    worksheet_id: str | None = Field(default=None, min_length=1, max_length=64)
+    result_ref: str | None = Field(default=None, min_length=32, max_length=32)
+    group_column_id: str = Field(min_length=1, max_length=160)
     group_values: list[str] = Field(min_length=2, max_length=5)
     aggregation: str
-    metric_column_id: str | None = Field(default=None, max_length=64)
+    metric_column_id: str | None = Field(default=None, max_length=160)
+    include_change: bool = False
 
 
 class JoinDiscoveryArgs(_StrictArgs):
@@ -207,9 +268,11 @@ class JoinDiscoveryArgs(_StrictArgs):
 
 
 class JoinArgs(_StrictArgs):
-    left_file_id: str = Field(min_length=1, max_length=64)
-    left_worksheet_id: str = Field(min_length=1, max_length=64)
-    left_key_column_id: str = Field(min_length=1, max_length=64)
+    left_file_id: str | None = Field(default=None, min_length=1, max_length=64)
+    left_worksheet_id: str | None = Field(default=None, min_length=1, max_length=64)
+    left_key_column_id: str | None = Field(default=None, min_length=1, max_length=64)
+    left_result_ref: str | None = Field(default=None, min_length=32, max_length=32)
+    left_key_column_ref: str | None = Field(default=None, max_length=160)
     right_file_id: str = Field(min_length=1, max_length=64)
     right_worksheet_id: str = Field(min_length=1, max_length=64)
     right_key_column_id: str = Field(min_length=1, max_length=64)
@@ -218,9 +281,21 @@ class JoinArgs(_StrictArgs):
 
 
 class JoinedAggregateArgs(_StrictArgs):
-    result_ref: str = Field(min_length=36, max_length=36)
+    result_ref: str = Field(min_length=32, max_length=32)
     aggregation: str
     column_ref: str | None = Field(default=None, max_length=140)
+
+
+class AnalysisPlanStep(_StrictArgs):
+    step_id: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")
+    capability: str = Field(min_length=1, max_length=64)
+    arguments: dict[str, Any]
+    depends_on: list[str] = Field(default_factory=list, max_length=MAX_ANALYSIS_PLAN_STEPS)
+
+
+class AnalysisPlanArgs(_StrictArgs):
+    objective: str = Field(min_length=1, max_length=512)
+    steps: list[AnalysisPlanStep] = Field(min_length=1, max_length=MAX_ANALYSIS_PLAN_STEPS)
 
 
 @dataclass
@@ -284,6 +359,8 @@ class JoinedToolResult:
     created_at: float
     memory_bytes: int
     transformations: list[str]
+    exact: bool = True
+    warnings: list[str] = field(default_factory=list)
 
 
 def cleanup_tool_context(context: ToolContext) -> None:
@@ -357,6 +434,11 @@ def _attach_result_contract(context: ToolContext, operation: str, arguments: dic
             identity = _source_identity(context, source["file_id"], source.get("worksheet_id", ""))
             if identity not in identities:
                 identities.append(identity)
+    unique_identities = []
+    for identity in identities:
+        if identity not in unique_identities:
+            unique_identities.append(identity)
+    identities = unique_identities
     conditions = arguments.get("conditions") or []
     result.update({
         "operation": operation,
@@ -371,10 +453,28 @@ def _attach_result_contract(context: ToolContext, operation: str, arguments: dic
                 {"column_id": condition.get("column_id"), "operator": condition.get("operator")}
                 for condition in conditions if isinstance(condition, dict)
             ],
-            "join_keys": ([
+            "join_keys": result.get("join_keys") or ([
                 {"file_id": arguments.get("left_file_id"), "worksheet_id": arguments.get("left_worksheet_id"), "column_id": arguments.get("left_key_column_id")},
                 {"file_id": arguments.get("right_file_id"), "worksheet_id": arguments.get("right_worksheet_id"), "column_id": arguments.get("right_key_column_id")},
             ] if operation == "join_tables" else []),
+            "sort": [
+                {"column_id": item.get("column_id"), "direction": item.get("direction")}
+                for item in arguments.get("sort_by", []) if isinstance(item, dict)
+            ],
+            "calculations": ([{
+                "operation": arguments.get("operation"),
+                "left_column_id": arguments.get("left_column_id"),
+                "right_column_id": arguments.get("right_column_id"),
+                "derived_column_ref": result.get("column_ref"),
+            }] if operation == "calculate_columns" else []),
+            "grouping": ([{
+                "group_column_id": arguments.get("group_column_id"),
+                "group_column_ids": arguments.get("group_column_ids"),
+                "aggregation": arguments.get("aggregation"),
+                "metric_column_id": arguments.get("metric_column_id"),
+                "additional_aggregations": arguments.get("additional_aggregations", []),
+                "sort_direction": arguments.get("sort_direction", "none"),
+            }] if operation == "group_and_aggregate" else []),
         },
         "input_record_count": result.get("row_count", result.get("total_rows", (
             (result.get("left_row_count") or 0) + (result.get("right_row_count") or 0)
@@ -385,8 +485,11 @@ def _attach_result_contract(context: ToolContext, operation: str, arguments: dic
         "warnings": result.get("warnings", []),
         "validation_checks": [*result.get("validation_checks", []), "chat_ownership", "file_ownership", "privacy_policy", "bounded_result", "outbound_pii_scan"],
         "execution_metadata": {"engine": "pandas", "bounded": True},
-        "partial_result": bool(result.get("truncated", False)),
-        "limitations": (["Result rows were capped by the configured tool limit."] if result.get("truncated") else []),
+        "partial_result": bool(result.get("partial_result", False) or result.get("truncated", False)),
+        "limitations": list(dict.fromkeys([
+            *result.get("limitations", []),
+            *( ["Result rows were capped by the configured tool limit."] if result.get("truncated") else [] ),
+        ])),
     })
     result.setdefault("privacy_policy_revision", identities[0]["privacy_policy_revision"] if identities else None)
     return result
@@ -408,6 +511,24 @@ class ToolDefinition:
             "name": self.name,
             "description": self.description,
             "parameters": self.parameters,
+        }
+
+    def capability(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": 1,
+            "supported_operations": [self.name],
+            "input_contract": self.argument_model.model_json_schema(),
+            "output_contract": self.result_schema,
+            "required_permissions": sorted(self.required_permissions),
+            "supported_source_types": ["csv", "xls", "xlsx", "docx_table"],
+            "resource_requirements": {"bounded": True, "max_result_bytes": self.max_result_bytes,
+                                       "max_intermediate_memory_bytes": MAX_JOIN_MEMORY_BYTES,
+                                       "max_source_rows": MAX_JOIN_SOURCE_ROWS, "max_output_rows": MAX_JOIN_OUTPUT_ROWS},
+            "execution_limits": {"calls_per_request": MAX_TOOL_CALLS_PER_REQUEST, "rounds": MAX_TOOL_ROUNDS,
+                                 "plan_steps": MAX_ANALYSIS_PLAN_STEPS, "plan_dependency_depth": MAX_ANALYSIS_PLAN_DEPTH,
+                                 "plan_seconds": MAX_ANALYSIS_PLAN_SECONDS, "tool_seconds": MAX_TOOL_EXECUTION_SECONDS},
+            "confirmation_required": self.name in {"join_tables", "discover_joins"},
         }
 
 
@@ -999,6 +1120,10 @@ def _discover_joins(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]
 def _join_tables(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
     args = raw_args
     assert isinstance(args, JoinArgs)
+    if args.left_result_ref:
+        return _join_prior_result(context, args)
+    if not args.left_file_id or not args.left_worksheet_id or not args.left_key_column_id:
+        raise ToolExecutionError("invalid_sources", "A join needs a source table or a current joined result on its left side.")
     if args.left_file_id == args.right_file_id:
         raise ToolExecutionError("invalid_sources", "A join requires two distinct attached files.")
     left_sheet = _get_sheet(context, args.left_file_id, args.left_worksheet_id)
@@ -1130,7 +1255,7 @@ def _join_tables(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
     memory_bytes = int(derived_frame.memory_usage(index=True, deep=True).sum())
     if context.join_result_bytes + memory_bytes > MAX_JOIN_MEMORY_BYTES:
         raise ToolExecutionError("join_memory_limit", "The joined result exceeds the request memory limit.")
-    result_ref = str(uuid.uuid4())
+    result_ref = _new_result_ref()
     source_identities = [
         _source_identity(context, args.left_file_id, args.left_worksheet_id),
         _source_identity(context, args.right_file_id, args.right_worksheet_id),
@@ -1181,28 +1306,127 @@ def _join_tables(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
     }
 
 
-def _aggregate_joined(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
-    args = raw_args
-    assert isinstance(args, JoinedAggregateArgs)
-    dataset = context.join_results.get(args.result_ref)
+def _validated_join_result(context: ToolContext, result_ref: str) -> JoinedToolResult:
+    dataset = context.join_results.get(result_ref)
     if dataset is None:
         raise ToolExecutionError("result_not_found", "That intermediate result is unavailable in this request.")
     if dataset.owner_id != context.user_id or dataset.chat_id != context.chat_id:
         raise ToolExecutionError("result_forbidden", "That intermediate result is not available in this conversation.")
     if time.monotonic() - dataset.created_at > 300:
-        context.join_results.pop(args.result_ref, None)
-        context.join_result_bytes = max(0, context.join_result_bytes - dataset.memory_bytes)
+        _discard_join_result(context, result_ref)
         raise ToolExecutionError("result_expired", "That intermediate result has expired.")
-    current_sources = []
     try:
-        for source in dataset.sources:
-            current_sources.append(_source_identity(context, source["file_id"], source["table_id"]))
+        current = [_source_identity(context, source["file_id"], source["table_id"]) for source in dataset.sources]
     except (KeyError, ToolExecutionError):
-        current_sources = []
-    if current_sources != dataset.sources:
-        context.join_results.pop(args.result_ref, None)
-        context.join_result_bytes = max(0, context.join_result_bytes - dataset.memory_bytes)
+        current = []
+    if not current or current != dataset.sources:
+        _discard_join_result(context, result_ref)
         raise ToolExecutionError("stale_result", "A source or privacy policy changed; rediscover and rejoin the files.")
+    return dataset
+
+
+def _join_prior_result(context: ToolContext, args: JoinArgs) -> dict[str, Any]:
+    """Append one authorized source to a complete request-scoped joined result."""
+    if not args.left_result_ref or not args.left_key_column_ref:
+        raise ToolExecutionError("invalid_sources", "A prior result join needs its result and key column references.")
+    if not args.right_file_id or not args.right_worksheet_id or not args.right_key_column_id:
+        raise ToolExecutionError("invalid_sources", "A prior result join needs an authorized right source table.")
+    dataset = _validated_join_result(context, args.left_result_ref)
+    if any(source.get("file_id") == args.right_file_id for source in dataset.sources):
+        raise ToolExecutionError("invalid_sources", "A source file can appear only once in a joined result.")
+    right_sheet = _get_sheet(context, args.right_file_id, args.right_worksheet_id)
+    right_key = _get_column(right_sheet, args.right_key_column_id)
+    left_key = dataset.columns.get(args.left_key_column_ref)
+    if left_key is None or args.left_key_column_ref not in dataset.frame:
+        raise ToolExecutionError("column_not_found", "The prior result key column is unavailable.")
+    if left_key.action != "share" or right_key.action != "share":
+        raise ToolExecutionError("ineligible_join_key", "Join keys must be explicitly Share-permitted columns.")
+    left_matches = [column for column in dataset.columns.values()
+                    if re.sub(r"[^a-z0-9]+", "", column.name.casefold()) == re.sub(r"[^a-z0-9]+", "", right_key.name.casefold())]
+    right_matches = [column for column in right_sheet.columns
+                     if column.action == "share" and re.sub(r"[^a-z0-9]+", "", column.name.casefold()) == re.sub(r"[^a-z0-9]+", "", left_key.name.casefold())]
+    if len(left_matches) != 1 or len(right_matches) != 1 or left_matches[0].column_id != left_key.column_id or right_matches[0].column_id != right_key.column_id:
+        raise ToolExecutionError("ambiguous_join", "This chained relationship is ambiguous; select a unique Share-permitted key relationship.")
+    right_frame = _ensure_frame(context, args.right_file_id, right_sheet)
+    if len(dataset.frame) > MAX_JOIN_SOURCE_ROWS or len(right_frame) > MAX_JOIN_SOURCE_ROWS:
+        raise ToolExecutionError("join_source_too_large", "Join sources exceed the configured row safety limit.")
+    left_values = dataset.frame[args.left_key_column_ref].tolist()
+    right_values = _series(right_sheet, right_key, right_frame).tolist()
+    left_non_null, right_non_null = _non_null(pd.Series(left_values)), _non_null(pd.Series(right_values))
+    if not left_non_null or not right_non_null or _column_kind(left_non_null) != _column_kind(right_non_null):
+        raise ToolExecutionError("incompatible_join_keys", "Join keys have no compatible, non-null values.")
+    kind = _column_kind(left_non_null)
+    def normalize(value: Any) -> Any:
+        if kind == "numeric": return _as_decimal(value)
+        if kind == "date": return _date_comparison_value(value)
+        return str(value)
+    left_keys = [normalize(value) for value in left_values if value is not None and not pd.isna(value)]
+    right_keys = [normalize(value) for value in right_values if value is not None and not pd.isna(value)]
+    left_counts: dict[Any, int] = {}
+    right_counts: dict[Any, int] = {}
+    for value in left_keys: left_counts[value] = left_counts.get(value, 0) + 1
+    for value in right_keys: right_counts[value] = right_counts.get(value, 0) + 1
+    left_unique, right_unique = len(left_keys) == len(set(left_keys)), len(right_keys) == len(set(right_keys))
+    if not left_unique and not right_unique:
+        raise ToolExecutionError("many_to_many_join", "This many-to-many relationship could multiply records unsafely.")
+    expected = sum(count * right_counts.get(value, 0) for value, count in left_counts.items())
+    if expected > MAX_JOIN_OUTPUT_ROWS:
+        raise ToolExecutionError("join_output_too_large", "The join would exceed the configured output safety limit.")
+    left_columns = [_get_column_from_result(dataset, ref) for ref in args.left_columns]
+    right_columns = [_get_column(right_sheet, ref) for ref in args.right_columns]
+    if len(set(args.left_columns)) != len(args.left_columns) or len(set(args.right_columns)) != len(args.right_columns):
+        raise ToolExecutionError("invalid_join_columns", "Join output columns must be unique.")
+    if args.left_key_column_ref not in args.left_columns:
+        raise ToolExecutionError("invalid_join_columns", "Join output columns must include the selected prior-result key.")
+    left_data = dataset.frame[args.left_columns].copy().rename(columns={ref: f"left:{ref}" for ref in args.left_columns})
+    right_refs = [column.column_id for column in right_columns]
+    right_data = right_frame[[column.policy_key for column in right_columns]].copy()
+    right_data.columns = [f"right:{args.right_file_id}:{ref}" for ref in right_refs]
+    lk, rk = "__privy_left_join_key__", "__privy_right_join_key__"
+    left_data[lk] = [normalize(value) if value is not None and not pd.isna(value) else None for value in left_values]
+    right_data[rk] = [normalize(value) if value is not None and not pd.isna(value) else None for value in right_values]
+    left_data, right_data = left_data[left_data[lk].notna()], right_data[right_data[rk].notna()]
+    validate = "one_to_one" if left_unique and right_unique else "one_to_many" if left_unique else "many_to_one"
+    try:
+        joined = left_data.merge(right_data, how="inner", left_on=lk, right_on=rk, validate=validate, sort=False)
+    except (pd.errors.MergeError, ValueError) as exc:
+        raise ToolExecutionError("unsafe_join", "The observed join cardinality failed validation.") from exc
+    if len(joined) != expected or len(joined) > max(1, len(left_data), len(right_data)):
+        raise ToolExecutionError("join_amplification", "The join would produce excessive duplicate amplification.")
+    right_aliases = [f"right:{args.right_file_id}:{ref}" for ref in right_refs]
+    columns = {f"left:{ref}": dataset.columns[ref] for ref in args.left_columns}
+    columns.update({alias: column for alias, column in zip(right_aliases, right_columns)})
+    frame = pd.DataFrame({column: joined[column].reset_index(drop=True) for column in [*(f"left:{ref}" for ref in args.left_columns), *right_aliases]})
+    memory = int(frame.memory_usage(index=True, deep=True).sum())
+    if context.join_result_bytes + memory > MAX_JOIN_MEMORY_BYTES:
+        raise ToolExecutionError("join_memory_limit", "The joined result exceeds the request memory limit.")
+    sources = [*dataset.sources, _source_identity(context, args.right_file_id, args.right_worksheet_id)]
+    result_ref = _new_result_ref()
+    context.join_results[result_ref] = JoinedToolResult(result_ref, context.user_id, context.chat_id, frame, columns, sources, time.monotonic(), memory, [*dataset.transformations, "join_tables"], dataset.exact, list(dataset.warnings))
+    context.join_result_bytes += memory
+    rows = []
+    for row_index, (_, row) in enumerate(joined.head(MAX_TOOL_ROWS).iterrows(), start=1):
+        rows.append({"row_index": row_index, "values": {alias: _safe_value(columns[alias], row[alias]) for alias in columns}})
+    return {
+        "exact": dataset.exact, "verification_status": "exact" if dataset.exact else "not_verified", "validation_checks": ["joined_result_ownership_checked", "source_revisions_checked", "privacy_policies_checked", "join_keys_compatible", "cardinality_validated", "expected_size_checked", "duplicate_amplification_checked"],
+        "join_type": "inner", "cardinality": validate, "matched_row_count": len(joined), "expected_matched_row_count": expected,
+        "returned_row_count": len(rows), "truncated": len(joined) > len(rows), "rows": rows, "result_ref": result_ref,
+        "source_identities": sources, "prior_transformations": dataset.transformations, "join_sources": [{"file_id": item["file_id"], "worksheet_id": item["table_id"]} for item in sources],
+        "join_keys": [{"result_ref": args.left_result_ref, "column_ref": args.left_key_column_ref}, {"file_id": args.right_file_id, "worksheet_id": args.right_worksheet_id, "column_id": right_key.column_id}],
+    }
+
+
+def _get_column_from_result(dataset: JoinedToolResult, column_ref: str) -> ToolColumn:
+    column = dataset.columns.get(column_ref)
+    if column is None:
+        raise ToolExecutionError("column_not_found", "A selected prior-result column is unavailable or excluded.")
+    return column
+
+
+def _aggregate_joined(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, JoinedAggregateArgs)
+    dataset = _validated_join_result(context, args.result_ref)
     if args.aggregation not in _AGGREGATIONS:
         raise ToolExecutionError("invalid_aggregation", "That aggregation is not supported.")
     column = dataset.columns.get(args.column_ref) if args.column_ref else None
@@ -1217,16 +1441,210 @@ def _aggregate_joined(context: ToolContext, raw_args: BaseModel) -> dict[str, An
         "aggregation": args.aggregation,
         "column_ref": args.column_ref,
         "row_count": len(dataset.frame),
-        "exact": True,
+        "exact": dataset.exact,
         "source_identities": dataset.sources,
         "prior_transformations": dataset.transformations,
         **aggregate,
     }
 
 
+def tool_capabilities() -> list[dict[str, Any]]:
+    """Provider-neutral descriptions of the authoritative backend registry."""
+    return [definition.capability() for definition in _TOOL_REGISTRY.values()]
+
+
+def _resolve_plan_value(value: Any, results: dict[str, dict[str, Any]], dependencies: set[str]) -> Any:
+    if isinstance(value, dict):
+        if set(value) == {"$ref"}:
+            reference = value["$ref"]
+            if not isinstance(reference, str) or reference.count(".") != 1:
+                raise ToolExecutionError("invalid_plan_reference", "Plan references must name one dependency output field.")
+            step_id, path = reference.split(".", 1)
+            if step_id not in dependencies or step_id not in results:
+                raise ToolExecutionError("invalid_plan_reference", "A plan references an undeclared or unavailable dependency.")
+            current: Any = results[step_id]
+            for part in path.split("."):
+                if not isinstance(current, dict) or part not in current:
+                    raise ToolExecutionError("invalid_plan_reference", "A plan references an unavailable output field.")
+                current = current[part]
+            return current
+        return {key: _resolve_plan_value(item, results, dependencies) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_plan_value(item, results, dependencies) for item in value]
+    return value
+
+
+def _plan_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep only bounded result metadata needed for provider interpretation and references."""
+    keys = _plan_result_summary_keys()
+    summary = {key: result[key] for key in keys if key in result and key not in {"rows", "groups", "columns"}}
+    if isinstance(result.get("rows"), list):
+        summary["rows"] = result["rows"][:10]
+    if isinstance(result.get("groups"), list):
+        summary["groups"] = result["groups"][:MAX_TOOL_GROUPS]
+    if isinstance(result.get("columns"), list):
+        summary["columns"] = result["columns"][:20]
+        summary["profile_summary_truncated"] = len(result["columns"]) > 20
+    return summary
+
+
+def _plan_result_summary_keys() -> tuple[str, ...]:
+    return (
+        "operation", "exact", "verification_status", "row_count", "matched_row_count",
+        "returned_row_count", "value", "aggregation", "group_count", "result_ref",
+        "source_identities", "provenance", "partial_result", "limitations", "column_ref",
+        "truncated", "period_range", "period_count", "returned_group_count", "rank_method",
+        "sort_direction", "sort_metric", "duplicate_row_count", "column_count", "row_count",
+        "operation", "valid_count", "null_count", "invalid_count", "division_by_zero_count",
+        "warnings",
+        "columns", "groups", "rows",
+    )
+
+
+def _execute_analysis_plan(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, AnalysisPlanArgs)
+    steps = args.steps
+    ids = [step.step_id for step in steps]
+    if len(set(ids)) != len(ids):
+        raise ToolExecutionError("invalid_plan", "Plan step identifiers must be unique.")
+    definitions = {step_id: _TOOL_REGISTRY.get(step.capability) for step_id, step in zip(ids, steps)}
+    for index, step in enumerate(steps):
+        earlier = set(ids[:index])
+        if len(set(step.depends_on)) != len(step.depends_on) or not set(step.depends_on) <= earlier:
+            raise ToolExecutionError("invalid_plan", "Plan dependencies must refer to earlier steps and cannot be circular.")
+        if definitions[step.step_id] is None or step.capability == "execute_analysis_plan":
+            raise ToolExecutionError("unknown_capability", "The plan includes an unavailable analytical capability.")
+        refs: list[str] = []
+        for value in step.arguments.values():
+            # Validate references before execution; values are later resolved against declared outputs.
+            def collect(item: Any) -> None:
+                if isinstance(item, dict):
+                    if set(item) == {"$ref"} and isinstance(item["$ref"], str):
+                        reference = item["$ref"]
+                        if reference.count(".") != 1 or any(not part for part in reference.split(".")):
+                            raise ToolExecutionError("invalid_plan_reference", "Plan references must name one dependency output field.")
+                        parent_id, field_name = reference.split(".", 1)
+                        parent_step = next((candidate for candidate in steps if candidate.step_id == parent_id), None)
+                        parent_definition = _TOOL_REGISTRY.get(parent_step.capability) if parent_step else None
+                        if (parent_definition is None or field_name not in _plan_result_summary_keys()
+                                or field_name not in parent_definition.result_schema.get("properties", {})):
+                            raise ToolExecutionError("invalid_plan_reference", "A plan reference names an unavailable or non-shareable output field.")
+                        refs.append(parent_id)
+                    else:
+                        for nested in item.values(): collect(nested)
+                elif isinstance(item, list):
+                    for nested in item: collect(nested)
+            collect(value)
+            if any(reference not in step.depends_on for reference in refs):
+                raise ToolExecutionError("invalid_plan_reference", "Every plan reference must be a declared dependency.")
+        if not refs:
+            try:
+                definitions[step.step_id].argument_model.model_validate(step.arguments)
+            except ValidationError as exc:
+                raise ToolExecutionError("invalid_plan", "A plan step does not match its registered capability contract.") from exc
+    depth: dict[str, int] = {}
+    for step in steps:
+        depth[step.step_id] = 1 + max((depth[parent] for parent in step.depends_on), default=0)
+        if depth[step.step_id] > MAX_ANALYSIS_PLAN_DEPTH:
+            raise ToolExecutionError("plan_depth_limit", "The plan exceeds the configured dependency depth.")
+
+    started = time.monotonic()
+    outputs: dict[str, dict[str, Any]] = {}
+    summaries: list[dict[str, Any]] = []
+    failed = False
+    awaiting_confirmation = False
+    for step in steps:
+        if awaiting_confirmation:
+            summaries.append({"step_id": step.step_id, "status": "paused_for_confirmation"})
+            continue
+        if any(parent not in outputs for parent in step.depends_on):
+            summaries.append({"step_id": step.step_id, "status": "skipped_dependency_failed"})
+            failed = True
+            continue
+        if time.monotonic() - started > MAX_ANALYSIS_PLAN_SECONDS:
+            summaries.append({"step_id": step.step_id, "status": "skipped_time_limit"})
+            failed = True
+            continue
+        try:
+            resolved = _resolve_plan_value(step.arguments, outputs, set(step.depends_on))
+            definition = definitions[step.step_id]
+            assert definition is not None
+            definition.argument_model.model_validate(resolved)
+            result = execute_tool(context, step.capability, resolved)
+            outputs[step.step_id] = result
+            if step.capability == "discover_joins" and context.pending_join_confirmations:
+                summaries.append({"step_id": step.step_id, "status": "awaiting_confirmation", "result": _plan_result_summary(result)})
+                awaiting_confirmation = True
+            else:
+                summaries.append({"step_id": step.step_id, "status": "completed", "result": _plan_result_summary(result)})
+        except (ToolExecutionError, ValidationError) as exc:
+            safe_code = exc.code if isinstance(exc, ToolExecutionError) else "invalid_arguments"
+            safe_message = exc.safe_message if isinstance(exc, ToolExecutionError) else "The plan step arguments did not match the capability contract."
+            summaries.append({"step_id": step.step_id, "status": "failed", "error": {"code": safe_code, "message": safe_message}})
+            failed = True
+            # Independent later steps may still run; dependent steps are skipped above.
+        except Exception:
+            summaries.append({"step_id": step.step_id, "status": "failed", "error": {
+                "code": "operation_failed", "message": "The workbook operation could not be completed safely.",
+            }})
+            failed = True
+    sources = []
+    for result in outputs.values():
+        for identity in result.get("source_identities", []):
+            if identity not in sources:
+                sources.append(identity)
+    return {
+        "plan_version": 1,
+        "exact": all(item.get("exact") is True for result in outputs.values() for item in [result]) and not failed and not awaiting_confirmation,
+        "awaiting_confirmation": awaiting_confirmation,
+        "partial_result": failed and bool(outputs),
+        "limitations": (["User approval is required before the pending join can run."] if awaiting_confirmation else []) +
+                      (["Some plan steps failed or were skipped; only completed step results are included."] if failed else []),
+        "completed_step_count": len(outputs),
+        "source_identities": sources,
+        "steps": summaries,
+    }
+
+
+_REGISTERED_OPERATION_NAMES = [
+    "discover_joins", "join_tables", "aggregate_joined_data", "get_workbook_schema",
+    "get_column_profile", "profile_dataset", "filter_rows", "aggregate_data", "group_and_aggregate",
+    "compare_groups", "trend_analysis", "calculate_columns",
+]
+
+
 def tool_definitions() -> list[ToolDefinition]:
     common = frozenset({"read_workbook"})
     return [
+        ToolDefinition(
+            name="execute_analysis_plan",
+            description="Validate and run a bounded dependency-aware plan using only registered analytical capabilities. Use {$ref:'step_id.output_field'} for declared dependencies. The backend executes steps in order and returns bounded summaries, never complete intermediate datasets.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string", "maxLength": 512},
+                    "steps": {"type": "array", "minItems": 1, "maxItems": MAX_ANALYSIS_PLAN_STEPS, "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"},
+                            "capability": {"type": "string", "enum": _REGISTERED_OPERATION_NAMES},
+                            "arguments": {"type": "object"},
+                            "depends_on": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ANALYSIS_PLAN_STEPS},
+                        },
+                        "required": ["step_id", "capability", "arguments"],
+                        "additionalProperties": False,
+                    }},
+                },
+                "required": ["objective", "steps"],
+                "additionalProperties": False,
+            },
+            required_permissions=frozenset({"read_workbook"}),
+            argument_model=AnalysisPlanArgs,
+            handler=_execute_analysis_plan,
+            result_schema={"type": "object", "properties": {"plan_version": {"type": "integer"}, "exact": {"type": "boolean"}, "awaiting_confirmation": {"type": "boolean"}, "partial_result": {"type": "boolean"}, "completed_step_count": {"type": "integer"}, "steps": {"type": "array"}}, "required": ["plan_version", "exact", "awaiting_confirmation", "partial_result", "completed_step_count", "steps"]},
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
         ToolDefinition(
             name="discover_joins",
             description="Find possible relationships between attached files using permitted column names, types, null rates, and key uniqueness. This only discovers candidates; ambiguous relationships require user confirmation.",
@@ -1246,19 +1664,21 @@ def tool_definitions() -> list[ToolDefinition]:
                     "left_file_id": {"type": "string"},
                     "left_worksheet_id": {"type": "string"},
                     "left_key_column_id": {"type": "string"},
+                    "left_result_ref": {"type": "string", "description": "A complete joined result from an earlier step in this request."},
+                    "left_key_column_ref": {"type": "string", "description": "A Share-permitted key column reference from that joined result."},
                     "right_file_id": {"type": "string"},
                     "right_worksheet_id": {"type": "string"},
                     "right_key_column_id": {"type": "string"},
                     "left_columns": {"type": "array", "minItems": 1, "maxItems": MAX_FILTER_COLUMNS, "items": {"type": "string"}},
                     "right_columns": {"type": "array", "minItems": 1, "maxItems": MAX_FILTER_COLUMNS, "items": {"type": "string"}},
                 },
-                "required": ["left_file_id", "left_worksheet_id", "left_key_column_id", "right_file_id", "right_worksheet_id", "right_key_column_id", "left_columns", "right_columns"],
+                "required": ["right_file_id", "right_worksheet_id", "right_key_column_id", "left_columns", "right_columns"],
                 "additionalProperties": False,
             },
             required_permissions=common,
             argument_model=JoinArgs,
             handler=_join_tables,
-            result_schema={"type": "object", "properties": {"exact": {"type": "boolean"}, "cardinality": {"type": "string"}, "matched_row_count": {"type": "integer"}, "returned_row_count": {"type": "integer"}, "rows": {"type": "array"}}, "required": ["exact", "cardinality", "matched_row_count", "returned_row_count", "rows"]},
+            result_schema={"type": "object", "properties": {"exact": {"type": "boolean"}, "cardinality": {"type": "string"}, "matched_row_count": {"type": "integer"}, "returned_row_count": {"type": "integer"}, "result_ref": {"type": "string"}, "rows": {"type": "array"}}, "required": ["exact", "cardinality", "matched_row_count", "returned_row_count", "result_ref", "rows"]},
             max_result_bytes=MAX_TOOL_RESULT_BYTES,
         ),
         ToolDefinition(
@@ -1313,13 +1733,27 @@ def tool_definitions() -> list[ToolDefinition]:
             max_result_bytes=MAX_TOOL_RESULT_BYTES,
         ),
         ToolDefinition(
+            name="profile_dataset",
+            description="Profile an authorized worksheet without returning columns: types, missing and duplicate counts, distinctness, decimal descriptive statistics, safe grouping hints, exact duplicate-row count, and IQR outlier counts.",
+            parameters={"type": "object", "properties": {
+                "file_id": {"type": "string"}, "worksheet_id": {"type": "string"},
+                "include_outliers": {"type": "boolean"},
+            }, "required": ["file_id", "worksheet_id"], "additionalProperties": False},
+            required_permissions=common,
+            argument_model=DatasetProfileArgs,
+            handler=_profile_dataset,
+            result_schema={"type": "object", "properties": {"workbook_id": {"type": "string"}, "worksheet_id": {"type": "string"}, "row_count": {"type": "integer"}, "column_count": {"type": "integer"}, "duplicate_row_count": {"type": "integer"}, "exact": {"type": "boolean"}, "columns": {"type": "array"}}, "required": ["row_count", "column_count", "duplicate_row_count", "exact", "columns"]},
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
+        ToolDefinition(
             name="filter_rows",
-            description="Filter the complete authorized worksheet using bounded AND/OR conditions and return only explicitly requested, privacy-safe columns and a bounded row sample.",
+            description="Filter a complete authorized worksheet or current request-scoped result using bounded AND/OR conditions, optionally sort by up to three authorized columns, and return a safe sample plus a local result reference for downstream plan steps.",
             parameters={
                 "type": "object",
                 "properties": {
                     "file_id": {"type": "string"},
                     "worksheet_id": {"type": "string"},
+                    "result_ref": {"type": "string"},
                     "conditions": {"type": "array", "minItems": 1, "maxItems": MAX_FILTER_CONDITIONS, "items": {
                         "type": "object",
                         "properties": {
@@ -1333,8 +1767,11 @@ def tool_definitions() -> list[ToolDefinition]:
                     "match": {"type": "string", "enum": ["all", "any"]},
                     "columns": {"type": "array", "minItems": 1, "maxItems": MAX_FILTER_COLUMNS, "items": {"type": "string"}},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_TOOL_ROWS},
+                    "sort_by": {"type": "array", "maxItems": 3, "items": {"type": "object", "properties": {
+                        "column_id": {"type": "string"}, "direction": {"type": "string", "enum": ["ascending", "descending"]},
+                    }, "required": ["column_id"], "additionalProperties": False}},
                 },
-                "required": ["file_id", "worksheet_id", "conditions", "columns"],
+                "required": ["conditions", "columns"],
                 "additionalProperties": False,
             },
             required_permissions=common,
@@ -1365,18 +1802,28 @@ def tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="group_and_aggregate",
-            description="Group the complete authorized worksheet by a permitted categorical column and apply one approved aggregate, with a bounded group count.",
+            description="Group a complete authorized worksheet or current request-scoped result by one permitted categorical column; apply one primary and up to four additional exact aggregates, rank by a selected metric, and return bounded top or bottom groups.",
             parameters={
                 "type": "object",
                 "properties": {
                     "file_id": {"type": "string"},
                     "worksheet_id": {"type": "string"},
+                    "result_ref": {"type": "string"},
                     "group_column_id": {"type": "string"},
+                    "group_column_ids": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "string"}},
                     "aggregation": _aggregation_schema(),
                     "metric_column_id": {"type": ["string", "null"]},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_TOOL_GROUPS},
+                    "additional_aggregations": {"type": "array", "maxItems": 4, "items": {"type": "object", "properties": {
+                        "alias": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$"},
+                        "aggregation": _aggregation_schema(), "metric_column_id": {"type": ["string", "null"]},
+                    }, "required": ["alias", "aggregation"], "additionalProperties": False}},
+                    "sort_direction": {"type": "string", "enum": ["none", "ascending", "descending"]},
+                    "sort_metric": {"type": "string"},
+                    "rank_method": {"type": "string", "enum": ["first", "dense", "min"]},
+                    "include_ties": {"type": "boolean"},
                 },
-                "required": ["file_id", "worksheet_id", "group_column_id", "aggregation"],
+                "required": ["aggregation"],
                 "additionalProperties": False,
             },
             required_permissions=common,
@@ -1387,24 +1834,58 @@ def tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="compare_groups",
-            description="Compare two to five explicitly selected groups using an approved exact aggregate over the complete authorized worksheet.",
+            description="Compare two to five explicitly selected groups using an exact aggregate. Optional change reports absolute difference and percentage change, treating the first group as baseline and returning null percent change for a zero or missing baseline.",
             parameters={
                 "type": "object",
                 "properties": {
                     "file_id": {"type": "string"},
                     "worksheet_id": {"type": "string"},
+                    "result_ref": {"type": "string"},
                     "group_column_id": {"type": "string"},
                     "group_values": {"type": "array", "minItems": 2, "maxItems": 5, "items": {"type": "string"}},
                     "aggregation": _aggregation_schema(),
                     "metric_column_id": {"type": ["string", "null"]},
+                    "include_change": {"type": "boolean"},
                 },
-                "required": ["file_id", "worksheet_id", "group_column_id", "group_values", "aggregation"],
+                "required": ["group_column_id", "group_values", "aggregation"],
                 "additionalProperties": False,
             },
             required_permissions=common,
             argument_model=CompareGroupsArgs,
             handler=_compare_groups,
             result_schema=_RESULT_SCHEMAS["compare_groups"],
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
+        ToolDefinition(
+            name="trend_analysis",
+            description="Aggregate complete authorized records by valid day, Monday-based week, month, quarter, or year periods; output is chronological and reports missing or invalid dates and truncation.",
+            parameters={"type": "object", "properties": {
+                "file_id": {"type": "string"}, "worksheet_id": {"type": "string"},
+                "date_column_id": {"type": "string"},
+                "interval": {"type": "string", "enum": ["day", "week", "month", "quarter", "year"]},
+                "aggregation": _aggregation_schema(), "metric_column_id": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_TOOL_GROUPS},
+            }, "required": ["file_id", "worksheet_id", "date_column_id", "interval", "aggregation"], "additionalProperties": False},
+            required_permissions=common,
+            argument_model=TrendArgs,
+            handler=_trend_analysis,
+            result_schema={"type": "object", "properties": {"period_count": {"type": "integer"}, "period_range": {"type": ["object", "null"]}, "missing_date_count": {"type": "integer"}, "invalid_date_count": {"type": "integer"}, "exact": {"type": "boolean"}, "groups": {"type": "array"}}, "required": ["period_count", "missing_date_count", "invalid_date_count", "exact", "groups"]},
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
+        ToolDefinition(
+            name="calculate_columns",
+            description="Create a bounded request-scoped derived column using only add, subtract, multiply, divide, percent_change, or days_between. The complete derived values remain local and can feed aggregate_joined_data through the returned result_ref and column_ref.",
+            parameters={"type": "object", "properties": {
+                "file_id": {"type": "string"}, "worksheet_id": {"type": "string"},
+                "result_ref": {"type": "string"},
+                "operation": {"type": "string", "enum": ["add", "subtract", "multiply", "divide", "percent_change", "days_between"]},
+                "left_column_id": {"type": "string"}, "right_column_id": {"type": "string"},
+                "alias": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$"},
+            }, "required": ["operation", "left_column_id", "right_column_id", "alias"], "additionalProperties": False},
+            required_permissions=common,
+            argument_model=DerivedColumnArgs,
+            handler=_calculate_columns,
+            result_schema={"type": "object", "properties": {"result_ref": {"type": "string"}, "column_ref": {"type": "string"}, "operation": {"type": "string"}, "row_count": {"type": "integer"}, "valid_count": {"type": "integer"}, "null_count": {"type": "integer"}, "invalid_count": {"type": "integer"}, "division_by_zero_count": {"type": "integer"}, "rounded_count": {"type": "integer"}, "numeric_precision": {"type": "string"}, "exact": {"type": "boolean"}}, "required": ["result_ref", "column_ref", "operation", "row_count", "exact"]},
             max_result_bytes=MAX_TOOL_RESULT_BYTES,
         ),
     ]
@@ -1428,7 +1909,11 @@ def _series(sheet: ToolWorksheet, column: ToolColumn, frame: pd.DataFrame) -> pd
 
 
 def _non_null(values: pd.Series) -> list[Any]:
-    return [value for value in values.tolist() if value is not None and not pd.isna(value)]
+    return [value for value in values.tolist() if not _is_null_cell(value)]
+
+
+def _is_null_cell(value: Any) -> bool:
+    return value is None or pd.isna(value) or (isinstance(value, str) and not value.strip())
 
 
 def _as_decimal(value: Any) -> Decimal:
@@ -1557,10 +2042,10 @@ def _compute_aggregate(
 
 def _check_match(operator: str, actual: Any, expected: Any, kind: str) -> bool:
     if operator == "is_null":
-        return actual is None or pd.isna(actual)
+        return _is_null_cell(actual)
     if operator == "not_null":
-        return actual is not None and not pd.isna(actual)
-    if actual is None or pd.isna(actual):
+        return not _is_null_cell(actual)
+    if _is_null_cell(actual):
         return False
     if operator in {"contains", "starts_with"}:
         if not isinstance(actual, str) or not isinstance(expected, str):
@@ -1625,6 +2110,233 @@ def _get_profile(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
     return result
 
 
+def _decimal_percentile(values: list[Decimal], percentile: int) -> Decimal | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = Decimal(percentile) * Decimal(len(ordered) - 1) / Decimal(100)
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    fraction = position - Decimal(lower)
+    with localcontext() as decimal_context:
+        decimal_context.prec = max(38, max(len(value.as_tuple().digits) for value in ordered) + 16)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def _profile_dataset(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, DatasetProfileArgs)
+    sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+    frame = _ensure_frame(context, args.file_id, sheet)
+    columns = []
+    for column in sheet.columns:
+        values = _series(sheet, column, frame)
+        non_null = _non_null(values)
+        kind = _column_kind(non_null)
+        frequencies: dict[str, int] = {}
+        for value in non_null:
+            key = str(value)
+            frequencies[key] = frequencies.get(key, 0) + 1
+        duplicate_values = sum(count - 1 for count in frequencies.values() if count > 1)
+        column_result: dict[str, Any] = {
+            "column_id": column.column_id,
+            "name": _schema_name(column.name, column.position),
+            "data_type": column.data_type or kind,
+            "inferred_type": kind,
+            "total_count": len(values),
+            "missing_count": len(values) - len(non_null),
+            "missing_percentage": round((len(values) - len(non_null)) * 100 / max(1, len(values)), 3),
+            "distinct_count": len(frequencies),
+            "is_unique": bool(non_null) and len(frequencies) == len(non_null),
+            "duplicate_value_count": duplicate_values,
+            "duplicate_distinct_value_count": sum(1 for count in frequencies.values() if count > 1),
+            "constant": bool(non_null) and len(frequencies) == 1,
+            "near_constant": bool(non_null) and max(frequencies.values(), default=0) / len(non_null) >= 0.98,
+            "useful_for_grouping": not column.protected and kind == "categorical" and 1 < len(frequencies) <= MAX_TOOL_GROUPS,
+        }
+        if not column.protected and kind == "numeric" and non_null:
+            numeric = [_as_decimal(value) for value in non_null]
+            min_exponent = min(value.as_tuple().exponent for value in numeric)
+            max_adjusted = max(value.adjusted() for value in numeric)
+            statistics_precision = max(64, max_adjusted - min_exponent + len(str(len(numeric))) + 12)
+            with localcontext() as decimal_context:
+                decimal_context.prec = statistics_precision
+                total = sum(numeric, Decimal(0))
+                mean = total / Decimal(len(numeric))
+                median = _decimal_percentile(numeric, 50)
+                column_result.update({
+                    "minimum": format(min(numeric), "f"),
+                    "maximum": format(max(numeric), "f"),
+                    "mean": format(mean, "f"),
+                    "median": format(median, "f") if median is not None else None,
+                    "percentile_25": format(_decimal_percentile(numeric, 25), "f"),
+                    "percentile_75": format(_decimal_percentile(numeric, 75), "f"),
+                    "stddev_sample": format((sum(((value - mean) ** 2 for value in numeric), Decimal(0)) / Decimal(max(1, len(numeric) - 1))).sqrt(), "f") if len(numeric) > 1 else None,
+                    "statistics_precision": f"decimal_{statistics_precision}_significant_digits",
+                })
+                if args.include_outliers:
+                    q1, q3 = _decimal_percentile(numeric, 25), _decimal_percentile(numeric, 75)
+                    assert q1 is not None and q3 is not None
+                    spread = q3 - q1
+                    low, high = q1 - Decimal("1.5") * spread, q3 + Decimal("1.5") * spread
+                    column_result.update({
+                        "outlier_method": "IQR_1.5",
+                        "percentile_method": "linear_interpolation",
+                        "outlier_count": sum(1 for value in numeric if value < low or value > high),
+                        "outlier_lower_fence": format(low, "f"),
+                        "outlier_upper_fence": format(high, "f"),
+                    })
+        elif not column.protected and kind == "date" and non_null:
+            parsed_dates = [_date_comparison_value(value) for value in non_null]
+            column_result.update({
+                "minimum": min(parsed_dates).isoformat(),
+                "maximum": max(parsed_dates).isoformat(),
+            })
+        columns.append(column_result)
+    permitted_keys = [column.policy_key for column in sheet.columns]
+    duplicate_row_count = int(frame[permitted_keys].duplicated(keep="first").sum()) if permitted_keys else 0
+    return {
+        "workbook_id": args.file_id,
+        "worksheet_id": sheet.worksheet_id,
+        "row_count": len(frame),
+        "column_count": len(sheet.columns),
+        "exact": True,
+        "duplicate_row_count": duplicate_row_count,
+        "duplicate_row_method": "exact_duplicate_across_available_columns",
+        "columns": columns,
+    }
+
+
+def _store_derived_result(
+    context: ToolContext,
+    frame: pd.DataFrame,
+    columns: dict[str, ToolColumn],
+    source_identities: list[dict[str, Any]],
+    transformations: list[str],
+    exact: bool = True,
+    warnings: list[str] | None = None,
+) -> str:
+    memory = int(frame.memory_usage(index=True, deep=True).sum())
+    if context.join_result_bytes + memory > MAX_JOIN_MEMORY_BYTES:
+        raise ToolExecutionError("join_memory_limit", "The derived result exceeds the request memory limit.")
+    result_ref = _new_result_ref()
+    context.join_results[result_ref] = JoinedToolResult(
+        result_ref, context.user_id, context.chat_id, frame, columns, source_identities,
+        time.monotonic(), memory, transformations, exact, warnings or [],
+    )
+    context.join_result_bytes += memory
+    return result_ref
+
+
+def _calculate_columns(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, DerivedColumnArgs)
+    if bool(args.result_ref) == bool(args.file_id or args.worksheet_id):
+        raise ToolExecutionError("invalid_sources", "Choose either an attached worksheet or one current result reference.")
+    dataset = _validated_join_result(context, args.result_ref) if args.result_ref else None
+    if dataset:
+        columns = [ToolColumn(ref, ref, column.name, column.data_type, column.action, column.sensitive,
+                              column.share_confirmed, column.position)
+                   for ref, column in dataset.columns.items()]
+        sheet = ToolWorksheet("derived_result", "Derived result", 0, len(dataset.frame), len(columns),
+                              "visible", False, columns, dataset.frame)
+        source_frame = dataset.frame
+        source_identities = dataset.sources
+        prior_transformations = dataset.transformations
+    else:
+        if not args.file_id or not args.worksheet_id:
+            raise ToolExecutionError("invalid_sources", "A derived calculation needs an authorized worksheet or current result reference.")
+        sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+        source_frame = _ensure_frame(context, args.file_id, sheet)
+        source_identities = [_source_identity(context, args.file_id, args.worksheet_id)]
+        prior_transformations = []
+    left = _get_column(sheet, args.left_column_id)
+    right = _get_column(sheet, args.right_column_id)
+    if any(column.action != "share" or column.protected or column.sensitive for column in (left, right)):
+        raise ToolExecutionError("column_not_shareable", "Derived calculations require non-sensitive Share-permitted columns.")
+    operations = {"add", "subtract", "multiply", "divide", "percent_change", "days_between"}
+    if args.operation not in operations:
+        raise ToolExecutionError("invalid_calculation", "That cross-column calculation is not supported.")
+    if args.operation == "days_between":
+        if _column_kind(_non_null(_series(sheet, left, source_frame))) != "date" or _column_kind(_non_null(_series(sheet, right, source_frame))) != "date":
+            raise ToolExecutionError("invalid_calculation", "Date differences require two consistently parseable date columns.")
+    else:
+        for column in (left, right):
+            kind = _column_kind(_non_null(_series(sheet, column, source_frame)))
+            if kind not in {"numeric", "empty"}:
+                raise ToolExecutionError("invalid_calculation", "Arithmetic requires consistently numeric columns.")
+    calculated: list[Decimal | None] = []
+    null_count = invalid_count = division_by_zero_count = 0
+    rounded_count = 0
+    for left_value, right_value in zip(_series(sheet, left, source_frame), _series(sheet, right, source_frame)):
+        if _is_null_cell(left_value) or _is_null_cell(right_value):
+            calculated.append(None)
+            null_count += 1
+            continue
+        try:
+            with localcontext() as decimal_context:
+                decimal_context.prec = 128
+                if args.operation == "days_between":
+                    result_value = Decimal((_date_comparison_value(left_value) - _date_comparison_value(right_value)).days)
+                else:
+                    first, second = _as_decimal(left_value), _as_decimal(right_value)
+                    if args.operation == "add": result_value = first + second
+                    elif args.operation == "subtract": result_value = first - second
+                    elif args.operation == "multiply": result_value = first * second
+                    else:
+                        if second == 0:
+                            calculated.append(None)
+                            division_by_zero_count += 1
+                            continue
+                        result_value = (first - second) / second * Decimal(100) if args.operation == "percent_change" else first / second
+                        exact_check = (first - second) * Decimal(100) if args.operation == "percent_change" else first
+                        if result_value * second != exact_check:
+                            rounded_count += 1
+                if len(result_value.as_tuple().digits) > 128 or not result_value.is_finite():
+                    raise InvalidOperation
+                calculated.append(result_value)
+        except (InvalidOperation, ToolExecutionError, OverflowError):
+            calculated.append(None)
+            invalid_count += 1
+    alias_ref = f"derived:{args.alias}"
+    derived_column = ToolColumn(alias_ref, alias_ref, args.alias, "DATE_DIFFERENCE" if args.operation == "days_between" else "DECIMAL",
+                                "share", False, True, max(left.position, right.position) + 1)
+    retained = [column for column in sheet.columns if column.action == "share" and not column.protected and not column.sensitive]
+    result_frame = pd.DataFrame({column.column_id: _series(sheet, column, source_frame).reset_index(drop=True) for column in retained})
+    result_frame[alias_ref] = calculated
+    result_columns = {column.column_id: column for column in retained}
+    result_columns[alias_ref] = derived_column
+    calculation_warnings = ( ["Null or invalid operand rows were omitted from downstream numeric aggregates."] if null_count or invalid_count else [] ) + \
+                            ( ["Division by zero produced null derived values."] if division_by_zero_count else [] ) + \
+                            ( ["Non-terminating decimal results were rounded to 128 significant digits."] if rounded_count else [] ) + list(dataset.warnings if dataset else [])
+    result_ref = _store_derived_result(context, result_frame, result_columns,
+                                       source_identities, [*prior_transformations, "calculate_columns"],
+                                       exact=(dataset.exact if dataset else True) and rounded_count == 0,
+                                       warnings=calculation_warnings)
+    sample = [{"row_index": index + 1, "value": _safe_value(derived_column, value)}
+              for index, value in enumerate(calculated[:MAX_TOOL_ROWS])]
+    return {
+        "result_ref": result_ref,
+        "workbook_id": args.file_id,
+        "worksheet_id": args.worksheet_id,
+        "column_ref": alias_ref,
+        "operation": args.operation,
+        "row_count": len(source_frame),
+        "valid_count": len(calculated) - null_count - invalid_count - division_by_zero_count,
+        "null_count": null_count,
+        "invalid_count": invalid_count,
+        "division_by_zero_count": division_by_zero_count,
+        "rounded_count": rounded_count,
+        "numeric_precision": "decimal_128_significant_digits",
+        "exact": (dataset.exact if dataset else True) and rounded_count == 0,
+        "truncated": len(calculated) > len(sample),
+        "sample": sample,
+        "warnings": calculation_warnings,
+        "source_identities": source_identities,
+        "prior_transformations": prior_transformations,
+    }
+
+
 def _filter_rows(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
     args = raw_args
     assert isinstance(args, FilterArgs)
@@ -1632,8 +2344,31 @@ def _filter_rows(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
         raise ToolExecutionError("invalid_filter", "The filter combination must be 'all' or 'any'.")
     if len(set(args.columns)) != len(args.columns):
         raise ToolExecutionError("invalid_filter", "Requested columns must be unique.")
-    sheet = _get_sheet(context, args.file_id, args.worksheet_id)
-    result_columns = [_get_column(sheet, column_id) for column_id in args.columns]
+    if bool(args.result_ref) == bool(args.file_id or args.worksheet_id):
+        raise ToolExecutionError("invalid_sources", "Choose either an attached worksheet or one current result reference.")
+    dataset = _validated_join_result(context, args.result_ref) if args.result_ref else None
+    if dataset:
+        columns_by_id = dataset.columns
+        frame = dataset.frame
+        if any(column_id not in columns_by_id for column_id in args.columns):
+            raise ToolExecutionError("column_not_found", "A requested output column is unavailable or excluded.")
+        result_columns = [columns_by_id[column_id] for column_id in args.columns]
+        all_columns = list(columns_by_id.values())
+        source_identities = dataset.sources
+        prior_transformations = dataset.transformations
+        source_row_count = len(frame)
+        get_values = lambda column: frame[column.column_id]
+    else:
+        if not args.file_id or not args.worksheet_id:
+            raise ToolExecutionError("invalid_sources", "A filter needs an authorized worksheet or current result reference.")
+        sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+        frame = _ensure_frame(context, args.file_id, sheet)
+        result_columns = [_get_column(sheet, column_id) for column_id in args.columns]
+        all_columns = list(sheet.columns)
+        source_identities = [_source_identity(context, args.file_id, args.worksheet_id)]
+        prior_transformations = []
+        source_row_count = len(frame)
+        get_values = lambda column: _series(sheet, column, frame)
     conditions: list[tuple[ToolColumn, FilterCondition, str]] = []
     for condition in args.conditions:
         if condition.operator not in _FILTER_OPERATORS:
@@ -1644,17 +2379,17 @@ def _filter_rows(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
             raise ToolExecutionError("invalid_filter", "This filter requires a comparison value.")
         if isinstance(condition.value, str) and len(condition.value) > 512:
             raise ToolExecutionError("invalid_filter", "Filter values must be 512 characters or fewer.")
-        column = _get_column(sheet, condition.column_id)
-        frame = _ensure_frame(context, args.file_id, sheet)
-        values = _non_null(_series(sheet, column, frame))
+        column = columns_by_id.get(condition.column_id) if dataset else _get_column(sheet, condition.column_id)
+        if column is None:
+            raise ToolExecutionError("column_not_found", "A filter column is unavailable or excluded.")
+        values = _non_null(get_values(column))
         conditions.append((column, condition, _column_kind(values)))
-    frame = _ensure_frame(context, args.file_id, sheet)
     matches = []
     for row_index, row in frame.iterrows():
         row_matches = [
             _check_match(
                 condition.operator,
-                row.get(column.policy_key),
+                row.get(column.column_id if dataset else column.policy_key),
                 condition.value,
                 kind,
             )
@@ -1662,22 +2397,66 @@ def _filter_rows(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
         ]
         if all(row_matches) if args.match == "all" else any(row_matches):
             matches.append((row_index, row))
+    if args.sort_by:
+        if len({item.column_id for item in args.sort_by}) != len(args.sort_by):
+            raise ToolExecutionError("invalid_sort", "Sort columns must be unique.")
+        sort_frame = pd.DataFrame(index=[index for index, _ in matches])
+        directions = []
+        sort_names = []
+        for position, specification in enumerate(args.sort_by):
+            if specification.direction not in {"ascending", "descending"}:
+                raise ToolExecutionError("invalid_sort", "Sort direction must be ascending or descending.")
+            column = columns_by_id.get(specification.column_id) if dataset else _get_column(sheet, specification.column_id)
+            if column is None:
+                raise ToolExecutionError("column_not_found", "A sort column is unavailable or excluded.")
+            values = _non_null(get_values(column))
+            kind = _column_kind(values)
+            if kind == "mixed":
+                raise ToolExecutionError("invalid_sort", "Mixed-type columns cannot be sorted reliably.")
+            def normalize_sort(value: Any) -> Any:
+                if _is_null_cell(value): return None
+                if kind == "numeric": return _as_decimal(value)
+                if kind == "date": return _date_comparison_value(value)
+                return str(value).casefold()
+            sort_name = f"sort_{position}"
+            sort_frame[sort_name] = [normalize_sort(frame.at[index, column.column_id if dataset else column.policy_key]) for index in sort_frame.index]
+            sort_names.append(sort_name)
+            directions.append(specification.direction == "ascending")
+        ordered_indices = sort_frame.sort_values(sort_names, ascending=directions, na_position="last", kind="mergesort").index.tolist()
+        by_index = {index: row for index, row in matches}
+        matches = [(index, by_index[index]) for index in ordered_indices]
     rows = []
     for index, row in matches[:args.limit]:
         rows.append({
             "row_index": int(index) + 1,
             "values": {
-                column.column_id: _safe_value(column, row.get(column.policy_key))
+                column.column_id: _safe_value(column, row.get(column.column_id if dataset else column.policy_key))
                 for column in result_columns
             },
         })
+    if dataset:
+        retained_frame = frame.loc[[index for index, _ in matches], list(frame.columns)].copy()
+        result_columns_by_id = columns_by_id
+    else:
+        retained_frame = pd.DataFrame({column.column_id: frame.loc[[index for index, _ in matches], column.policy_key].reset_index(drop=True)
+                                       for column in all_columns})
+        result_columns_by_id = {column.column_id: column for column in all_columns}
+    result_ref = _store_derived_result(context, retained_frame, result_columns_by_id,
+        source_identities, [*prior_transformations, "filter_rows"],
+        exact=dataset.exact if dataset else True,
+        warnings=list(dataset.warnings) if dataset else [])
     return {
         "workbook_id": args.file_id,
-        "worksheet_id": sheet.worksheet_id,
-        "exact": True,
+        "worksheet_id": args.worksheet_id,
+        "exact": dataset.exact if dataset else True,
         "matched_row_count": len(matches),
         "returned_row_count": len(rows),
         "truncated": len(matches) > len(rows),
+        "result_ref": result_ref,
+        "sort_by": [{"column_id": item.column_id, "direction": item.direction} for item in args.sort_by],
+        "source_identities": source_identities if dataset else [],
+        "prior_transformations": prior_transformations,
+        "warnings": list(dataset.warnings) if dataset else [],
         "rows": rows,
     }
 
@@ -1715,56 +2494,232 @@ def _group_aggregate_values(
     frame: pd.DataFrame,
     aggregation: str,
     limit: int,
-) -> tuple[list[dict[str, Any]], int]:
+    additional_aggregations: list[GroupMetric] | None = None,
+    sort_direction: str = "none",
+    sort_metric: str = "primary",
+    rank_method: str = "first",
+    include_ties: bool = False,
+    additional_group_columns: list[ToolColumn] | None = None,
+) -> tuple[list[dict[str, Any]], int, bool]:
     if aggregation not in _AGGREGATIONS:
         raise ToolExecutionError("invalid_aggregation", "That aggregation is not supported.")
     if aggregation != "count" and metric_column is None:
         raise ToolExecutionError("missing_column", "Select a metric column for this aggregation.")
-    groups: dict[tuple[bool, str], list[Any]] = {}
-    group_series = _series(sheet, group_column, frame)
+    group_columns = [group_column, *(additional_group_columns or [])]
+    group_series = [_series(sheet, column, frame) for column in group_columns]
     metric_series = _series(sheet, metric_column, frame) if metric_column else None
-    for index, value in group_series.items():
-        is_null = value is None or pd.isna(value)
-        key = (is_null, "" if is_null else str(value))
-        groups.setdefault(key, []).append(metric_series.loc[index] if metric_series is not None else True)
-        if len(groups) > MAX_TOOL_GROUPS:
-            raise ToolExecutionError("too_many_groups", f"The worksheet has more than {MAX_TOOL_GROUPS} groups; choose a lower-cardinality column.")
-    result = []
-    for group_index, ((is_null, group_value), values) in enumerate(
-        sorted(groups.items(), key=lambda item: item[0])[:limit],
-        start=1,
-    ):
+    groups: dict[tuple[tuple[bool, str], ...], list[Any]] = {}
+    for index in frame.index:
+        parts = []
+        for series in group_series:
+            value = series.loc[index]
+            is_null = _is_null_cell(value)
+            parts.append((is_null, "" if is_null else str(value)))
+        key = tuple(parts)
+        groups.setdefault(key, []).append(index)
+        if len(groups) > MAX_ANALYSIS_GROUP_CARDINALITY:
+            raise ToolExecutionError("too_many_groups", "The group cardinality exceeds the configured analysis limit.")
+    metric_requests = [GroupMetric(alias="primary", aggregation=aggregation, metric_column_id=metric_column.column_id if metric_column else None)]
+    metric_requests.extend(additional_aggregations or [])
+    if len({metric.alias for metric in metric_requests}) != len(metric_requests):
+        raise ToolExecutionError("invalid_aggregation", "Aggregation aliases must be unique.")
+    computed = []
+    for group_key, group_indexes in groups.items():
+        values = [metric_series.loc[index] for index in group_indexes] if metric_series is not None else [True] * len(group_indexes)
         non_null_values = [value for value in values if value is not None and not pd.isna(value)]
-        aggregate = _compute_aggregate(non_null_values, aggregation, metric_column)
-        label = "<NULL>" if is_null else group_value
-        if group_column.protected or scan_for_unmasked_pii(label):
-            label = f"Group {group_index}"
-        result.append({
-            "group": label,
+        aggregates = {"primary": _compute_aggregate(non_null_values, aggregation, metric_column)}
+        for metric in metric_requests[1:]:
+            if metric.aggregation not in _AGGREGATIONS:
+                raise ToolExecutionError("invalid_aggregation", "That aggregation is not supported.")
+            selected = _get_column(sheet, metric.metric_column_id) if metric.metric_column_id else None
+            metric_series = _series(sheet, selected, frame) if selected else None
+            local_values = [metric_series.loc[index] for index in group_indexes] if metric_series is not None else [True] * len(group_indexes)
+            aggregates[metric.alias] = _compute_aggregate(_non_null(pd.Series(local_values)), metric.aggregation, selected)
+        labels = []
+        for (is_null, group_value), column in zip(group_key, group_columns):
+            label = "<NULL>" if is_null else group_value
+            labels.append(f"Group {len(computed) + 1}" if not is_null and (column.protected or scan_for_unmasked_pii(label)) else label)
+        safe_label: Any = labels[0] if len(labels) == 1 else {column.column_id: label for column, label in zip(group_columns, labels)}
+        computed.append({
+            "_key": group_key,
+            "_sort_value": aggregates.get(sort_metric, {}).get("value"),
+            "group": safe_label,
             "row_count": len(values),
-            **aggregate,
+            **aggregates["primary"],
+            **({"aggregate_values": {key: value for key, value in aggregates.items() if key != "primary"}} if additional_aggregations else {}),
         })
-    return result, len(groups)
+    if sort_direction not in {"none", "ascending", "descending"}:
+        raise ToolExecutionError("invalid_sort", "Group sort direction must be none, ascending, or descending.")
+    if sort_metric not in {"primary", *(metric.alias for metric in metric_requests[1:])}:
+        raise ToolExecutionError("invalid_sort", "The requested ranking metric is not available.")
+    if rank_method not in {"first", "dense", "min"}:
+        raise ToolExecutionError("invalid_rank", "Rank method must be first, dense, or min.")
+    if sort_direction != "none":
+        def sort_key(item: dict[str, Any]) -> tuple[bool, Any, str]:
+            value = item.get("_sort_value")
+            if value is None:
+                return True, Decimal(0), str(item["_key"])
+            try:
+                normalized: Any = _as_decimal(value)
+            except InvalidOperation:
+                normalized = str(value).casefold()
+            return False, normalized, str(item["_key"])
+        eligible = [item for item in computed if item.get("_sort_value") is not None]
+        nulls = [item for item in computed if item.get("_sort_value") is None]
+        eligible.sort(key=sort_key, reverse=(sort_direction == "descending"))
+        computed = [*eligible, *nulls]
+        for item in computed:
+            item.pop("_sort_value", None)
+    else:
+        computed.sort(key=lambda item: item["_key"])
+        for item in computed:
+            item.pop("_sort_value", None)
+    chosen = computed[:limit]
+    if include_ties and sort_direction != "none" and len(computed) > limit and chosen:
+        boundary = chosen[-1].get("aggregate_values", {}).get(sort_metric, {}).get("value") if sort_metric != "primary" else chosen[-1].get("value")
+        for candidate in computed[limit:]:
+            candidate_value = candidate.get("aggregate_values", {}).get(sort_metric, {}).get("value") if sort_metric != "primary" else candidate.get("value")
+            if candidate_value != boundary or len(chosen) >= MAX_TOOL_GROUPS:
+                break
+            chosen.append(candidate)
+    ranks: dict[Any, int] = {}
+    previous_value: Any = object()
+    dense_rank = 0
+    for position, item in enumerate(chosen, start=1):
+        if sort_direction != "none":
+            value = item.get("aggregate_values", {}).get(sort_metric, {}).get("value") if sort_metric != "primary" else item.get("value")
+            normalized = str(value)
+            if normalized != str(previous_value):
+                dense_rank += 1
+                ranks[normalized] = position if rank_method == "min" else dense_rank
+                previous_value = value
+            item["rank"] = position if rank_method == "first" else ranks[normalized]
+    truncated = len(chosen) < len(computed)
+    for item in chosen:
+        item.pop("_key", None)
+    return chosen, len(groups), truncated
 
 
 def _group_aggregate(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
     args = raw_args
     assert isinstance(args, GroupAggregateArgs)
-    sheet = _get_sheet(context, args.file_id, args.worksheet_id)
-    group_column = _get_column(sheet, args.group_column_id)
+    if bool(args.result_ref) == bool(args.file_id or args.worksheet_id):
+        raise ToolExecutionError("invalid_sources", "Choose either an attached worksheet or one current result reference.")
+    dataset = _validated_join_result(context, args.result_ref) if args.result_ref else None
+    if dataset:
+        columns = [ToolColumn(ref, ref, column.name, column.data_type, column.action, column.sensitive,
+                              column.share_confirmed, column.position)
+                   for ref, column in dataset.columns.items()]
+        sheet = ToolWorksheet("derived_result", "Derived result", 0, len(dataset.frame), len(columns),
+                              "visible", False, columns, dataset.frame)
+        frame = dataset.frame
+        source_identities = dataset.sources
+        prior_transformations = dataset.transformations
+        workbook_id = None
+        worksheet_id = None
+    else:
+        if not args.file_id or not args.worksheet_id:
+            raise ToolExecutionError("invalid_sources", "Grouping needs an authorized worksheet or current result reference.")
+        sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+        frame = _ensure_frame(context, args.file_id, sheet)
+        source_identities = []
+        prior_transformations = []
+        workbook_id = args.file_id
+        worksheet_id = sheet.worksheet_id
+    group_column_ids = args.group_column_ids or ([args.group_column_id] if args.group_column_id else [])
+    if not group_column_ids or len(set(group_column_ids)) != len(group_column_ids):
+        raise ToolExecutionError("invalid_group", "Choose one to three unique grouping columns.")
+    group_columns = [_get_column(sheet, column_id) for column_id in group_column_ids]
+    group_column = group_columns[0]
     metric_column = _get_column(sheet, args.metric_column_id) if args.metric_column_id else None
-    frame = _ensure_frame(context, args.file_id, sheet)
-    groups, group_count = _group_aggregate_values(
-        sheet, group_column, metric_column, frame, args.aggregation, args.limit
+    groups, group_count, truncated = _group_aggregate_values(
+        sheet, group_column, metric_column, frame, args.aggregation, args.limit,
+        args.additional_aggregations, args.sort_direction, args.sort_metric,
+        args.rank_method, args.include_ties, group_columns[1:],
     )
     return {
-        "workbook_id": args.file_id,
-        "worksheet_id": sheet.worksheet_id,
+        "workbook_id": workbook_id,
+        "worksheet_id": worksheet_id,
         "aggregation": args.aggregation,
-        "row_count": sheet.row_count,
+        "row_count": len(frame),
         "group_count": group_count,
-        "exact": True,
+        "returned_group_count": len(groups),
+        "truncated": truncated,
+        "sort_direction": args.sort_direction,
+        "sort_metric": args.sort_metric,
+        "rank_method": args.rank_method,
+        "exact": dataset.exact if dataset else True,
+        "source_identities": source_identities,
+        "prior_transformations": prior_transformations,
+        "warnings": list(dataset.warnings) if dataset else [],
         "groups": groups,
+    }
+
+
+def _trend_bucket(value: date | datetime, interval: str) -> date:
+    day = value.date() if isinstance(value, datetime) else value
+    if interval == "day": return day
+    if interval == "week": return day - timedelta(days=day.weekday())
+    if interval == "month": return day.replace(day=1)
+    if interval == "quarter": return date(day.year, ((day.month - 1) // 3) * 3 + 1, 1)
+    if interval == "year": return date(day.year, 1, 1)
+    raise ToolExecutionError("invalid_interval", "Choose day, week, month, quarter, or year.")
+
+
+def _trend_analysis(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, TrendArgs)
+    if args.interval not in {"day", "week", "month", "quarter", "year"}:
+        raise ToolExecutionError("invalid_interval", "Choose day, week, month, quarter, or year.")
+    if args.aggregation not in _AGGREGATIONS:
+        raise ToolExecutionError("invalid_aggregation", "That aggregation is not supported.")
+    sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+    date_column = _get_column(sheet, args.date_column_id)
+    metric_column = _get_column(sheet, args.metric_column_id) if args.metric_column_id else None
+    if date_column.protected or date_column.sensitive:
+        raise ToolExecutionError("column_not_shareable", "Trend periods cannot be derived from a protected date column.")
+    if args.aggregation != "count" and metric_column is None:
+        raise ToolExecutionError("missing_column", "Select a metric column for this trend aggregation.")
+    frame = _ensure_frame(context, args.file_id, sheet)
+    date_values = _series(sheet, date_column, frame)
+    metric_values = _series(sheet, metric_column, frame) if metric_column else None
+    groups: dict[date, list[Any]] = {}
+    invalid_count = missing_count = 0
+    for index, raw_date in date_values.items():
+        if _is_null_cell(raw_date):
+            missing_count += 1
+            continue
+        try:
+            period = _trend_bucket(_parse_iso_date(raw_date), args.interval)
+        except ToolExecutionError:
+            invalid_count += 1
+            continue
+        groups.setdefault(period, []).append(metric_values.loc[index] if metric_values is not None else True)
+        if len(groups) > MAX_ANALYSIS_GROUP_CARDINALITY:
+            raise ToolExecutionError("too_many_periods", "The trend exceeds the configured period limit.")
+    periods = sorted(groups)
+    summaries = []
+    for period in periods:
+        values = _non_null(pd.Series(groups[period]))
+        summaries.append({"period": period.isoformat(), "row_count": len(groups[period]), **_compute_aggregate(values, args.aggregation, metric_column)})
+    returned = summaries[:args.limit]
+    return {
+        "workbook_id": args.file_id,
+        "worksheet_id": args.worksheet_id,
+        "date_column_id": date_column.column_id,
+        "metric_column_id": metric_column.column_id if metric_column else None,
+        "interval": args.interval,
+        "aggregation": args.aggregation,
+        "row_count": len(frame),
+        "period_count": len(summaries),
+        "returned_period_count": len(returned),
+        "period_range": {"start": periods[0].isoformat(), "end": periods[-1].isoformat()} if periods else None,
+        "missing_date_count": missing_count,
+        "invalid_date_count": invalid_count,
+        "exact": True,
+        "truncated": len(returned) < len(summaries),
+        "groups": returned,
+        "warnings": (["Rows with missing or invalid dates were excluded from the trend."] if missing_count or invalid_count else []),
     }
 
 
@@ -1775,17 +2730,34 @@ def _compare_groups(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]
         raise ToolExecutionError("invalid_groups", "Comparison groups must be unique.")
     if any(len(value) > 256 for value in args.group_values):
         raise ToolExecutionError("invalid_groups", "Comparison group values must be 256 characters or fewer.")
-    sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+    if bool(args.result_ref) == bool(args.file_id or args.worksheet_id):
+        raise ToolExecutionError("invalid_sources", "Choose either an attached worksheet or one current result reference.")
+    dataset = _validated_join_result(context, args.result_ref) if args.result_ref else None
+    if dataset:
+        columns = [ToolColumn(ref, ref, column.name, column.data_type, column.action, column.sensitive,
+                              column.share_confirmed, column.position)
+                   for ref, column in dataset.columns.items()]
+        sheet = ToolWorksheet("derived_result", "Derived result", 0, len(dataset.frame), len(columns),
+                              "visible", False, columns, dataset.frame)
+        frame = dataset.frame
+        source_identities = dataset.sources
+        prior_transformations = dataset.transformations
+    else:
+        if not args.file_id or not args.worksheet_id:
+            raise ToolExecutionError("invalid_sources", "A comparison needs an authorized worksheet or current result reference.")
+        sheet = _get_sheet(context, args.file_id, args.worksheet_id)
+        frame = _ensure_frame(context, args.file_id, sheet)
+        source_identities = []
+        prior_transformations = []
     group_column = _get_column(sheet, args.group_column_id)
     metric_column = _get_column(sheet, args.metric_column_id) if args.metric_column_id else None
-    frame = _ensure_frame(context, args.file_id, sheet)
     group_series = _series(sheet, group_column, frame)
     metric_series = _series(sheet, metric_column, frame) if metric_column else None
     comparisons = []
     for group_index, expected in enumerate(args.group_values, start=1):
         indices = [
             index for index, value in group_series.items()
-            if value is not None and not pd.isna(value) and str(value).casefold() == expected.casefold()
+            if not _is_null_cell(value) and str(value).casefold() == expected.casefold()
         ]
         values = (
             [metric_series.loc[index] for index in indices]
@@ -1803,14 +2775,56 @@ def _compare_groups(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]
             "row_count": len(indices),
             **aggregate,
         })
-    return {
+    comparison_result = {
         "workbook_id": args.file_id,
         "worksheet_id": sheet.worksheet_id,
         "aggregation": args.aggregation,
-        "row_count": sheet.row_count,
-        "exact": True,
+        "row_count": len(frame),
+        "exact": dataset.exact if dataset else True,
+        "source_identities": source_identities,
+        "prior_transformations": prior_transformations,
+        "warnings": list(dataset.warnings) if dataset else [],
         "comparisons": comparisons,
     }
+    if args.include_change:
+        if len(comparisons) != 2:
+            raise ToolExecutionError("invalid_comparison", "Percentage change requires exactly two groups; the first is the baseline.")
+        baseline, current = comparisons
+        baseline_value, current_value = baseline.get("value"), current.get("value")
+        absolute_difference = None
+        percentage_change = None
+        percentage_rounded = False
+        baseline_is_zero = baseline_value is None
+        if baseline_value is not None and current_value is not None:
+            try:
+                first, second = _as_decimal(baseline_value), _as_decimal(current_value)
+                baseline_is_zero = first == 0
+                absolute_difference = format(second - first, "f")
+                if first != 0:
+                    with localcontext() as decimal_context:
+                        decimal_context.prec = 48
+                        percentage = (second - first) / first * Decimal(100)
+                        percentage_change = format(percentage, "f")
+                        exact_fraction = Fraction(second - first) * 100 / Fraction(first)
+                        denominator = exact_fraction.denominator
+                        while denominator % 2 == 0:
+                            denominator //= 2
+                        while denominator % 5 == 0:
+                            denominator //= 5
+                        percentage_rounded = denominator != 1
+            except InvalidOperation as exc:
+                raise ToolExecutionError("invalid_comparison", "Percentage change requires numeric aggregate results.") from exc
+        comparison_result.update({
+            "comparison_definition": {"baseline_group": baseline.get("group"), "current_group": current.get("group"), "baseline_zero_behavior": "percentage_change_null"},
+            "absolute_difference": absolute_difference,
+            "percentage_change": percentage_change,
+            "exact": comparison_result["exact"] and not percentage_rounded,
+            "comparison_precision": "decimal_48_significant_digits",
+            "warnings": ((["Percentage change is undefined because the baseline is zero or missing."] if baseline_is_zero else []) +
+                         (["Percentage change was rounded to 48 significant digits."] if percentage_rounded else []) +
+                         (list(dataset.warnings) if dataset else [])),
+        })
+    return comparison_result
 
 
 _TOOL_REGISTRY = {item.name: item for item in tool_definitions()}
@@ -1849,12 +2863,16 @@ def execute_tool(context: ToolContext, name: str, arguments: str | dict[str, Any
         if any(file_id not in context.files for file_id in arguments["file_ids"]):
             raise ToolExecutionError("file_not_found", "One or more requested files are not attached to this chat.")
     elif name == "join_tables":
-        source_ids = [arguments.get("left_file_id"), arguments.get("right_file_id")]
-        if any(not isinstance(file_id, str) for file_id in source_ids):
+        right_id = arguments.get("right_file_id")
+        if not isinstance(right_id, str):
             raise ToolExecutionError("invalid_arguments", "Join file identifiers must be strings.")
         _refresh_authorized_files(context, None)
-        if any(file_id not in context.files for file_id in source_ids):
+        if right_id not in context.files:
             raise ToolExecutionError("file_not_found", "One or more requested files are not attached to this chat.")
+        if not arguments.get("left_result_ref"):
+            left_id = arguments.get("left_file_id")
+            if not isinstance(left_id, str) or left_id not in context.files:
+                raise ToolExecutionError("file_not_found", "One or more requested files are not attached to this chat.")
     else:
         file_id = arguments.get("file_id")
         if file_id is not None and not isinstance(file_id, str):
@@ -1873,7 +2891,8 @@ def execute_tool(context: ToolContext, name: str, arguments: str | dict[str, Any
             "privacy_validation_failed",
             "The workbook could not pass its privacy and integrity checks.",
         ) from exc
-    if time.monotonic() - started > MAX_TOOL_EXECUTION_SECONDS:
+    execution_limit = MAX_ANALYSIS_PLAN_SECONDS if name == "execute_analysis_plan" else MAX_TOOL_EXECUTION_SECONDS
+    if time.monotonic() - started > execution_limit:
         _discard_join_result(context, result.get("result_ref") if result else None)
         raise ToolExecutionError("execution_timeout", "The workbook operation exceeded its execution time limit.")
     result.setdefault("execution_metadata", {})["duration_ms"] = round((time.monotonic() - started) * 1000, 3)

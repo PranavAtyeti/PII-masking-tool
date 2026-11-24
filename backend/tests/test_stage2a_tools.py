@@ -10,7 +10,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite://")
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from app.privacy_policy import policy_json
-from app.tools import ToolContext, ToolExecutionError, _source_identity, cleanup_tool_context, execute_tool, provider_tool_schemas
+from app.tools import ToolContext, ToolExecutionError, _source_identity, cleanup_tool_context, execute_tool, provider_tool_schemas, tool_capabilities
 from app.workbook import build_workbook_document, column_identity, parse_workbook, serialize_workbook
 
 
@@ -93,6 +93,363 @@ class WorkbookToolTests(unittest.TestCase):
             return_value={self.file_id: 1.0},
         ):
             return execute_tool(context, name, args)
+
+    def make_csv_chat_file(self, file_id, csv_text):
+        parsed = parse_workbook("synthetic.csv", csv_text.encode())
+        worksheet = parsed.worksheets[0]
+        names = list(worksheet.dataframe.columns)
+        policy = {name: {"action": "share", "sensitive": False, "share_confirmed": False} for name in names}
+        types = {"sheet-1": {name: None for name in names}}
+        document = build_workbook_document(parsed, file_id, policy, types, {"sheet-1": worksheet.dataframe.copy()})
+        return {
+            "file_id": file_id, "updated_at": 1.0, "workbook_json": serialize_workbook(document),
+            "privacy_policy_json": policy_json(policy),
+            "columns_json": json.dumps([{"name": name, "type": None} for name in names]),
+            "masked_csv": "", "row_count": len(worksheet.dataframe),
+        }
+
+    def ids_for(self, *names):
+        return {name: column_identity(0, index, name) for index, name in enumerate(names)}
+
+    def test_registered_plan_chains_three_sources_and_preserves_provenance(self):
+        ids = ["plan-left", "plan-middle", "plan-right"]
+        original = json.loads(self.chat_file["workbook_json"])
+
+        def make_file(file_id, amount):
+            document = deepcopy(original)
+            document["file_id"] = file_id
+            sheet = document["worksheets"][0]
+            sheet["rows"] = sheet["rows"][:4]
+            sheet["row_count"] = 4
+            for index, row in enumerate(sheet["rows"]):
+                row["values"][0] = f"K{index}"
+                row["values"][1] = str(amount)
+            return {**self.chat_file, "file_id": file_id, "row_count": 4,
+                    "workbook_json": serialize_workbook(document)}
+
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id,
+                              files={ids[0]: make_file(ids[0], 2), ids[1]: make_file(ids[1], 3), ids[2]: make_file(ids[2], 5)},
+                              approved_join_confirmation_id="approved-1")
+        dept, amount = self.column_ids["Department"], self.column_ids["Amount"]
+        plan = {
+            "objective": "Sum the third source amount after matching all three tables by Department.",
+            "steps": [
+                {"step_id": "join_ab", "capability": "join_tables", "arguments": {
+                    "left_file_id": ids[0], "left_worksheet_id": "sheet-1", "left_key_column_id": dept,
+                    "right_file_id": ids[1], "right_worksheet_id": "sheet-1", "right_key_column_id": dept,
+                    "left_columns": [dept], "right_columns": [amount],
+                }},
+                {"step_id": "join_abc", "capability": "join_tables", "depends_on": ["join_ab"], "arguments": {
+                    "left_result_ref": {"$ref": "join_ab.result_ref"}, "left_key_column_ref": f"left:{dept}",
+                    "right_file_id": ids[2], "right_worksheet_id": "sheet-1", "right_key_column_id": dept,
+                    "left_columns": [f"left:{dept}", f"right:{amount}"], "right_columns": [amount],
+                }},
+                {"step_id": "total", "capability": "aggregate_joined_data", "depends_on": ["join_abc"], "arguments": {
+                    "result_ref": {"$ref": "join_abc.result_ref"}, "aggregation": "sum",
+                    "column_ref": f"right:{ids[2]}:{amount}",
+                }},
+                {"step_id": "groups", "capability": "group_and_aggregate", "depends_on": ["join_abc"], "arguments": {
+                    "result_ref": {"$ref": "join_abc.result_ref"},
+                    "group_column_ids": [f"left:left:{dept}", f"right:{ids[2]}:{amount}"],
+                    "aggregation": "sum", "metric_column_id": f"right:{ids[2]}:{amount}",
+                    "sort_direction": "descending", "limit": 4,
+                }},
+            ],
+        }
+        revisions = {file_id: 1.0 for file_id in ids}
+        binding = {
+            "left": {"file_id": ids[0], "worksheet_id": "sheet-1", "column_id": dept},
+            "right": {"file_id": ids[1], "worksheet_id": "sheet-1", "column_id": dept},
+            "source_identities": [_source_identity(context, ids[0], "sheet-1"), _source_identity(context, ids[1], "sheet-1")],
+        }
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value=revisions
+        ), patch("app.tools.store.consume_join_confirmation", return_value=binding):
+            result = execute_tool(context, "execute_analysis_plan", plan)
+        self.assertTrue(result["exact"], result)
+        self.assertFalse(result["partial_result"])
+        self.assertEqual(result["completed_step_count"], 4)
+        self.assertEqual(result["steps"][2]["result"]["value"], "20")
+        self.assertEqual({item["file_id"] for item in result["source_identities"]}, set(ids))
+        self.assertEqual(result["steps"][2]["result"]["provenance"]["transformations"],
+                         ["join_tables", "join_tables", "aggregate_joined_data"])
+        self.assertEqual(result["steps"][3]["result"]["group_count"], 4)
+        self.assertEqual(len(result["steps"][3]["result"]["source_identities"]), 3)
+        self.assertLessEqual(context.join_result_bytes, 32 * 1024 * 1024)
+        cleanup_tool_context(context)
+        self.assertFalse(context.join_results)
+
+    def test_plan_rejects_unknown_capability_and_keeps_unrelated_partial_success(self):
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={self.file_id: self.chat_file})
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={self.file_id: 1.0}
+        ):
+            with self.assertRaises(ToolExecutionError) as unknown:
+                execute_tool(context, "execute_analysis_plan", {"objective": "x", "steps": [
+                    {"step_id": "bad", "capability": "run_python", "arguments": {}}
+                ]})
+            self.assertEqual(unknown.exception.code, "unknown_capability")
+            partial = execute_tool(context, "execute_analysis_plan", {"objective": "x", "steps": [
+                {"step_id": "bad", "capability": "aggregate_data", "arguments": {
+                    "file_id": self.file_id, "worksheet_id": "sheet-1", "aggregation": "median",
+                }},
+                {"step_id": "schema", "capability": "get_workbook_schema", "arguments": {"file_id": self.file_id}},
+            ]})
+        self.assertTrue(partial["partial_result"])
+        self.assertEqual(partial["steps"][0]["status"], "failed")
+        self.assertEqual(partial["steps"][1]["status"], "completed")
+        self.assertIn("execute_analysis_plan", {item["name"] for item in tool_capabilities()})
+        self.assertIn("aggregate_joined_data", {item["name"] for item in tool_capabilities()})
+
+    def test_plan_pauses_when_join_discovery_needs_user_confirmation(self):
+        left_id, right_id = "pause-left", "pause-right"
+        original = json.loads(self.chat_file["workbook_json"])
+
+        def make_file(file_id):
+            document = deepcopy(original)
+            document["file_id"] = file_id
+            sheet = document["worksheets"][0]
+            sheet["rows"] = sheet["rows"][:4]
+            sheet["row_count"] = 4
+            for index, row in enumerate(sheet["rows"]):
+                row["values"][0] = f"K{index}"
+                row["values"][1] = str(index + 1)
+            return {**self.chat_file, "file_id": file_id, "row_count": 4,
+                    "workbook_json": serialize_workbook(document)}
+
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id,
+                              files={left_id: make_file(left_id), right_id: make_file(right_id)})
+        plan = {"objective": "Find and then execute the relationship.", "steps": [
+            {"step_id": "discover", "capability": "discover_joins", "arguments": {"file_ids": [left_id, right_id]}},
+            {"step_id": "join", "capability": "join_tables", "depends_on": ["discover"], "arguments": {
+                "left_file_id": left_id, "left_worksheet_id": "sheet-1", "left_key_column_id": self.column_ids["Department"],
+                "right_file_id": right_id, "right_worksheet_id": "sheet-1", "right_key_column_id": self.column_ids["Department"],
+                "left_columns": [self.column_ids["Department"]], "right_columns": [self.column_ids["Amount"]],
+            }},
+        ]}
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={left_id: 1.0, right_id: 1.0}
+        ), patch("app.tools.store.create_join_confirmation", side_effect=["confirm-1", "confirm-2"]):
+            result = execute_tool(context, "execute_analysis_plan", plan)
+        self.assertTrue(result["awaiting_confirmation"])
+        self.assertFalse(result["exact"])
+        self.assertEqual(result["steps"][0]["status"], "awaiting_confirmation")
+        self.assertEqual(result["steps"][1]["status"], "paused_for_confirmation")
+        self.assertTrue(context.pending_join_confirmations)
+
+    def test_plan_rejects_forward_dependencies_and_undeclared_references(self):
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={self.file_id: self.chat_file})
+        revisions = {self.file_id: 1.0}
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value=revisions
+        ):
+            with self.assertRaises(ToolExecutionError) as forward:
+                execute_tool(context, "execute_analysis_plan", {"objective": "x", "steps": [
+                    {"step_id": "first", "capability": "get_workbook_schema", "depends_on": ["second"], "arguments": {"file_id": self.file_id}},
+                    {"step_id": "second", "capability": "get_workbook_schema", "arguments": {"file_id": self.file_id}},
+                ]})
+            self.assertEqual(forward.exception.code, "invalid_plan")
+            with self.assertRaises(ToolExecutionError) as reference:
+                execute_tool(context, "execute_analysis_plan", {"objective": "x", "steps": [
+                    {"step_id": "first", "capability": "aggregate_joined_data", "arguments": {
+                        "result_ref": {"$ref": "other.result_ref"}, "aggregation": "count",
+                    }},
+                ]})
+            self.assertEqual(reference.exception.code, "invalid_plan_reference")
+
+    def test_dataset_profile_reports_quality_statistics_without_raw_values(self):
+        file_id = "profile-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Department,Amount,Code\nA,1.00,X\nA,2.00,X\nB,3.00,Y\nB,1000.00,\n")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            result = execute_tool(context, "profile_dataset", {"file_id": file_id, "worksheet_id": "sheet-1"})
+        self.assertEqual(result["row_count"], 4)
+        self.assertEqual(result["column_count"], 3)
+        self.assertEqual(result["duplicate_row_count"], 0)
+        profile = {column["name"]: column for column in result["columns"]}
+        self.assertEqual(profile["Amount"]["missing_count"], 0)
+        self.assertEqual(Decimal(profile["Amount"]["mean"]), Decimal("251.5"))
+        self.assertEqual(Decimal(profile["Amount"]["median"]), Decimal("2.5"))
+        self.assertEqual(profile["Amount"]["outlier_method"], "IQR_1.5")
+        self.assertEqual(profile["Amount"]["outlier_count"], 1)
+        self.assertEqual(profile["Code"]["missing_count"], 1)
+        self.assertEqual(profile["Code"]["duplicate_value_count"], 1)
+        self.assertNotIn('"value": "X"', json.dumps(result))
+
+    def test_filter_sort_then_rank_multiple_group_aggregates_in_one_plan(self):
+        file_id = "composable-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Department,Amount\nA,10\nB,20\nA,30\nB,40\nA,50\nB,60\n")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        columns = self.ids_for("Department", "Amount")
+        plan = {"objective": "Filter large rows, then rank departments by total and average amount.", "steps": [
+            {"step_id": "filtered", "capability": "filter_rows", "arguments": {
+                "file_id": file_id, "worksheet_id": "sheet-1", "conditions": [
+                    {"column_id": columns["Amount"], "operator": "gte", "value": 20},
+                ], "columns": [columns["Department"], columns["Amount"]],
+                "sort_by": [{"column_id": columns["Amount"], "direction": "descending"}],
+            }},
+            {"step_id": "ranked", "capability": "group_and_aggregate", "depends_on": ["filtered"], "arguments": {
+                "result_ref": {"$ref": "filtered.result_ref"}, "group_column_id": columns["Department"],
+                "aggregation": "sum", "metric_column_id": columns["Amount"],
+                "additional_aggregations": [{"alias": "avg", "aggregation": "average", "metric_column_id": columns["Amount"]}],
+                "sort_direction": "descending", "rank_method": "dense", "limit": 2,
+            }},
+        ]}
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            result = execute_tool(context, "execute_analysis_plan", plan)
+        ranked = result["steps"][1]["result"]["groups"]
+        self.assertEqual([item["group"] for item in ranked], ["B", "A"])
+        self.assertEqual([item["value"] for item in ranked], ["120", "80"])
+        self.assertEqual([item["aggregate_values"]["avg"]["value"] for item in ranked], ["40", "40"])
+        self.assertEqual([item["rank"] for item in ranked], [1, 2])
+        self.assertFalse(result["partial_result"])
+        cleanup_tool_context(context)
+
+    def test_trends_are_chronological_and_report_invalid_dates(self):
+        file_id = "trend-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Date,Amount\n2024-02-03,3\n2024-01-20,2.75\n2024-01-02,1.25\nbad-date,4\n,5\n")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        columns = self.ids_for("Date", "Amount")
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            result = execute_tool(context, "trend_analysis", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "date_column_id": columns["Date"],
+                "interval": "month", "aggregation": "sum", "metric_column_id": columns["Amount"],
+            })
+        self.assertEqual([group["period"] for group in result["groups"]], ["2024-01-01", "2024-02-01"])
+        self.assertEqual([group["value"] for group in result["groups"]], ["4.00", "3"])
+        self.assertEqual(result["invalid_date_count"], 1)
+        self.assertEqual(result["missing_date_count"], 1)
+
+    def test_derived_column_uses_fixed_operations_and_feeds_exact_aggregate(self):
+        file_id = "calc-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Revenue,Cost\n100,50\n80,0\n60,30\n")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        columns = self.ids_for("Revenue", "Cost")
+        plan = {"objective": "Calculate margin and sum it.", "steps": [
+            {"step_id": "margin", "capability": "calculate_columns", "arguments": {
+                "file_id": file_id, "worksheet_id": "sheet-1", "operation": "subtract",
+                "left_column_id": columns["Revenue"], "right_column_id": columns["Cost"], "alias": "margin",
+            }},
+            {"step_id": "total", "capability": "aggregate_joined_data", "depends_on": ["margin"], "arguments": {
+                "result_ref": {"$ref": "margin.result_ref"}, "aggregation": "sum", "column_ref": "derived:margin",
+            }},
+        ]}
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            result = execute_tool(context, "execute_analysis_plan", plan)
+        self.assertEqual(result["steps"][1]["result"]["value"], "160")
+        self.assertEqual({item["file_id"] for item in result["source_identities"]}, {file_id})
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            division = execute_tool(context, "calculate_columns", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "operation": "divide",
+                "left_column_id": columns["Revenue"], "right_column_id": columns["Cost"], "alias": "ratio",
+            })
+        self.assertEqual(division["division_by_zero_count"], 1)
+        cleanup_tool_context(context)
+
+    def test_compare_reports_absolute_and_percentage_change_with_zero_baseline(self):
+        file_id = "compare-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Department,Amount\nA,0\nB,10\nA,0\nB,20\n")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        columns = self.ids_for("Department", "Amount")
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            result = execute_tool(context, "compare_groups", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "group_column_id": columns["Department"],
+                "group_values": ["A", "B"], "aggregation": "sum", "metric_column_id": columns["Amount"],
+                "include_change": True,
+            })
+        self.assertEqual(result["absolute_difference"], "30")
+        self.assertIsNone(result["percentage_change"])
+        self.assertTrue(result["warnings"])
+
+    def test_compare_consumes_derived_result_and_reports_percentage_rounding(self):
+        file_id = "compare-derived-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Department,Amount\nA,3\nB,4\n")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        columns = self.ids_for("Department", "Amount")
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            derived = execute_tool(context, "calculate_columns", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "operation": "add",
+                "left_column_id": columns["Amount"], "right_column_id": columns["Amount"], "alias": "double_amount",
+            })
+            result = execute_tool(context, "compare_groups", {
+                "result_ref": derived["result_ref"], "group_column_id": columns["Department"],
+                "group_values": ["A", "B"], "aggregation": "sum", "metric_column_id": "derived:double_amount",
+                "include_change": True,
+            })
+        self.assertEqual(result["absolute_difference"], "2")
+        self.assertTrue(result["percentage_change"].startswith("33.333333333333333333333333"))
+        self.assertFalse(result["exact"])
+        self.assertEqual(result["comparison_precision"], "decimal_48_significant_digits")
+        cleanup_tool_context(context)
+
+    def test_derived_references_fail_closed_after_revision_or_policy_changes(self):
+        file_id = "stale-derived-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Revenue,Cost\n100,50\n")
+        columns = self.ids_for("Revenue", "Cost")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            derived = execute_tool(context, "calculate_columns", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "operation": "subtract",
+                "left_column_id": columns["Revenue"], "right_column_id": columns["Cost"], "alias": "margin",
+            })
+        updated = {**chat_file, "updated_at": 2.0}
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 2.0}
+        ), patch("app.tools.store.get_chat_file", return_value=updated), self.assertRaises(ToolExecutionError) as stale_revision:
+            execute_tool(context, "aggregate_joined_data", {
+                "result_ref": derived["result_ref"], "aggregation": "sum", "column_ref": "derived:margin",
+            })
+        self.assertEqual(stale_revision.exception.code, "stale_result")
+
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ):
+            derived = execute_tool(context, "calculate_columns", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "operation": "subtract",
+                "left_column_id": columns["Revenue"], "right_column_id": columns["Cost"], "alias": "margin",
+            })
+        updated_policy = {"Revenue": {"action": "mask", "sensitive": True, "share_confirmed": False},
+                         "Cost": {"action": "share", "sensitive": False, "share_confirmed": False}}
+        context.files[file_id]["privacy_policy_json"] = policy_json(updated_policy)
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ), self.assertRaises(ToolExecutionError) as stale_policy:
+            execute_tool(context, "aggregate_joined_data", {
+                "result_ref": derived["result_ref"], "aggregation": "sum", "column_ref": "derived:margin",
+            })
+        self.assertEqual(stale_policy.exception.code, "stale_result")
+
+    def test_derived_results_obey_shared_intermediate_memory_ceiling(self):
+        file_id = "memory-derived-fixture"
+        chat_file = self.make_csv_chat_file(file_id, "Revenue,Cost\n100,50\n")
+        columns = self.ids_for("Revenue", "Cost")
+        context = ToolContext(user_id="user-1", chat_id=self.chat_id, files={file_id: chat_file})
+        with patch("app.tools.store.get_chat", return_value={"chat_id": self.chat_id}), patch(
+            "app.tools.store.get_chat_file_revisions", return_value={file_id: 1.0}
+        ), patch("app.tools.MAX_JOIN_MEMORY_BYTES", 1), self.assertRaises(ToolExecutionError) as limited:
+            execute_tool(context, "calculate_columns", {
+                "file_id": file_id, "worksheet_id": "sheet-1", "operation": "subtract",
+                "left_column_id": columns["Revenue"], "right_column_id": columns["Cost"], "alias": "margin",
+            })
+        self.assertEqual(limited.exception.code, "join_memory_limit")
+        self.assertFalse(context.join_results)
 
     def test_schema_hides_excluded_columns_and_values(self):
         result = self.execute("get_workbook_schema", {"file_id": self.file_id})

@@ -65,7 +65,7 @@ The informal 28-record DOCX experiment is not a project acceptance requirement. 
 
 ## Analytical accuracy tests
 
-Tests must verify synthetic exact tool values against complete stored data, not against retrieval excerpts. Join discovery and execution tests cover compatibility, null counts, uniqueness, overlap, one-to-one, one-to-many, and many-to-one cardinality, many-to-many rejection, output limits, excluded keys, authorization, and provenance. Confirmation tests cover owner/chat binding, expiry, reuse, stale source revisions, changed privacy policies, and exact-candidate matching. Cross-format tests include DOCX-table-to-workbook joins and prove narrative sections are not exposed as tables. Derived calculations use the complete in-memory join result, not the bounded LLM sample; cleanup is verified.
+Tests must verify synthetic exact tool values against complete stored data, not against retrieval excerpts. Join discovery and execution tests cover compatibility, null counts, uniqueness, overlap, one-to-one, one-to-many, and many-to-one cardinality, many-to-many rejection, output limits, excluded keys, authorization, and provenance. Confirmation tests cover owner/chat binding, expiry, reuse, stale source revisions, changed privacy policies, and exact-candidate matching. Cross-format tests include DOCX-table-to-workbook joins and prove narrative sections are not exposed as tables. Derived calculations use the complete in-memory join result, not the bounded LLM sample; cleanup is verified. Prompt 3 tests cover registry capability metadata, unknown-operation rejection, dependency/reference validation, partial independent-step success, and a complete three-source join followed by an exact aggregate. Prompt 4 adds complete-data profiling and quality metrics, filter/sort-to-group plan composition, multiple grouping dimensions and ranked aggregates, chronological trends with invalid/missing dates, division-by-zero and derived aggregation, comparison zero-baseline handling, stale result rejection, and intermediate-memory limits. The existing shared Gemini/Groq tool-loop contract remains covered by mocked adapter tests.
 
 ## Privacy and authorization tests
 
@@ -153,3 +153,11 @@ The following values are previously reported from earlier local sessions. They a
 - Alembic reports one head: `0009_join_confirmations`.
 - `git diff --check` passed.
 - The migration was not executed; live PostgreSQL and provider behavior remain unverified.
+
+## Prompt 4 verification
+
+- Focused workbook tool suite: 26 tests passed.
+- Full backend suite: 101 tests passed with `python -m unittest discover -s backend/tests -q`.
+- Python compilation passed; `git diff --check` passed with only line-ending normalization notices.
+- Alembic reports one head, `0009_join_confirmations`. Prompt 4 created no migration, and no migration was applied.
+- Frontend files were unchanged in this implementation batch. Live PostgreSQL and provider behavior remain unverified.

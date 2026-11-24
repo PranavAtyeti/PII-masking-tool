@@ -71,6 +71,8 @@ Join discovery considers policy-eligible columns in workbook sheets and structur
 
 Complete joined frames remain in request-scoped process memory. Their total memory is capped at 32 MiB, sources at 20,000 rows, and join outputs at 10,000 rows. The provider receives only a bounded sample or exact aggregate result. Random result references are held only by the active tool context, access checks repeat before derived operations, and cleanup clears frames at stream termination. No plaintext analytical result is persisted.
 
+Multi-step plans use the existing registry and per-tool permission checks. The model cannot name unregistered capabilities, call the plan recursively, alter backend limits, or refer to undeclared dependencies. Plans cap at five steps, dependency depth three, and 30 seconds, in addition to the request-wide provider rounds, tool calls, arguments, result bytes, execution time, source rows, output rows, and intermediate memory limits. Plan outputs sent back to the provider contain bounded summaries, not full intermediate frames. Every reused frame revalidates owner/chat, file revisions, and privacy-policy revisions. A chained join accepts only a unique matching Share-permitted key and a new attached source; ambiguity fails closed, and many-to-many amplification is rejected. A prior UI approval is consumed only by the original exact source/table/key binding; the model cannot manufacture approval.
+
 The structured DOCX tool implementation must fail closed for uneven tables and excluded documents.
 
 ## Sandboxed execution
@@ -157,4 +159,8 @@ Logs should record event names, request IDs, provider/model names, durations, st
 - Persistent workspace asset lifecycle.
 - Stronger sensitive-document classification than regex/NER sampling.
 - Live provider, PostgreSQL, and Cloud KMS verification.
+
+## Advanced analytical tools
+
+Prompt 4 analytics use only registered operations over the current authorized Share projection. Masked or excluded fields cannot be selected as calculation operands, group keys, trend dates, or filter values through the analytical tools. Profiles return aggregate descriptors rather than cell samples; filter and calculation samples remain bounded and pass the outbound PII scanner. Complete filtered/calculated frames are kept only in the current tool context, share the existing intermediate-memory ceiling, and are cleared at request cleanup. Result references revalidate source revisions and privacy-policy identity before reuse. Derived operations are fixed Decimal/date operations; arbitrary code is not evaluated. Rounded numeric results expose precision warnings and `exact: false`.
 

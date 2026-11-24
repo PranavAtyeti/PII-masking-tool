@@ -1008,6 +1008,7 @@ def _generate_active_impl(
         operation_labels = {
             "get_workbook_schema": "Reviewing workbook structure",
             "get_column_profile": "Profiling a workbook column",
+            "profile_dataset": "Profiling data quality",
             "filter_rows": "Filtering workbook rows",
             "aggregate_data": "Calculating a workbook result",
             "group_and_aggregate": "Comparing workbook groups",
@@ -1015,6 +1016,9 @@ def _generate_active_impl(
             "discover_joins": "Checking file relationships",
             "join_tables": "Joining approved file data",
             "aggregate_joined_data": "Calculating across joined files",
+            "trend_analysis": "Analyzing date trends",
+            "calculate_columns": "Calculating a derived metric",
+            "execute_analysis_plan": "Analyzing the request step by step",
         }
         for event in stream_unmask_events(provider_events, chat_id):
             if event.get("type") == "delta":
@@ -1030,7 +1034,7 @@ def _generate_active_impl(
                         "status": "running" if event["type"] == "tool_start" else "complete",
                     }
                 })
-                if event.get("type") == "tool_complete" and tool_name == "discover_joins" and tool_context:
+                if event.get("type") == "tool_complete" and tool_name in {"discover_joins", "execute_analysis_plan"} and tool_context:
                     pending = list(tool_context.pending_join_confirmations)
                     tool_context.pending_join_confirmations.clear()
                     for request in pending:
