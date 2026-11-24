@@ -26,6 +26,7 @@ from .models import (
     ChatMessage,
     ConversationTurn,
     GuestSession,
+    JoinConfirmation,
     TokenEntry,
     User,
 )
@@ -907,6 +908,71 @@ def get_chat_file_revisions(chat_id: str) -> dict[str, float]:
             select(ChatFile.file_id, ChatFile.updated_at).where(ChatFile.chat_id == chat_id)
         ).all()
         return {str(file_id): float(updated_at) for file_id, updated_at in rows}
+
+
+def create_join_confirmation(
+    *, chat_id: str, user_id: str, candidate: dict, ttl_seconds: int = 300
+) -> str:
+    """Persist non-content consent state bound to one candidate and owner."""
+    now = time.time()
+    confirmation_id = str(uuid.uuid4())
+    with SessionLocal() as db:
+        chat = db.scalar(select(Chat).where(Chat.chat_id == chat_id, Chat.user_id == user_id))
+        if chat is None:
+            raise LookupError("Chat not found")
+        db.execute(delete(JoinConfirmation).where(JoinConfirmation.expires_at <= now))
+        db.add(JoinConfirmation(
+            confirmation_id=confirmation_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            candidate_json=json.dumps(candidate, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+            expires_at=now + min(max(ttl_seconds, 30), 600),
+            confirmed_at=None,
+            consumed_at=None,
+            created_at=now,
+        ))
+        db.commit()
+    return confirmation_id
+
+
+def confirm_join_confirmation(*, chat_id: str, user_id: str, confirmation_id: str) -> bool:
+    """Atomically approve a live candidate from its authorized user."""
+    now = time.time()
+    with SessionLocal() as db:
+        result = db.execute(update(JoinConfirmation).where(
+            JoinConfirmation.confirmation_id == confirmation_id,
+            JoinConfirmation.chat_id == chat_id,
+            JoinConfirmation.user_id == user_id,
+            JoinConfirmation.expires_at > now,
+            JoinConfirmation.confirmed_at.is_(None),
+            JoinConfirmation.consumed_at.is_(None),
+        ).values(confirmed_at=now))
+        db.commit()
+        return result.rowcount == 1
+
+
+def consume_join_confirmation(
+    *, chat_id: str, user_id: str, confirmation_id: str
+) -> dict | None:
+    """Atomically consume user approval exactly once and return its binding."""
+    now = time.time()
+    with SessionLocal() as db:
+        candidate_json = db.execute(update(JoinConfirmation).where(
+            JoinConfirmation.confirmation_id == confirmation_id,
+            JoinConfirmation.chat_id == chat_id,
+            JoinConfirmation.user_id == user_id,
+            JoinConfirmation.expires_at > now,
+            JoinConfirmation.confirmed_at.is_not(None),
+            JoinConfirmation.consumed_at.is_(None),
+        ).values(consumed_at=now).returning(JoinConfirmation.candidate_json)).scalar_one_or_none()
+        db.commit()
+        if candidate_json is None:
+            return None
+        try:
+            candidate = json.loads(candidate_json)
+        except (TypeError, ValueError):
+            return None
+        return candidate
 
 
 def get_chat_file(chat_id: str, file_id: str | None = None):

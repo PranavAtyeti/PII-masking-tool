@@ -17,10 +17,11 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import docx_ingestion, document_retrieval, mapping_store
+from app import docx_ingestion, document_retrieval, mapping_store, workbook as workbook_module
 from app.crypto import generate_key, is_encrypted
 from app.models import Chat, ChatFile, TokenEntry
 from app.privacy_policy import validate_outbound_text
+from app import tools
 from app.routers.upload import (
     _document_policy,
     _document_sensitive_type,
@@ -95,6 +96,29 @@ def stored_document(sections: list[dict], action="mask", sensitive=False, confir
 
 
 class DocxIngestionTests(unittest.TestCase):
+    def test_infers_header_rows_but_preserves_data_first_table(self):
+        data_first = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body><w:tbl>
+  <w:tr><w:tc><w:p><w:r><w:t>CUST-001</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Pune</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>CUST-002</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Mumbai</w:t></w:r></w:p></w:tc></w:tr>
+ </w:tbl></w:body></w:document>"""
+        parsed = docx_ingestion.parse_docx(make_docx(data_first), "doc-data-first")
+        table_rows = [section for section in parsed["sections"] if section["kind"] == "table_row"]
+        self.assertFalse(any(row["is_header"] for row in table_rows))
+
+        with_header = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body><w:tbl>
+  <w:tr><w:tc><w:p><w:r><w:t>Customer ID</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>City</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>CUST-001</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Pune</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>Customer ID</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>City</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>CUST-002</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Mumbai</w:t></w:r></w:p></w:tc></w:tr>
+ </w:tbl></w:body></w:document>"""
+        parsed = docx_ingestion.parse_docx(make_docx(with_header), "doc-headers")
+        table_rows = [section for section in parsed["sections"] if section["kind"] == "table_row"]
+        self.assertEqual([row["is_header"] for row in table_rows], [True, False, True, False])
+
     def test_extracts_heading_paragraph_unicode_tables_and_order(self):
         parsed = docx_ingestion.parse_docx(make_docx(), "doc-1")
 
@@ -239,6 +263,44 @@ class DocumentPrivacyAndRetrievalTests(unittest.TestCase):
                 "EMAIL",
             )
 
+    def test_sensitivity_classification_inspects_deduplicated_table_values(self):
+        sections = [
+            {
+                "kind": "table_row",
+                "heading_path": ["Customer Profiles"],
+                "cells": [
+                    {"content": "CUST-001"},
+                    {"content": "alice@example.test"},
+                ],
+            },
+            {
+                "kind": "table_row",
+                "heading_path": ["Customer Profiles"],
+                "cells": [
+                    {"content": "CUST-001"},
+                    {"content": "alice@example.test"},
+                ],
+            },
+            {
+                "kind": "table_row",
+                "heading_path": ["Customer Profiles"],
+                "cells": [
+                    {"content": "CUST-002"},
+                    {"content": "bob@example.test"},
+                ],
+            },
+        ]
+        with patch(
+            "app.routers.upload.ner_detection.analyze_texts",
+            return_value={},
+        ) as analyze:
+            self.assertEqual(
+                _document_sensitive_type({"sections": sections}),
+                "EMAIL",
+            )
+        analyzed_texts = analyze.call_args.args[0]
+        self.assertLessEqual(len(analyzed_texts), 3)
+
     def test_retrieval_masks_sensitive_text_and_excludes_document_values(self):
         doc = stored_document([self.section], action="mask", sensitive=True)
         tokenized = {
@@ -320,6 +382,76 @@ class DocumentPrivacyAndRetrievalTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             document_retrieval.retrieve_document_context("chat-1", [doc], "project delivery")
 
+    def test_excluded_docx_is_not_exposed_as_a_tool_sheet(self):
+        doc = stored_document([
+            {
+                "source_id": "table-0001-row-0001",
+                "kind": "table_row",
+                "order": 1,
+                "table_id": "table-0001",
+                "heading_path": ["Transactions"],
+                "is_header": True,
+                "cells": [
+                    {"source_id": "table-0001-row-0001-cell-001", "content": "Amount"},
+                ],
+            },
+            {
+                "source_id": "table-0001-row-0002",
+                "kind": "table_row",
+                "order": 2,
+                "table_id": "table-0001",
+                "heading_path": ["Transactions"],
+                "is_header": False,
+                "cells": [
+                    {"source_id": "table-0001-row-0002-cell-001", "content": "48660"},
+                ],
+            },
+        ], action="exclude")
+        context = tools.ToolContext(
+            user_id="doc-user",
+            chat_id="chat-1",
+            files={"doc-file-1": doc},
+        )
+        with patch.object(mapping_store, "get_chat", return_value={"chat_id": "chat-1"}):
+            workbook = tools._load_tool_workbook(context, "doc-file-1")
+        self.assertEqual(workbook.sheets, [])
+
+    def test_uneven_docx_table_fails_closed_instead_of_misaligned_calculation(self):
+        doc = stored_document([
+            {
+                "source_id": "table-0001-row-0001",
+                "kind": "table_row",
+                "order": 1,
+                "table_id": "table-0001",
+                "heading_path": ["Transactions"],
+                "is_header": True,
+                "cells": [
+                    {"source_id": "table-0001-row-0001-cell-001", "content": "Amount"},
+                    {"source_id": "table-0001-row-0001-cell-002", "content": "Status"},
+                ],
+            },
+            {
+                "source_id": "table-0001-row-0002",
+                "kind": "table_row",
+                "order": 2,
+                "table_id": "table-0001",
+                "heading_path": ["Transactions"],
+                "is_header": False,
+                "cells": [
+                    {"source_id": "table-0001-row-0002-cell-001", "content": "48660"},
+                ],
+            },
+        ], action="share")
+        context = tools.ToolContext(
+            user_id="doc-user",
+            chat_id="chat-1",
+            files={"doc-file-1": doc},
+        )
+        with patch.object(mapping_store, "get_chat", return_value={"chat_id": "chat-1"}):
+            with self.assertRaises(tools.ToolExecutionError) as error:
+                tools._load_tool_workbook(context, "doc-file-1")
+        self.assertEqual(error.exception.code, "uneven_docx_table")
+
     def test_result_count_and_context_size_are_bounded(self):
         sections = [
             {
@@ -343,6 +475,170 @@ class DocumentPrivacyAndRetrievalTests(unittest.TestCase):
             )
         self.assertLessEqual(len(sources), document_retrieval.MAX_DOCUMENT_SOURCES)
         self.assertLessEqual(len(context), document_retrieval.MAX_DOCUMENT_CONTEXT_CHARS + 300)
+
+    def test_broad_table_query_returns_all_matching_rows_in_document_order(self):
+        sections = []
+        for index, city in enumerate(["Pune", "Mumbai", "Pune", "Delhi", "Pune", "Mumbai", "Chennai", "Pune"], start=1):
+            sections.append({
+                "source_id": f"table-0001-row-{index:04d}",
+                "kind": "table_row",
+                "order": index,
+                "table_id": "table-0001",
+                "heading_path": ["Customer Profiles"],
+                "cells": [
+                    {"source_id": f"table-0001-row-{index:04d}-cell-001", "content": f"CUST-{index:03d}"},
+                    {"source_id": f"table-0001-row-{index:04d}-cell-002", "content": city},
+                ],
+            })
+        doc = stored_document(sections, action="share")
+        with (
+            patch("app.document_retrieval.mask_free_texts", side_effect=lambda texts, *_args, **_kwargs: {
+                text: text for text in texts
+            }),
+            patch.object(mapping_store, "get_known_values", return_value={}),
+            patch.object(mapping_store, "load_counters", return_value={}),
+        ):
+            context, sources, _allowed = document_retrieval.retrieve_document_context(
+                "chat-1", [doc], "List all customer cities"
+            )
+
+        self.assertGreaterEqual(context.count("CUST-"), 8)
+        self.assertEqual(len(sources), 8)
+        for expected in ("Pune", "Mumbai", "Delhi", "Chennai"):
+            self.assertIn(expected, context)
+
+    def test_structured_docx_tools_compute_exact_transaction_totals(self):
+        sections = [
+            {
+                "source_id": "table-0001-row-0001",
+                "kind": "table_row",
+                "order": 1,
+                "table_id": "table-0001",
+                "heading_path": ["Payment Transactions"],
+                "is_header": True,
+                "cells": [
+                    {"source_id": "table-0001-row-0001-cell-001", "content": "Transaction ID"},
+                    {"source_id": "table-0001-row-0001-cell-002", "content": "Amount"},
+                    {"source_id": "table-0001-row-0001-cell-003", "content": "Status"},
+                ],
+            },
+        ]
+        amounts = ["12000", "9500", "11000", "8200", "7960"]
+        statuses = ["Settled", "Settled", "Pending", "Refunded", "Settled"]
+        for index, (amount, status) in enumerate(zip(amounts, statuses), start=2):
+            sections.append({
+                "source_id": f"table-0001-row-{index:04d}",
+                "kind": "table_row",
+                "order": index,
+                "table_id": "table-0001",
+                "heading_path": ["Payment Transactions"],
+                "is_header": False,
+                "cells": [
+                    {"source_id": f"table-0001-row-{index:04d}-cell-001", "content": f"TXN-{index:03d}"},
+                    {"source_id": f"table-0001-row-{index:04d}-cell-002", "content": amount},
+                    {"source_id": f"table-0001-row-{index:04d}-cell-003", "content": status},
+                ],
+            })
+        doc = stored_document(sections, action="share")
+        context = tools.ToolContext(
+            user_id="doc-user",
+            chat_id="chat-1",
+            files={"doc-file-1": doc},
+        )
+
+        with patch.object(mapping_store, "get_chat", return_value={"chat_id": "chat-1"}):
+            workbook = tools._load_tool_workbook(context, "doc-file-1")
+            schema = tools._available_schema(workbook)
+            sheet = workbook.sheets[0]
+            amount_column = next(column for column in sheet.columns if column.name == "Amount")
+            status_column = next(column for column in sheet.columns if column.name == "Status")
+            total = tools._aggregate_handler(context, tools.AggregateArgs(
+                file_id="doc-file-1",
+                worksheet_id=sheet.worksheet_id,
+                aggregation="sum",
+                column_id=amount_column.column_id,
+            ))
+            average = tools._aggregate_handler(context, tools.AggregateArgs(
+                file_id="doc-file-1",
+                worksheet_id=sheet.worksheet_id,
+                aggregation="average",
+                column_id=amount_column.column_id,
+            ))
+            status_groups = tools._group_aggregate(
+                context,
+                tools.GroupAggregateArgs(
+                    file_id="doc-file-1",
+                    worksheet_id=sheet.worksheet_id,
+                    group_column_id=status_column.column_id,
+                    aggregation="count",
+                    limit=10,
+                ),
+            )
+
+        self.assertEqual(schema["worksheets"][0]["row_count"], 5)
+        self.assertEqual(total["value"], "48660")
+        self.assertEqual(average["value"], "9732")
+        groups = {item["group"]: item["value"] for item in status_groups["groups"]}
+        self.assertEqual(groups, {"Pending": 1, "Refunded": 1, "Settled": 3})
+
+    def test_docx_table_joins_to_csv_without_using_narrative_text(self):
+        docx_table = DOCUMENT.replace("<w:t>Region</w:t>", "<w:t>Customer ID</w:t>").replace(
+            "<w:t>Revenue</w:t>", "<w:t>Amount</w:t>"
+        )
+        doc = stored_document(docx_ingestion.parse_docx(make_docx(docx_table), "doc-file-1")["sections"], action="share")
+        doc["file_id"] = "doc-file-1"
+        doc_document = json.loads(doc["workbook_json"])
+        doc_document["file_id"] = "doc-file-1"
+        doc["workbook_json"] = json.dumps(doc_document)
+
+        parsed = workbook_module.parse_workbook("revenue.csv", b"Customer ID,Sales\nWest,120.50\nEast,40")
+        frame = parsed.worksheets[0].dataframe.copy()
+        policy = {
+            "Customer ID": {"action": "share", "sensitive": False, "share_confirmed": False},
+            "Sales": {"action": "share", "sensitive": False, "share_confirmed": False},
+        }
+        workbook_document = workbook_module.build_workbook_document(
+            parsed,
+            "csv-file-1",
+            policy,
+            {"sheet-1": {"Customer ID": None, "Sales": None}},
+            {"sheet-1": frame},
+        )
+        csv_file = {
+            "file_id": "csv-file-1",
+            "filename": "revenue.csv",
+            "updated_at": 1.0,
+            "workbook_json": workbook_module.serialize_workbook(workbook_document),
+            "privacy_policy_json": json.dumps({"version": 1, "columns": policy}),
+            "columns_json": "[]",
+            "masked_csv": "",
+            "row_count": 2,
+        }
+        doc.update({"filename": "revenue.docx", "updated_at": 1.0, "row_count": 1})
+        context = tools.ToolContext(
+            user_id="doc-user", chat_id="chat-1", files={"doc-file-1": doc, "csv-file-1": csv_file}
+        )
+        with patch.object(mapping_store, "get_chat", return_value={"chat_id": "chat-1"}), patch.object(
+            mapping_store, "get_chat_file_revisions", return_value={"doc-file-1": 1.0, "csv-file-1": 1.0}
+        ):
+            doc_table = tools._load_tool_workbook(context, "doc-file-1").sheets[0]
+            csv_sheet = tools._load_tool_workbook(context, "csv-file-1").sheets[0]
+            doc_region = next(column for column in doc_table.columns if column.name == "Customer ID")
+            csv_region = next(column for column in csv_sheet.columns if column.name == "Customer ID")
+            doc_revenue = next(column for column in doc_table.columns if column.name == "Amount")
+            csv_amount = next(column for column in csv_sheet.columns if column.name == "Sales")
+            joined = tools.execute_tool(context, "join_tables", {
+                "left_file_id": "doc-file-1", "left_worksheet_id": doc_table.worksheet_id,
+                "left_key_column_id": doc_region.column_id,
+                "right_file_id": "csv-file-1", "right_worksheet_id": csv_sheet.worksheet_id,
+                "right_key_column_id": csv_region.column_id,
+                "left_columns": [doc_revenue.column_id],
+                "right_columns": [csv_amount.column_id],
+            })
+
+        self.assertEqual(joined["matched_row_count"], 1)
+        self.assertEqual({source["source_format"] for source in joined["source_identities"]}, {"docx", "csv"})
+        self.assertNotIn("team summary", json.dumps(joined))
 
     def test_document_revision_changes_when_content_changes(self):
         first = docx_ingestion.parse_docx(make_docx(), "doc-1")

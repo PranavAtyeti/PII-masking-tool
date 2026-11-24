@@ -141,6 +141,27 @@ class ConversationTurn(Base):
     )
 
 
+class JoinConfirmation(Base):
+    """One-time consent for a specific ambiguous join candidate."""
+
+    __tablename__ = "join_confirmations"
+
+    confirmation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    chat_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("chats.chat_id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    candidate_json: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Float, nullable=False)
+    confirmed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consumed_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[float] = mapped_column(Float, nullable=False)
+
+    __table_args__ = (
+        Index("ix_join_confirmations_owner_expiry", "chat_id", "user_id", "expires_at"),
+    )
+
+
 class ChatFile(Base):
     __tablename__ = "chat_files"
 

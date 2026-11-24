@@ -1103,3 +1103,13 @@
 2026-11-20 11:36:22 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
 2026-11-20 14:26:29 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
 2026-11-20 17:34:49 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:06:36 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:07:45 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:08:32 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:10:00 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:16:14 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:17:25 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 11:18:45 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 12:39:21 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 12:41:08 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending
+2026-11-24 12:41:40 | WARNING | app.lifecycle | request_id=- | privy event=file_deletion_pending chat_id=chat-a file_id=file-a reason=provider_cleanup_pending

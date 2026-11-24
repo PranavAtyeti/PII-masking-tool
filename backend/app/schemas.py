@@ -32,6 +32,7 @@ class MessageIn(BaseModel):
     concise: bool = True
     model_id: str | None = None
     allow_unmasked_risk: bool = False
+    join_confirmation_id: str | None = Field(default=None, min_length=36, max_length=36)
 
 
 class MessageOut(BaseModel):

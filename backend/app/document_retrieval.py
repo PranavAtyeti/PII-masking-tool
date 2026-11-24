@@ -14,11 +14,27 @@ from .privacy_policy import load_policy
 from .security_scan import scan_for_unmasked_pii
 
 MAX_DOCUMENT_SOURCES = 6
+MAX_BROAD_DOCUMENT_SOURCES = 32
 MAX_DOCUMENT_EXCERPT_CHARS = 900
 MAX_DOCUMENT_CONTEXT_CHARS = 9000
 MAX_DOCUMENT_SECTIONS = 100_000
 MAX_DOCUMENT_TEXT_CHARS = 10_000_000
 _WORD_RE = re.compile(r"[^\W_][\w'-]{2,}", re.UNICODE)
+_TERM_ALIASES = {
+    "cities": {"city", "cities"},
+    "city": {"city", "cities"},
+    "customers": {"customer", "customers"},
+    "customer": {"customer", "customers"},
+    "transactions": {"transaction", "transactions", "payment", "payments"},
+    "transaction": {"transaction", "transactions", "payment", "payments"},
+    "payments": {"transaction", "transactions", "payment", "payments"},
+    "payment": {"transaction", "transactions", "payment", "payments"},
+    "identities": {"identity", "identities"},
+    "identity": {"identity", "identities"},
+    "support": {"support", "support case", "support cases"},
+    "network": {"network", "networks", "network event", "network events"},
+    "networks": {"network", "networks", "network event", "network events"},
+}
 _STOP_WORDS = {
     "about", "after", "again", "also", "and", "are", "because", "before",
     "between", "could", "does", "from", "have", "into", "more", "most",
@@ -50,11 +66,27 @@ def _section_text(section: dict) -> str:
 
 
 def _terms(text: str) -> set[str]:
-    return {
+    terms = {
         token.casefold()
         for token in _WORD_RE.findall(text or "")
         if token.casefold() not in _STOP_WORDS
     }
+    expanded = set(terms)
+    for term in terms:
+        expanded.update(_TERM_ALIASES.get(term, set()))
+    return expanded
+
+
+def _needs_broad_table_coverage(question: str) -> bool:
+    text = " ".join(str(question or "").strip().lower().split())
+    if not text:
+        return False
+    return bool(re.search(
+        r"\b(all|every|complete|entire|list|cities|city|which|most|least|"
+        r"total|sum|average|count|group|compare|maximum|minimum|settled|"
+        r"pending|refunded|transactions?|customers?|identities|support|network)\b",
+        text,
+    ))
 
 
 def _excerpt(text: str, query_terms: set[str]) -> str:
@@ -91,6 +123,7 @@ def retrieve_document_context(
 ) -> tuple[str, list[dict], list[str]]:
     """Return policy-filtered excerpts and source metadata for one request."""
     query_terms = _terms(question)
+    broad_coverage = _needs_broad_table_coverage(question)
     candidates = []
     document_index = 0
     for chat_file in chat_files:
@@ -174,6 +207,7 @@ def retrieve_document_context(
                 "order": order,
                 "fingerprint": fingerprint,
                 "document_index": document_index,
+                "table_id": str(section.get("table_id") or ""),
                 "action": action,
                 "excerpt": excerpt,
                 "raw_heading_path": raw_heading_path,
@@ -207,7 +241,8 @@ def retrieve_document_context(
                     item["source"]["file_id"],
                 )
             )
-            del candidates[MAX_DOCUMENT_SOURCES:]
+            if not broad_coverage:
+                del candidates[MAX_DOCUMENT_SOURCES:]
 
     contexts = []
     sources = []
@@ -219,7 +254,29 @@ def retrieve_document_context(
     )
     selected = []
     used_chars = 0
-    for candidate in candidates:
+    selection_candidates = candidates
+    if broad_coverage:
+        broad_table_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["kind"] == "table_row"
+            or candidate["score"] > 0
+        ]
+        seen_fingerprints = set()
+        selection_candidates = []
+        for candidate in broad_table_candidates:
+            if candidate["fingerprint"] in seen_fingerprints:
+                continue
+            seen_fingerprints.add(candidate["fingerprint"])
+            selection_candidates.append(candidate)
+        selection_candidates.sort(
+            key=lambda item: (
+                item["order"],
+                item["source"]["file_id"],
+            )
+        )
+
+    for candidate in selection_candidates:
         candidate_context_size = (
             len(candidate["excerpt"])
             + sum(len(heading) for heading in candidate["raw_heading_path"])
@@ -229,7 +286,7 @@ def retrieve_document_context(
             continue
         selected.append(candidate)
         used_chars += candidate_context_size
-        if len(selected) >= MAX_DOCUMENT_SOURCES:
+        if len(selected) >= (MAX_BROAD_DOCUMENT_SOURCES if broad_coverage else MAX_DOCUMENT_SOURCES):
             break
     if not selected:
         return "", [], []

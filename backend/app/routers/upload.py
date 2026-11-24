@@ -135,18 +135,9 @@ def _document_sensitive_type(document: dict) -> str | None:
     sections = document.get("sections", [])
     if not sections:
         return None
-    sample_count = min(16, len(sections))
-    sample_indexes = (
-        [0]
-        if sample_count == 1
-        else [
-            round(index * (len(sections) - 1) / (sample_count - 1))
-            for index in range(sample_count)
-        ]
-    )
-    samples = []
-    for index in sample_indexes:
-        section = sections[index]
+    texts: list[str] = []
+    seen_texts: set[str] = set()
+    for section in sections:
         if section.get("kind") == "table_row":
             content = " | ".join(
                 str(cell.get("content", "")) for cell in section.get("cells", [])
@@ -156,9 +147,9 @@ def _document_sensitive_type(document: dict) -> str | None:
         heading_path = section.get("heading_path", [])
         heading_text = " > ".join(str(item) for item in heading_path)
         sample = f"{heading_text} {content}".strip()
-        if sample:
-            samples.append(sample[:1000])
-    texts = samples
+        if sample and sample not in seen_texts:
+            seen_texts.add(sample)
+            texts.append(sample)
     detected = {
         kind
         for text in texts

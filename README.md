@@ -76,6 +76,8 @@ uvicorn app.main:app --reload --port 8000
 The API health endpoint is available at `http://localhost:8000/api/health`.
 It checks database connectivity and returns HTTP 503 when PostgreSQL is unavailable.
 
+Permanent project documentation is maintained in [docs/privy/](./docs/privy/). The [AI coding handover](./docs/privy/PRIVY_HANDOVER.md) is the preferred starting point for continuing development.
+
 ### 3. Configure the frontend
 
 In a second terminal:

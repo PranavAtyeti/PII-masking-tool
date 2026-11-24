@@ -20,7 +20,7 @@ import type {
   ColumnPrivacyChoice,
   WorksheetInfo,
 } from "./types";
-import { api } from "./api";
+import { api, type JoinConfirmationEvent } from "./api";
 import { AuthPanel } from "./components/AuthPanel";
 import { SUGGESTION_CHIPS } from "./constants";
 import type { ChatAttachment } from "./components/ChatInput";
@@ -55,6 +55,7 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [toolStatus, setToolStatus] = useState<string | null>(null);
+  const [approvedJoin, setApprovedJoin] = useState<{ chatId: string; confirmationId: string } | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingColumns, setPendingColumns] = useState<ColumnInfo[]>([]);
@@ -72,6 +73,7 @@ export default function App() {
   );
 
   const streamControllerRef = useRef<AbortController | null>(null);
+  const sendingRef = useRef(false);
 
   // Wire local JWT and guest-session credentials into the API layer.
   useEffect(() => {
@@ -224,6 +226,7 @@ export default function App() {
 
   async function selectChat(chatId: string) {
     setActiveChatId(chatId);
+    setApprovedJoin(null);
     clearPendingFileState();
     setAttachments([]);
 
@@ -559,6 +562,7 @@ export default function App() {
   }
 
   function handleStopGeneration() {
+    sendingRef.current = false;
     streamControllerRef.current?.abort();
   }
 
@@ -568,28 +572,29 @@ export default function App() {
   }
 
   async function handleSend(text: string) {
-    if (isStreaming) return;
+    if (isStreaming || sendingRef.current) return;
+    sendingRef.current = true;
+    try {
+      let chatId = activeChatId;
 
-    let chatId = activeChatId;
+      if (!chatId) {
+        const created = await api.createChat();
+        setChats((prev) => [created, ...prev]);
+        chatId = created.chat_id;
+        setActiveChatId(chatId);
+      }
 
-    if (!chatId) {
-      const created = await api.createChat();
-      setChats((prev) => [created, ...prev]);
-      chatId = created.chat_id;
-      setActiveChatId(chatId);
-    }
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: text, masked_count: 0 },
+        { role: "assistant", content: "", masked_count: 0 },
+      ]);
 
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: text, masked_count: 0 },
-      { role: "assistant", content: "", masked_count: 0 },
-    ]);
-
-    setIsStreaming(true);
-    setToolStatus(null);
-    const requestId = crypto.randomUUID();
-
-    const runStream = async (allowUnmaskedRisk: boolean) => {
+      setIsStreaming(true);
+      setToolStatus(null);
+      const requestId = crypto.randomUUID();
+      const joinConfirmationId = approvedJoin?.chatId === chatId ? approvedJoin.confirmationId : undefined;
+      if (joinConfirmationId) setApprovedJoin(null);
       const controller = new AbortController();
       streamControllerRef.current = controller;
 
@@ -602,7 +607,8 @@ export default function App() {
           ner_confidence: 0.6,
           concise: true,
           model_id: selectedModelId || undefined,
-          allow_unmasked_risk: allowUnmaskedRisk,
+          allow_unmasked_risk: false,
+          join_confirmation_id: joinConfirmationId,
         },
         {
           onDelta: (piece) => {
@@ -623,6 +629,22 @@ export default function App() {
 
           onToolStatus: setToolStatus,
 
+          onJoinConfirmation: async (confirmation: JoinConfirmationEvent) => {
+            const leftName = attachments.find((item) => item.fileId === confirmation.left.file_id)?.filename ?? "first attached file";
+            const rightName = attachments.find((item) => item.fileId === confirmation.right.file_id)?.filename ?? "second attached file";
+            const approved = window.confirm(
+              `Allow Privy to join ${leftName} (${confirmation.left_column_label}) with ${rightName} (${confirmation.right_column_label})? This approval expires in five minutes and applies only to these files and columns.`
+            );
+            if (!approved) return;
+            try {
+              await api.confirmJoin(chatId!, confirmation.confirmation_id);
+              setApprovedJoin({ chatId: chatId!, confirmationId: confirmation.confirmation_id });
+              window.alert("Join approved. Ask your question again to run the confirmed analysis.");
+            } catch (error) {
+              window.alert(error instanceof Error ? error.message : "This join confirmation is no longer available.");
+            }
+          },
+
           onSources: (sources) => {
             setMessages((prev) => {
               const next = [...prev];
@@ -637,6 +659,7 @@ export default function App() {
           },
 
           onDone: (maskedCount, usage) => {
+            sendingRef.current = false;
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
@@ -661,6 +684,7 @@ export default function App() {
           },
 
           onError: (message, error) => {
+            sendingRef.current = false;
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
@@ -685,6 +709,7 @@ export default function App() {
           },
 
           onAbort: () => {
+            sendingRef.current = false;
             setIsStreaming(false);
             setToolStatus(null);
             streamControllerRef.current = null;
@@ -696,9 +721,23 @@ export default function App() {
       if (streamControllerRef.current === controller) {
         streamControllerRef.current = null;
       }
-    };
-
-    await runStream(false);
+    } catch (error) {
+      sendingRef.current = false;
+      setIsStreaming(false);
+      setToolStatus(null);
+      streamControllerRef.current = null;
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (!last) return prev;
+        next[next.length - 1] = {
+          ...last,
+          content: error instanceof Error ? error.message : "Couldn't send this message.",
+          masked_count: 0,
+        };
+        return next;
+      });
+    }
   }
 
   if (authLoading) {

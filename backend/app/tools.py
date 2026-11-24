@@ -8,6 +8,8 @@ import json
 import os
 import re
 import time
+import hashlib
+import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, localcontext
@@ -35,6 +37,9 @@ MAX_TOOL_GROUPS = int(os.getenv("PRIVY_MAX_TOOL_GROUPS", "20"))
 MAX_TOOL_RESULT_BYTES = int(os.getenv("PRIVY_MAX_TOOL_RESULT_BYTES", "12000"))
 MAX_TOOL_ARGUMENT_BYTES = int(os.getenv("PRIVY_MAX_TOOL_ARGUMENT_BYTES", "8000"))
 MAX_TOOL_EXECUTION_SECONDS = float(os.getenv("PRIVY_MAX_TOOL_EXECUTION_SECONDS", "10"))
+MAX_JOIN_SOURCE_ROWS = max(1, min(int(os.getenv("PRIVY_MAX_JOIN_SOURCE_ROWS", "20000")), 20000))
+MAX_JOIN_OUTPUT_ROWS = max(1, min(int(os.getenv("PRIVY_MAX_JOIN_OUTPUT_ROWS", "10000")), 10000))
+MAX_JOIN_MEMORY_BYTES = max(1024, min(int(os.getenv("PRIVY_MAX_JOIN_MEMORY_BYTES", str(32 * 1024 * 1024))), 32 * 1024 * 1024))
 
 _AGGREGATIONS = {"count", "sum", "average", "minimum", "maximum", "distinct_count"}
 _FILTER_OPERATORS = {
@@ -197,6 +202,27 @@ class CompareGroupsArgs(_StrictArgs):
     metric_column_id: str | None = Field(default=None, max_length=64)
 
 
+class JoinDiscoveryArgs(_StrictArgs):
+    file_ids: list[str] | None = Field(default=None, min_length=2, max_length=8)
+
+
+class JoinArgs(_StrictArgs):
+    left_file_id: str = Field(min_length=1, max_length=64)
+    left_worksheet_id: str = Field(min_length=1, max_length=64)
+    left_key_column_id: str = Field(min_length=1, max_length=64)
+    right_file_id: str = Field(min_length=1, max_length=64)
+    right_worksheet_id: str = Field(min_length=1, max_length=64)
+    right_key_column_id: str = Field(min_length=1, max_length=64)
+    left_columns: list[str] = Field(min_length=1, max_length=MAX_FILTER_COLUMNS)
+    right_columns: list[str] = Field(min_length=1, max_length=MAX_FILTER_COLUMNS)
+
+
+class JoinedAggregateArgs(_StrictArgs):
+    result_ref: str = Field(min_length=36, max_length=36)
+    aggregation: str
+    column_ref: str | None = Field(default=None, max_length=140)
+
+
 @dataclass
 class ToolColumn:
     column_id: str
@@ -241,6 +267,129 @@ class ToolContext:
     files: dict[str, dict[str, Any]]
     workbooks: dict[str, ToolWorkbook] = field(default_factory=dict)
     execution_count: int = 0
+    join_results: dict[str, "JoinedToolResult"] = field(default_factory=dict)
+    join_result_bytes: int = 0
+    pending_join_confirmations: list[dict[str, Any]] = field(default_factory=list)
+    approved_join_confirmation_id: str | None = None
+
+
+@dataclass
+class JoinedToolResult:
+    result_id: str
+    owner_id: str
+    chat_id: str
+    frame: pd.DataFrame
+    columns: dict[str, ToolColumn]
+    sources: list[dict[str, Any]]
+    created_at: float
+    memory_bytes: int
+    transformations: list[str]
+
+
+def cleanup_tool_context(context: ToolContext) -> None:
+    """Drop request-scoped derived data on success, failure, or cancellation."""
+    context.join_results.clear()
+    context.join_result_bytes = 0
+    context.workbooks.clear()
+    context.pending_join_confirmations.clear()
+    context.approved_join_confirmation_id = None
+
+
+def _discard_join_result(context: ToolContext, result_ref: str | None) -> None:
+    if not result_ref:
+        return
+    dataset = context.join_results.pop(result_ref, None)
+    if dataset is not None:
+        context.join_result_bytes = max(0, context.join_result_bytes - dataset.memory_bytes)
+
+
+def _source_identity(context: ToolContext, file_id: str, worksheet_id: str) -> dict[str, Any]:
+    """Build a request-scoped identity without including data values."""
+    workbook = _load_tool_workbook(context, file_id)
+    item = context.files[file_id]
+    revision = item.get("updated_at")
+    source = workbook.source_workbook or {}
+    extension = os.path.splitext(str(item.get("filename") or ""))[1].lower().lstrip(".")
+    source_format = "docx" if source.get("document_kind") == "docx" else (
+        str(source.get("source_format") or item.get("file_type") or extension or "spreadsheet").lower()
+    )
+    policy_bytes = str(item.get("privacy_policy_json") or "").encode("utf-8")
+    sheet = next((entry for entry in workbook.sheets if entry.worksheet_id == worksheet_id), None)
+    return {
+        "file_id": file_id,
+        "ownership": "current_authenticated_user",
+        "ownership_verified": True,
+        "file_revision": str(revision) if revision is not None else None,
+        "source_revision": source.get("document_revision") or source.get("revision"),
+        "source_format": source_format,
+        "table_id": worksheet_id,
+        "column_ids": [column.column_id for column in sheet.columns] if sheet else [],
+        "privacy_policy_revision": hashlib.sha256(policy_bytes).hexdigest()[:16],
+    }
+
+
+def _attach_result_contract(context: ToolContext, operation: str, arguments: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """Add common verification/provenance fields while retaining legacy result keys."""
+    file_id = arguments.get("file_id")
+    worksheet_id = arguments.get("worksheet_id")
+    identities = list(result.get("source_identities", [])) if isinstance(result.get("source_identities"), list) else []
+    if isinstance(file_id, str) and isinstance(worksheet_id, str) and file_id in context.files:
+        identities.append(_source_identity(context, file_id, worksheet_id))
+    elif isinstance(file_id, str) and file_id in context.files:
+        for sheet in _get_workbook(context, file_id).sheets:
+            identities.append(_source_identity(context, file_id, sheet.worksheet_id))
+    elif operation == "discover_joins":
+        for source_file_id in arguments.get("file_ids") or sorted(context.files):
+            if source_file_id in context.files:
+                for sheet in _get_workbook(context, source_file_id).sheets:
+                    identities.append(_source_identity(context, source_file_id, sheet.worksheet_id))
+    for candidate in result.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        for side in ("left", "right"):
+            source = candidate.get(side)
+            if isinstance(source, dict) and source.get("file_id") in context.files:
+                identity = _source_identity(context, source["file_id"], source.get("worksheet_id", ""))
+                if identity not in identities:
+                    identities.append(identity)
+    for source in result.get("join_sources", []):
+        if isinstance(source, dict) and source.get("file_id") in context.files:
+            identity = _source_identity(context, source["file_id"], source.get("worksheet_id", ""))
+            if identity not in identities:
+                identities.append(identity)
+    conditions = arguments.get("conditions") or []
+    result.update({
+        "operation": operation,
+        "operation_version": 1,
+        "verification_status": "exact" if result.get("exact") is True else "not_verified",
+        "source_identities": identities,
+        "privacy_policy_revisions": sorted({item["privacy_policy_revision"] for item in identities}),
+        "provenance": {
+            "source_tables": [item["table_id"] for item in identities],
+            "transformations": [*result.pop("prior_transformations", []), operation],
+            "filters": [
+                {"column_id": condition.get("column_id"), "operator": condition.get("operator")}
+                for condition in conditions if isinstance(condition, dict)
+            ],
+            "join_keys": ([
+                {"file_id": arguments.get("left_file_id"), "worksheet_id": arguments.get("left_worksheet_id"), "column_id": arguments.get("left_key_column_id")},
+                {"file_id": arguments.get("right_file_id"), "worksheet_id": arguments.get("right_worksheet_id"), "column_id": arguments.get("right_key_column_id")},
+            ] if operation == "join_tables" else []),
+        },
+        "input_record_count": result.get("row_count", result.get("total_rows", (
+            (result.get("left_row_count") or 0) + (result.get("right_row_count") or 0)
+            if operation == "join_tables" else None
+        ))),
+        "output_record_count": result.get("matched_row_count", result.get("group_count", result.get("row_count", result.get("returned_row_count")))),
+        "returned_record_count": result.get("returned_row_count"),
+        "warnings": result.get("warnings", []),
+        "validation_checks": [*result.get("validation_checks", []), "chat_ownership", "file_ownership", "privacy_policy", "bounded_result", "outbound_pii_scan"],
+        "execution_metadata": {"engine": "pandas", "bounded": True},
+        "partial_result": bool(result.get("truncated", False)),
+        "limitations": (["Result rows were capped by the configured tool limit."] if result.get("truncated") else []),
+    })
+    result.setdefault("privacy_policy_revision", identities[0]["privacy_policy_revision"] if identities else None)
+    return result
 
 
 @dataclass(frozen=True)
@@ -309,6 +458,7 @@ def create_tool_context(
     chat_id: str,
     user_id: str,
     files: list[dict[str, Any]] | None = None,
+    approved_join_confirmation_id: str | None = None,
 ) -> ToolContext:
     if not store.get_chat(chat_id, user_id):
         raise ToolExecutionError("chat_not_found", "The requested chat is not available.")
@@ -318,6 +468,7 @@ def create_tool_context(
         user_id=user_id,
         chat_id=chat_id,
         files={str(item["file_id"]): item for item in files},
+        approved_join_confirmation_id=approved_join_confirmation_id,
     )
     _refresh_authorized_files(context, None)
     return context
@@ -347,6 +498,123 @@ def _load_tool_workbook(context: ToolContext, file_id: str) -> ToolWorkbook:
 
     workbook_json = chat_file.get("workbook_json")
     if workbook_json:
+        try:
+            raw_document = json.loads(workbook_json)
+        except (TypeError, ValueError):
+            raw_document = None
+        if isinstance(raw_document, dict) and raw_document.get("document_kind") == "docx":
+            if raw_document.get("file_id") != file_id:
+                raise ToolExecutionError("invalid_workbook", "The stored document identity is invalid.")
+            policy, legacy = load_policy(
+                chat_file.get("privacy_policy_json"),
+                chat_file.get("columns_json"),
+            )
+            if legacy:
+                raise ToolExecutionError("missing_privacy_policy", "The document privacy policy needs review.")
+            choice = policy.get("document_content")
+            if not isinstance(choice, dict):
+                raise ToolExecutionError("invalid_privacy_policy", "The document privacy policy is invalid.")
+            if choice["action"] == "exclude":
+                result = ToolWorkbook(file_id=file_id, sheets=[], source_workbook=raw_document, privacy_policy=policy)
+                context.workbooks[file_id] = result
+                return result
+            if choice["action"] == "share" and choice.get("sensitive") and not choice.get("share_confirmed"):
+                raise ToolExecutionError("unconfirmed_sensitive_share", "A sensitive document Share choice needs confirmation.")
+
+            worksheets: list[ToolWorksheet] = []
+            table_sections: dict[str, list[dict[str, Any]]] = {}
+            table_names: dict[str, str] = {}
+            for section in raw_document.get("sections", []):
+                if not isinstance(section, dict) or section.get("kind") != "table_row":
+                    continue
+                table_id = str(section.get("table_id") or "")
+                if not table_id:
+                    continue
+                table_sections.setdefault(table_id, []).append(section)
+                heading_path = section.get("heading_path", [])
+                if heading_path and table_id not in table_names:
+                    table_names[table_id] = str(heading_path[-1])
+
+            for table_position, (table_id, rows) in enumerate(sorted(
+                table_sections.items(),
+                key=lambda item: min(int(row.get("order", 0)) for row in item[1]),
+            )):
+                ordered = sorted(rows, key=lambda row: int(row.get("order", 0)))
+                if not ordered:
+                    continue
+                if len({len(row.get("cells", [])) for row in ordered}) > 1:
+                    raise ToolExecutionError(
+                        "uneven_docx_table",
+                        "This DOCX table has uneven row widths and could not be analyzed safely.",
+                    )
+                header_rows = [row for row in ordered if row.get("is_header") is True]
+                if header_rows:
+                    first_cells = header_rows[-1].get("cells", [])
+                else:
+                    first_cells = []
+                if first_cells:
+                    headers = [
+                        str(cell.get("content", "")).strip() or f"Column {column_position + 1}"
+                        for column_position, cell in enumerate(first_cells)
+                    ]
+                    header_column_count = len(headers)
+                    uneven_rows = [
+                        row for row in ordered
+                        if len(row.get("cells", [])) not in {header_column_count}
+                    ]
+                    if uneven_rows:
+                        raise ToolExecutionError(
+                            "uneven_docx_table",
+                            "This DOCX table has uneven row widths and could not be analyzed safely.",
+                        )
+                else:
+                    column_count = max(
+                        (len(row.get("cells", [])) for row in ordered),
+                        default=0,
+                    )
+                    headers = [f"Column {column_position + 1}" for column_position in range(column_count)]
+                unique_headers: list[str] = []
+                for header_position, header in enumerate(headers):
+                    normalized = header.casefold()
+                    count = sum(
+                        1 for existing in unique_headers if existing.casefold() == normalized
+                    )
+                    unique_headers.append(
+                        header if count == 0
+                        else f"{header} ({count + 1})"
+                    )
+                headers = unique_headers
+                columns: list[ToolColumn] = []
+                for column_position, header in enumerate(headers):
+                    policy_key = f"{table_id}:column-{column_position + 1}"
+                    columns.append(ToolColumn(
+                        column_id=f"{table_id}:column-{column_position + 1}",
+                        policy_key=policy_key,
+                        name=header,
+                        data_type=None,
+                        action=str(choice["action"]),
+                        sensitive=bool(choice.get("sensitive")),
+                        share_confirmed=bool(choice.get("share_confirmed")),
+                        position=column_position,
+                    ))
+                worksheets.append(ToolWorksheet(
+                    worksheet_id=table_id,
+                    name=table_names.get(table_id, f"Table {table_position + 1}"),
+                    position=table_position,
+                    row_count=max(0, len(ordered) - 1),
+                    column_count=len(columns),
+                    visibility="visible",
+                    is_irregular=False,
+                    columns=columns,
+                ))
+            result = ToolWorkbook(
+                file_id=file_id,
+                sheets=worksheets,
+                source_workbook=raw_document,
+                privacy_policy=policy,
+            )
+            context.workbooks[file_id] = result
+            return result
         workbook_data = deserialize_workbook(workbook_json)
         if workbook_data.get("file_id") != file_id:
             raise ToolExecutionError("invalid_workbook", "The stored workbook identity is invalid.")
@@ -451,6 +719,42 @@ def _ensure_frame(context: ToolContext, file_id: str, sheet: ToolWorksheet) -> p
         workbook_data = workbook.source_workbook
         if workbook_data is None:
             raise ToolExecutionError("invalid_workbook", "The stored workbook is unavailable.")
+        if isinstance(workbook_data, dict) and workbook_data.get("document_kind") == "docx":
+            rows: list[dict[str, Any]] = []
+            table_rows = [
+                section
+                for section in workbook_data.get("sections", [])
+                if isinstance(section, dict)
+                and section.get("kind") == "table_row"
+                and str(section.get("table_id") or "") == sheet.worksheet_id
+            ]
+            table_rows.sort(key=lambda row: int(row.get("order", 0)))
+            if table_rows:
+                data_rows = [
+                    row for row in table_rows
+                    if row.get("is_header") is not True
+                ]
+                for row in data_rows:
+                    values: dict[str, Any] = {}
+                    cells = row.get("cells", [])
+                    for column in sheet.columns:
+                        column_position = column.position
+                        cell = cells[column_position] if column_position < len(cells) else None
+                        value = str(cell.get("content", "")).strip() if isinstance(cell, dict) else ""
+                        if column.action == "mask" and scan_for_unmasked_pii(value):
+                            raise ToolExecutionError(
+                                "privacy_validation_failed",
+                                "The document result did not pass outbound privacy validation.",
+                            )
+                        values[column.policy_key] = value
+                    rows.append(values)
+            frame = pd.DataFrame(
+                rows,
+                columns=[column.policy_key for column in sheet.columns],
+            )
+            sheet.row_count = len(frame)
+            sheet.frame = frame
+            return frame
         policy = workbook.privacy_policy
         selected_keys = {column.policy_key for column in sheet.columns}
         projected = workbook_policy_projection(
@@ -594,9 +898,388 @@ def describe_workbooks(context: ToolContext) -> str:
     )
 
 
+def _discover_joins(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, JoinDiscoveryArgs)
+    file_ids = args.file_ids or sorted(context.files)
+    if len(file_ids) < 2 or len(file_ids) > 8 or len(set(file_ids)) != len(file_ids):
+        raise ToolExecutionError("invalid_sources", "Choose between two and eight distinct attached files.")
+    workbooks = [_get_workbook(context, file_id) for file_id in file_ids]
+    candidates: list[dict[str, Any]] = []
+    for left_index, left_book in enumerate(workbooks):
+        for right_book in workbooks[left_index + 1:]:
+            for left_sheet in left_book.sheets:
+                if left_sheet.row_count > MAX_JOIN_SOURCE_ROWS:
+                    continue
+                left_frame = _ensure_frame(context, left_book.file_id, left_sheet)
+                if len(left_frame) > 20000:
+                    continue
+                for right_sheet in right_book.sheets:
+                    if right_sheet.row_count > MAX_JOIN_SOURCE_ROWS:
+                        continue
+                    right_frame = _ensure_frame(context, right_book.file_id, right_sheet)
+                    if len(right_frame) > 20000:
+                        continue
+                    for left_col in left_sheet.columns:
+                        if left_col.action != "share" or (left_col.sensitive and not left_col.share_confirmed):
+                            continue
+                        left_values = _non_null(_series(left_sheet, left_col, left_frame))
+                        if not left_values:
+                            continue
+                        left_kind = _column_kind(left_values)
+                        for right_col in right_sheet.columns:
+                            if right_col.action != "share" or (right_col.sensitive and not right_col.share_confirmed):
+                                continue
+                            if re.sub(r"[^a-z0-9]+", "", left_col.name.casefold()) != re.sub(r"[^a-z0-9]+", "", right_col.name.casefold()):
+                                continue
+                            right_values = _non_null(_series(right_sheet, right_col, right_frame))
+                            if not right_values or _column_kind(right_values) != left_kind:
+                                continue
+                            left_series = _series(left_sheet, left_col, left_frame)
+                            right_series = _series(right_sheet, right_col, right_frame)
+                            left_non_null = [str(v) for v in left_series if v is not None and not pd.isna(v)]
+                            right_non_null = [str(v) for v in right_series if v is not None and not pd.isna(v)]
+                            left_unique = len(left_non_null) == len(set(left_non_null))
+                            right_unique = len(right_non_null) == len(set(right_non_null))
+                            cardinality = "one_to_one" if left_unique and right_unique else (
+                                "one_to_many" if left_unique else "many_to_one" if right_unique else "many_to_many"
+                            )
+                            candidates.append({
+                                "left": {"file_id": left_book.file_id, "worksheet_id": left_sheet.worksheet_id, "column_id": left_col.column_id},
+                                "right": {"file_id": right_book.file_id, "worksheet_id": right_sheet.worksheet_id, "column_id": right_col.column_id},
+                                "compatible_type": left_kind,
+                                "left_null_count": int(len(left_series) - len(left_non_null)),
+                                "right_null_count": int(len(right_series) - len(right_non_null)),
+                                "left_unique": left_unique,
+                                "right_unique": right_unique,
+                                "observed_cardinality": cardinality,
+                                "overlap_count": len(set(left_non_null) & set(right_non_null)),
+                                "requires_confirmation": False,
+                                "execution_eligible": cardinality != "many_to_many" and bool(set(left_non_null) & set(right_non_null)),
+                            })
+    candidate_counts: dict[tuple[str, str, str, str], int] = {}
+    visible_candidates = candidates[:40]
+    for candidate in visible_candidates:
+        left = candidate["left"]
+        right = candidate["right"]
+        pair = (left["file_id"], left["worksheet_id"], right["file_id"], right["worksheet_id"])
+        candidate_counts[pair] = candidate_counts.get(pair, 0) + 1
+    for candidate in candidates:
+        left = candidate["left"]
+        right = candidate["right"]
+        pair = (left["file_id"], left["worksheet_id"], right["file_id"], right["worksheet_id"])
+        ambiguous = candidate_counts[pair] > 1
+        candidate["requires_confirmation"] = ambiguous
+        candidate["left_column_label"] = _schema_name(
+            _get_column(_get_sheet(context, left["file_id"], left["worksheet_id"]), left["column_id"]).name, 0
+        )
+        candidate["right_column_label"] = _schema_name(
+            _get_column(_get_sheet(context, right["file_id"], right["worksheet_id"]), right["column_id"]).name, 0
+        )
+        if ambiguous and candidate["execution_eligible"]:
+            identities = [
+                _source_identity(context, left["file_id"], left["worksheet_id"]),
+                _source_identity(context, right["file_id"], right["worksheet_id"]),
+            ]
+            binding = {"left": left, "right": right, "source_identities": identities}
+            confirmation_id = store.create_join_confirmation(
+                chat_id=context.chat_id, user_id=context.user_id, candidate=binding, ttl_seconds=300
+            )
+            context.pending_join_confirmations.append({
+                "confirmation_id": confirmation_id,
+                "left": left,
+                "right": right,
+                "left_column_label": candidate["left_column_label"],
+                "right_column_label": candidate["right_column_label"],
+                "expires_in_seconds": 300,
+            })
+    return {"candidates": visible_candidates, "exact": True, "candidate_limit_reached": len(candidates) > 40}
+
+
+def _join_tables(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, JoinArgs)
+    if args.left_file_id == args.right_file_id:
+        raise ToolExecutionError("invalid_sources", "A join requires two distinct attached files.")
+    left_sheet = _get_sheet(context, args.left_file_id, args.left_worksheet_id)
+    right_sheet = _get_sheet(context, args.right_file_id, args.right_worksheet_id)
+    left_key = _get_column(left_sheet, args.left_key_column_id)
+    right_key = _get_column(right_sheet, args.right_key_column_id)
+    if left_key.action != "share" or right_key.action != "share":
+        raise ToolExecutionError("ineligible_join_key", "Join keys must be explicitly Share-permitted columns.")
+    left_frame = _ensure_frame(context, args.left_file_id, left_sheet)
+    right_frame = _ensure_frame(context, args.right_file_id, right_sheet)
+    if len(left_frame) > MAX_JOIN_SOURCE_ROWS or len(right_frame) > MAX_JOIN_SOURCE_ROWS:
+        raise ToolExecutionError("join_source_too_large", "Join sources exceed the configured row safety limit.")
+
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    left_values = _series(left_sheet, left_key, left_frame)
+    right_values = _series(right_sheet, right_key, right_frame)
+    left_non_null = _non_null(left_values)
+    right_non_null = _non_null(right_values)
+    if not left_non_null or not right_non_null or _column_kind(left_non_null) != _column_kind(right_non_null):
+        raise ToolExecutionError("incompatible_join_keys", "Join keys have no compatible, non-null values.")
+
+    # A unique compatible name pair is the only relationship that can execute
+    # without an interactive confirmation channel. Ambiguity fails closed.
+    key_candidates = []
+    for left_col in left_sheet.columns:
+        if left_col.action != "share":
+            continue
+        lv = _non_null(_series(left_sheet, left_col, left_frame))
+        for right_col in right_sheet.columns:
+            if right_col.action != "share" or normalized(left_col.name) != normalized(right_col.name):
+                continue
+            rv = _non_null(_series(right_sheet, right_col, right_frame))
+            if lv and rv and _column_kind(lv) == _column_kind(rv):
+                key_candidates.append((left_col.column_id, right_col.column_id))
+    selected_key = (left_key.column_id, right_key.column_id)
+    if selected_key not in key_candidates:
+        raise ToolExecutionError("ambiguous_join", "The selected relationship is ambiguous and needs confirmation.")
+    if len(key_candidates) > 1:
+        confirmation_id = context.approved_join_confirmation_id
+        if not confirmation_id:
+            raise ToolExecutionError("ambiguous_join", "This relationship needs explicit user confirmation before it can be joined.")
+        confirmed = store.consume_join_confirmation(
+            chat_id=context.chat_id, user_id=context.user_id, confirmation_id=confirmation_id
+        )
+        context.approved_join_confirmation_id = None
+        current_binding = {
+            "left": {"file_id": args.left_file_id, "worksheet_id": args.left_worksheet_id, "column_id": left_key.column_id},
+            "right": {"file_id": args.right_file_id, "worksheet_id": args.right_worksheet_id, "column_id": right_key.column_id},
+            "source_identities": [
+                _source_identity(context, args.left_file_id, args.left_worksheet_id),
+                _source_identity(context, args.right_file_id, args.right_worksheet_id),
+            ],
+        }
+        if confirmed != current_binding:
+            raise ToolExecutionError("invalid_confirmation", "The join confirmation is expired, reused, stale, or does not match this relationship.")
+
+    if normalized(left_key.name) != normalized(right_key.name):
+        raise ToolExecutionError("ambiguous_join", "The relationship is ambiguous and needs user confirmation before it can be joined.")
+    key_kind = _column_kind(left_non_null)
+
+    def normalize_key(value: Any) -> Any:
+        if key_kind == "numeric":
+            return _as_decimal(value)
+        if key_kind == "date":
+            return _date_comparison_value(value)
+        return str(value)
+
+    left_key_values = [normalize_key(value) for value in left_values if value is not None and not pd.isna(value)]
+    right_key_values = [normalize_key(value) for value in right_values if value is not None and not pd.isna(value)]
+    left_unique = len(left_key_values) == len(set(left_key_values))
+    right_unique = len(right_key_values) == len(set(right_key_values))
+    if not left_unique and not right_unique:
+        raise ToolExecutionError("many_to_many_join", "This many-to-many relationship could multiply records unsafely.")
+    left_counts: dict[Any, int] = {}
+    right_counts: dict[Any, int] = {}
+    for value in left_key_values:
+        left_counts[value] = left_counts.get(value, 0) + 1
+    for value in right_key_values:
+        right_counts[value] = right_counts.get(value, 0) + 1
+    expected_join_rows = sum(count * right_counts.get(value, 0) for value, count in left_counts.items())
+    if expected_join_rows > MAX_JOIN_OUTPUT_ROWS:
+        raise ToolExecutionError("join_output_too_large", "The join would exceed the configured output safety limit.")
+
+    left_columns = [_get_column(left_sheet, column_id) for column_id in args.left_columns]
+    right_columns = [_get_column(right_sheet, column_id) for column_id in args.right_columns]
+    if len(set(args.left_columns)) != len(args.left_columns) or len(set(args.right_columns)) != len(args.right_columns):
+        raise ToolExecutionError("invalid_join_columns", "Join output columns must be unique.")
+    left_join_key = "__privy_left_join_key__"
+    right_join_key = "__privy_right_join_key__"
+    left_names = {column.policy_key: f"left:{column.policy_key}" for column in left_columns}
+    right_names = {column.policy_key: f"right:{column.policy_key}" for column in right_columns}
+    left_data = left_frame[[column.policy_key for column in left_columns]].copy().rename(columns=left_names)
+    right_data = right_frame[[column.policy_key for column in right_columns]].copy().rename(columns=right_names)
+    left_data[left_join_key] = [normalize_key(value) if value is not None and not pd.isna(value) else None for value in left_values]
+    right_data[right_join_key] = [normalize_key(value) if value is not None and not pd.isna(value) else None for value in right_values]
+    left_data = left_data[left_data[left_join_key].notna()]
+    right_data = right_data[right_data[right_join_key].notna()]
+    validate = "one_to_one" if left_unique and right_unique else "one_to_many" if left_unique else "many_to_one"
+    try:
+        joined = left_data.merge(
+            right_data,
+            how="inner",
+            left_on=left_join_key,
+            right_on=right_join_key,
+            suffixes=("_left", "_right"),
+            validate=validate,
+            sort=False,
+        )
+    except (pd.errors.MergeError, ValueError) as exc:
+        raise ToolExecutionError("unsafe_join", "The observed join cardinality failed validation.") from exc
+    output_count = len(joined)
+    if output_count != expected_join_rows or output_count > max(1, len(left_data), len(right_data)):
+        raise ToolExecutionError("join_amplification", "The join would produce excessive duplicate amplification.")
+    derived_columns = {
+        **{f"left:{column.column_id}": column for column in left_columns},
+        **{f"right:{column.column_id}": column for column in right_columns},
+    }
+    derived_data = {
+        f"left:{column.column_id}": joined[left_names[column.policy_key]].reset_index(drop=True)
+        for column in left_columns
+    }
+    derived_data.update({
+        f"right:{column.column_id}": joined[right_names[column.policy_key]].reset_index(drop=True)
+        for column in right_columns
+    })
+    derived_frame = pd.DataFrame(derived_data)
+    memory_bytes = int(derived_frame.memory_usage(index=True, deep=True).sum())
+    if context.join_result_bytes + memory_bytes > MAX_JOIN_MEMORY_BYTES:
+        raise ToolExecutionError("join_memory_limit", "The joined result exceeds the request memory limit.")
+    result_ref = str(uuid.uuid4())
+    source_identities = [
+        _source_identity(context, args.left_file_id, args.left_worksheet_id),
+        _source_identity(context, args.right_file_id, args.right_worksheet_id),
+    ]
+    context.join_results[result_ref] = JoinedToolResult(
+        result_id=result_ref,
+        owner_id=context.user_id,
+        chat_id=context.chat_id,
+        frame=derived_frame,
+        columns=derived_columns,
+        sources=source_identities,
+        created_at=time.monotonic(),
+        memory_bytes=memory_bytes,
+        transformations=["join_tables"],
+    )
+    context.join_result_bytes += memory_bytes
+    result_rows = []
+    for row_index, (_, row) in enumerate(joined.head(MAX_TOOL_ROWS).iterrows(), start=1):
+        values = {}
+        for column in left_columns:
+            values[f"left:{column.column_id}"] = _safe_value(column, row.get(left_names[column.policy_key]))
+        for column in right_columns:
+            values[f"right:{column.column_id}"] = _safe_value(column, row.get(right_names[column.policy_key]))
+        result_rows.append({"row_index": row_index, "values": values})
+    return {
+        "exact": True,
+        "verification_status": "exact",
+        "validation_checks": ["join_keys_compatible", "join_keys_share_permitted", "cardinality_validated", "expected_size_checked", "duplicate_amplification_checked", "source_ownership_checked", "source_policies_checked"],
+        "join_type": "inner",
+        "cardinality": validate,
+        "left_row_count": len(left_frame),
+        "right_row_count": len(right_frame),
+        "matched_row_count": output_count,
+        "expected_matched_row_count": expected_join_rows,
+        "left_null_key_count": int(len(left_values) - len(left_key_values)),
+        "right_null_key_count": int(len(right_values) - len(right_key_values)),
+        "left_unmatched_row_count": sum(count for value, count in left_counts.items() if value not in right_counts),
+        "right_unmatched_row_count": sum(count for value, count in right_counts.items() if value not in left_counts),
+        "duplicate_amplification_ratio": round(output_count / max(1, len(left_key_values), len(right_key_values)), 6),
+        "result_ref": result_ref,
+        "returned_row_count": len(result_rows),
+        "truncated": output_count > len(result_rows),
+        "rows": result_rows,
+        "join_sources": [
+            {"file_id": args.left_file_id, "worksheet_id": args.left_worksheet_id},
+            {"file_id": args.right_file_id, "worksheet_id": args.right_worksheet_id},
+        ],
+    }
+
+
+def _aggregate_joined(context: ToolContext, raw_args: BaseModel) -> dict[str, Any]:
+    args = raw_args
+    assert isinstance(args, JoinedAggregateArgs)
+    dataset = context.join_results.get(args.result_ref)
+    if dataset is None:
+        raise ToolExecutionError("result_not_found", "That intermediate result is unavailable in this request.")
+    if dataset.owner_id != context.user_id or dataset.chat_id != context.chat_id:
+        raise ToolExecutionError("result_forbidden", "That intermediate result is not available in this conversation.")
+    if time.monotonic() - dataset.created_at > 300:
+        context.join_results.pop(args.result_ref, None)
+        context.join_result_bytes = max(0, context.join_result_bytes - dataset.memory_bytes)
+        raise ToolExecutionError("result_expired", "That intermediate result has expired.")
+    current_sources = []
+    try:
+        for source in dataset.sources:
+            current_sources.append(_source_identity(context, source["file_id"], source["table_id"]))
+    except (KeyError, ToolExecutionError):
+        current_sources = []
+    if current_sources != dataset.sources:
+        context.join_results.pop(args.result_ref, None)
+        context.join_result_bytes = max(0, context.join_result_bytes - dataset.memory_bytes)
+        raise ToolExecutionError("stale_result", "A source or privacy policy changed; rediscover and rejoin the files.")
+    if args.aggregation not in _AGGREGATIONS:
+        raise ToolExecutionError("invalid_aggregation", "That aggregation is not supported.")
+    column = dataset.columns.get(args.column_ref) if args.column_ref else None
+    if args.column_ref and column is None:
+        raise ToolExecutionError("column_not_found", "That joined column is unavailable or excluded.")
+    if args.aggregation != "count" and column is None:
+        raise ToolExecutionError("missing_column", "Select a joined column for this aggregation.")
+    values = _non_null(dataset.frame[args.column_ref]) if column else [True] * len(dataset.frame)
+    aggregate = _compute_aggregate(values, args.aggregation, column)
+    return {
+        "result_ref": args.result_ref,
+        "aggregation": args.aggregation,
+        "column_ref": args.column_ref,
+        "row_count": len(dataset.frame),
+        "exact": True,
+        "source_identities": dataset.sources,
+        "prior_transformations": dataset.transformations,
+        **aggregate,
+    }
+
+
 def tool_definitions() -> list[ToolDefinition]:
     common = frozenset({"read_workbook"})
     return [
+        ToolDefinition(
+            name="discover_joins",
+            description="Find possible relationships between attached files using permitted column names, types, null rates, and key uniqueness. This only discovers candidates; ambiguous relationships require user confirmation.",
+            parameters={"type": "object", "properties": {"file_ids": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "string"}}}, "additionalProperties": False},
+            required_permissions=common,
+            argument_model=JoinDiscoveryArgs,
+            handler=_discover_joins,
+            result_schema={"type": "object", "properties": {"candidates": {"type": "array"}, "exact": {"type": "boolean"}}, "required": ["candidates", "exact"]},
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
+        ToolDefinition(
+            name="join_tables",
+            description="Execute an inner join only for a unique, compatible, Share-permitted key relationship. Ambiguous, excluded, masked-key, many-to-many, oversized, and high-amplification joins are rejected. Returns a bounded privacy-safe sample plus the exact matched count.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "left_file_id": {"type": "string"},
+                    "left_worksheet_id": {"type": "string"},
+                    "left_key_column_id": {"type": "string"},
+                    "right_file_id": {"type": "string"},
+                    "right_worksheet_id": {"type": "string"},
+                    "right_key_column_id": {"type": "string"},
+                    "left_columns": {"type": "array", "minItems": 1, "maxItems": MAX_FILTER_COLUMNS, "items": {"type": "string"}},
+                    "right_columns": {"type": "array", "minItems": 1, "maxItems": MAX_FILTER_COLUMNS, "items": {"type": "string"}},
+                },
+                "required": ["left_file_id", "left_worksheet_id", "left_key_column_id", "right_file_id", "right_worksheet_id", "right_key_column_id", "left_columns", "right_columns"],
+                "additionalProperties": False,
+            },
+            required_permissions=common,
+            argument_model=JoinArgs,
+            handler=_join_tables,
+            result_schema={"type": "object", "properties": {"exact": {"type": "boolean"}, "cardinality": {"type": "string"}, "matched_row_count": {"type": "integer"}, "returned_row_count": {"type": "integer"}, "rows": {"type": "array"}}, "required": ["exact", "cardinality", "matched_row_count", "returned_row_count", "rows"]},
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
+        ToolDefinition(
+            name="aggregate_joined_data",
+            description="Run an exact bounded aggregate over the complete in-memory result of a prior join in this request. The sample returned by join_tables is not the calculation source.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "result_ref": {"type": "string"},
+                    "aggregation": _aggregation_schema(),
+                    "column_ref": {"type": ["string", "null"]},
+                },
+                "required": ["result_ref", "aggregation"],
+                "additionalProperties": False,
+            },
+            required_permissions=common,
+            argument_model=JoinedAggregateArgs,
+            handler=_aggregate_joined,
+            result_schema={"type": "object", "properties": {"result_ref": {"type": "string"}, "exact": {"type": "boolean"}, "row_count": {"type": "integer"}, "value": {"type": ["string", "integer", "number", "null"]}}, "required": ["result_ref", "exact", "row_count", "value"]},
+            max_result_bytes=MAX_TOOL_RESULT_BYTES,
+        ),
         ToolDefinition(
             name="get_workbook_schema",
             description="Get authorized workbook worksheets, permitted columns, types, row counts, privacy actions, and structural warnings. No cell values are returned.",
@@ -1159,11 +1842,30 @@ def execute_tool(context: ToolContext, name: str, arguments: str | dict[str, Any
         raise ToolExecutionError("invalid_arguments", "Tool arguments must be a JSON object.")
     if len(json.dumps(arguments, ensure_ascii=True).encode("utf-8")) > MAX_TOOL_ARGUMENT_BYTES:
         raise ToolExecutionError("arguments_too_large", "Tool arguments exceeded the allowed size.")
-    _refresh_authorized_files(context, arguments.get("file_id"))
+    if isinstance(arguments.get("file_ids"), list):
+        if any(not isinstance(file_id, str) for file_id in arguments["file_ids"]):
+            raise ToolExecutionError("invalid_arguments", "File identifiers must be strings.")
+        _refresh_authorized_files(context, None)
+        if any(file_id not in context.files for file_id in arguments["file_ids"]):
+            raise ToolExecutionError("file_not_found", "One or more requested files are not attached to this chat.")
+    elif name == "join_tables":
+        source_ids = [arguments.get("left_file_id"), arguments.get("right_file_id")]
+        if any(not isinstance(file_id, str) for file_id in source_ids):
+            raise ToolExecutionError("invalid_arguments", "Join file identifiers must be strings.")
+        _refresh_authorized_files(context, None)
+        if any(file_id not in context.files for file_id in source_ids):
+            raise ToolExecutionError("file_not_found", "One or more requested files are not attached to this chat.")
+    else:
+        file_id = arguments.get("file_id")
+        if file_id is not None and not isinstance(file_id, str):
+            raise ToolExecutionError("invalid_arguments", "The file identifier must be a string.")
+        _refresh_authorized_files(context, file_id)
     started = time.monotonic()
+    result: dict[str, Any] | None = None
     try:
         validated = definition.argument_model.model_validate(arguments)
         result = definition.handler(context, validated)
+        result = _attach_result_contract(context, name, arguments, result)
     except ValidationError as exc:
         raise ToolExecutionError("invalid_arguments", "The tool arguments did not match the operation schema.") from exc
     except HTTPException as exc:
@@ -1172,11 +1874,15 @@ def execute_tool(context: ToolContext, name: str, arguments: str | dict[str, Any
             "The workbook could not pass its privacy and integrity checks.",
         ) from exc
     if time.monotonic() - started > MAX_TOOL_EXECUTION_SECONDS:
+        _discard_join_result(context, result.get("result_ref") if result else None)
         raise ToolExecutionError("execution_timeout", "The workbook operation exceeded its execution time limit.")
+    result.setdefault("execution_metadata", {})["duration_ms"] = round((time.monotonic() - started) * 1000, 3)
     encoded = json.dumps(result, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     if len(encoded.encode("utf-8")) > min(MAX_TOOL_RESULT_BYTES, definition.max_result_bytes):
+        _discard_join_result(context, result.get("result_ref"))
         raise ToolExecutionError("result_too_large", "The workbook result exceeded the allowed size.")
     if scan_for_unmasked_pii(encoded):
+        _discard_join_result(context, result.get("result_ref"))
         raise ToolExecutionError("privacy_validation_failed", "The workbook result did not pass outbound privacy validation.")
     return result
 

@@ -44,7 +44,9 @@ from ..tools import (
     MAX_TOOL_ROUNDS,
     ToolExecutionError,
     create_tool_context,
+    describe_workbooks,
     execute_tool_safely,
+    cleanup_tool_context,
     provider_tool_schemas,
 )
 from ..document_retrieval import is_document_file, retrieve_document_context
@@ -404,7 +406,17 @@ def _build_prompt(
                 file_descriptions=file_descriptions,
                 row_note=row_note,
                 length_instruction=length_instruction,
+                tool_mode="local_workbook_tools" if tools_enabled else None,
             )
+            if tools_enabled:
+                system_prompt += "\n\n" + workbook_schema
+                system_prompt += (
+                    "\nUse the available local document-table tools for schema discovery, "
+                    "filtering, grouping, counting, and exact calculations over the complete "
+                    "stored DOCX tables. Never claim an exact result unless a tool returns "
+                    "exact=true. Retrieved excerpts are for citations and context; they are "
+                    "not the authoritative source for exact table calculations."
+                )
             built_prompt = build_prompt(
                 system_prompt=system_prompt,
                 file_context=document_context,
@@ -658,6 +670,7 @@ def _context_revision(chat_id: str, body: MessageIn) -> str:
         "use_ner": body.use_ner,
         "ner_confidence": body.ner_confidence,
         "masking_revision": os.getenv("PRIVY_MASKING_REVISION", "1"),
+        "join_confirmation_id": body.join_confirmation_id,
     }
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -672,6 +685,7 @@ def _request_fingerprint(body: MessageIn) -> str:
         "concise": body.concise,
         "model_id": body.model_id,
         "allow_unmasked_risk": body.allow_unmasked_risk,
+        "join_confirmation_id": body.join_confirmation_id,
     }
     return hmac.new(
         JWT_SECRET.encode("utf-8"),
@@ -811,6 +825,7 @@ def _generate_active_impl(
     gemini_tool_mode = None
     chat_files = store.get_chat_files(chat_id)
     workbook_files = [item for item in chat_files if not is_document_file(item)]
+    document_files = [item for item in chat_files if is_document_file(item)]
     document_context = ""
     document_sources: list[dict] = []
     confirmed_share_segments: list[str] = []
@@ -838,7 +853,10 @@ def _generate_active_impl(
         )
         yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
         return
-    tools_enabled = bool(workbook_files)
+    tools_enabled = bool(
+        workbook_files
+        or (document_files and capabilities.get("tool_calling") is True)
+    )
     tool_context = None
     workbook_schema = ""
     if tools_enabled:
@@ -855,7 +873,11 @@ def _generate_active_impl(
             yield _sse({"done": True, "masked_count": count_masked_tokens(masked_question)})
             return
         try:
-            tool_context = create_tool_context(chat_id, user_id, workbook_files)
+            tool_context = create_tool_context(
+                chat_id, user_id, chat_files,
+                approved_join_confirmation_id=body.join_confirmation_id,
+            )
+            workbook_schema = describe_workbooks(tool_context)
         except (ToolExecutionError, HTTPException, RuntimeError) as exc:
             log_event(
                 logger,
@@ -990,6 +1012,9 @@ def _generate_active_impl(
             "aggregate_data": "Calculating a workbook result",
             "group_and_aggregate": "Comparing workbook groups",
             "compare_groups": "Comparing workbook groups",
+            "discover_joins": "Checking file relationships",
+            "join_tables": "Joining approved file data",
+            "aggregate_joined_data": "Calculating across joined files",
         }
         for event in stream_unmask_events(provider_events, chat_id):
             if event.get("type") == "delta":
@@ -1005,6 +1030,11 @@ def _generate_active_impl(
                         "status": "running" if event["type"] == "tool_start" else "complete",
                     }
                 })
+                if event.get("type") == "tool_complete" and tool_name == "discover_joins" and tool_context:
+                    pending = list(tool_context.pending_join_confirmations)
+                    tool_context.pending_join_confirmations.clear()
+                    for request in pending:
+                        yield _sse({"join_confirmation": request})
         log_event(
             logger,
             "unmask_complete",
@@ -1116,6 +1146,9 @@ def _generate_active_impl(
             "delta": msg,
             "error": {"category": "unexpected", "retryable": True},
         })
+    finally:
+        if tool_context is not None:
+            cleanup_tool_context(tool_context)
 
     answer = "".join(answer_parts)
     usage_state.setdefault("provider", provider)
@@ -1178,3 +1211,19 @@ def post_message(
         _generate(chat_id, body, user["auth0_sub"]),
         media_type="text/event-stream",
     )
+
+
+@router.post("/{chat_id}/join-confirmations/{confirmation_id}/confirm")
+def confirm_join(
+    chat_id: str,
+    confirmation_id: str,
+    user: dict = Depends(get_current_app_user),
+):
+    user_id = user["auth0_sub"]
+    if not store.get_chat(chat_id, user_id):
+        raise HTTPException(status_code=404, detail="Chat not found")
+    if not store.confirm_join_confirmation(
+        chat_id=chat_id, user_id=user_id, confirmation_id=confirmation_id
+    ):
+        raise HTTPException(status_code=410, detail="This join confirmation is expired or unavailable.")
+    return {"status": "confirmed", "confirmation_id": confirmation_id}

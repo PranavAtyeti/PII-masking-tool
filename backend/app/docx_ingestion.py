@@ -201,7 +201,21 @@ def _paragraphs_in_cell(cell: ElementTree.Element) -> list[str]:
 
 def _table_rows(table: ElementTree.Element, table_index: int) -> list[dict]:
     rows_out: list[dict] = []
-    for row_index, row in enumerate(table.findall("./w:tr", _NS), start=1):
+    raw_rows = table.findall("./w:tr", _NS)
+    first_cells: list[str] = []
+    if raw_rows:
+        first_cells = [
+            "\n".join(_paragraphs_in_cell(cell)).strip()
+            for cell in raw_rows[0].findall("./w:tc", _NS)
+        ]
+
+    header_words = {
+        "id", "name", "city", "amount", "status", "payment", "transaction",
+        "identity", "customer", "support", "network", "email", "phone",
+        "address", "date", "account", "case", "event", "description",
+    }
+
+    for row_index, row in enumerate(raw_rows, start=1):
         cells = []
         for cell_index, cell in enumerate(row.findall("./w:tc", _NS), start=1):
             cells.append({
@@ -209,9 +223,33 @@ def _table_rows(table: ElementTree.Element, table_index: int) -> list[dict]:
                 "content": "\n".join(_paragraphs_in_cell(cell)),
             })
         if cells:
+            explicit_header = row.find("w:trPr/w:tblHeader", _NS) is not None
+            inferred_header = False
+            if row_index == 1 and not explicit_header and first_cells:
+                normalized = [
+                    re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+                    for value in first_cells
+                ]
+                header_like = sum(
+                    any(word in set(value.split()) for word in header_words)
+                    for value in normalized
+                )
+                inferred_header = (
+                    len(normalized) >= 2
+                    and all(value and len(value) <= 64 for value in normalized)
+                    and header_like >= max(1, len(normalized) // 2)
+                )
+            repeated_header = bool(first_cells) and [
+                "\n".join(_paragraphs_in_cell(cell)).strip()
+                for cell in row.findall("./w:tc", _NS)
+            ] == first_cells
+            is_header = explicit_header or inferred_header or (
+                row_index > 1 and repeated_header
+            )
             rows_out.append({
                 "source_id": f"table-{table_index + 1:04d}-row-{row_index:04d}",
                 "cells": cells,
+                "is_header": is_header,
             })
     return rows_out
 
@@ -268,6 +306,7 @@ def _extract_story(
                     "table_id": f"{prefix}table-{table_index:04d}",
                     "heading_path": [value for _, value in heading_stack],
                     "cells": row["cells"],
+                    "is_header": bool(row["is_header"]),
                 })
     return order, text_size, paragraph_index + table_index
 

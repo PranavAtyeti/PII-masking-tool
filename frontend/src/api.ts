@@ -28,6 +28,15 @@ const API_ORIGIN = (
 ).replace(/\/$/, "");
 const BASE = `${API_ORIGIN}/api`;
 
+export interface JoinConfirmationEvent {
+  confirmation_id: string;
+  left: { file_id: string; worksheet_id: string; column_id: string };
+  right: { file_id: string; worksheet_id: string; column_id: string };
+  left_column_label: string;
+  right_column_label: string;
+  expires_in_seconds: number;
+}
+
 async function authedFetch(
   input: RequestInfo | URL,
   init: RequestInit = {}
@@ -61,6 +70,9 @@ async function authedFetch(
           ...(init.headers ?? {}),
         },
       });
+      if (response.status === 401) {
+        clearAccessToken();
+      }
     } else {
       clearAccessToken();
     }
@@ -295,6 +307,14 @@ export const api = {
     }
   },
 
+  async confirmJoin(chatId: string, confirmationId: string): Promise<void> {
+    const response = await authedFetch(
+      `${BASE}/chats/${chatId}/join-confirmations/${confirmationId}/confirm`,
+      { method: "POST" }
+    );
+    await jsonOrThrow<{ status: string; confirmation_id: string }>(response);
+  },
+
   async streamMessage(
     chatId: string,
     body: {
@@ -305,11 +325,13 @@ export const api = {
       concise: boolean;
       model_id?: string;
       allow_unmasked_risk?: boolean;
+      join_confirmation_id?: string;
     },
     handlers: {
       onDelta: (text: string) => void;
       onSources?: (sources: DocumentSource[]) => void;
       onToolStatus?: (status: string | null) => void;
+      onJoinConfirmation?: (confirmation: JoinConfirmationEvent) => void | Promise<void>;
       onDone: (maskedCount: number, usage?: ProviderUsage) => void;
       onError: (message: string, error?: ProviderErrorMetadata) => void;
       onAbort?: () => void;
@@ -398,6 +420,7 @@ function handleEvent(
     onDelta: (text: string) => void;
     onSources?: (sources: DocumentSource[]) => void;
     onToolStatus?: (status: string | null) => void;
+    onJoinConfirmation?: (confirmation: JoinConfirmationEvent) => void | Promise<void>;
     onDone: (maskedCount: number, usage?: ProviderUsage) => void;
     onError: (message: string, error?: ProviderErrorMetadata) => void;
     onAbort?: () => void;
@@ -420,6 +443,7 @@ function handleEvent(
     tool_status?: { label?: string; status?: string };
     error?: string | ProviderErrorMetadata;
     sources?: DocumentSource[];
+    join_confirmation?: JoinConfirmationEvent;
   };
 
   try {
@@ -430,6 +454,8 @@ function handleEvent(
 
   if (Array.isArray(obj.sources)) {
     handlers.onSources?.(obj.sources);
+  } else if (obj.join_confirmation) {
+    void handlers.onJoinConfirmation?.(obj.join_confirmation);
   } else if (obj.error) {
     handlers.onToolStatus?.(null);
     handlers.onError(
